@@ -37,6 +37,7 @@ readonly TESTS=(
     both-compromised
     rollover-on-time
     rollover-forgotten
+    savings-lock
 )
 
 list_tests() {
@@ -978,6 +979,44 @@ test_rollover_on_time() {
     expect_failure "the renewed outputs have a fresh phone-recovery delay" \
         "$MAIN" phone recover "$MINING_ADDRESS"
     success "Old recovery deadline passed while renewed funds stayed locked."
+}
+
+test_savings_lock() {
+    local unlock_date coins_output deposit_output deposit_address
+    setup_vault
+
+    step "Create a hard-locked savings address for recurring deposits"
+    unlock_date=$(date -u -d "@$((NOW + 2 * 365 * 24 * 60 * 60))" +%Y-%m-%d)
+    anzen "$MAIN" savings create --unlock "$unlock_date"
+    anzen "$MAIN" savings list
+    anzen_capture deposit_output "$MAIN" deposit-address
+    deposit_address=$(printf '%s\n' "$deposit_output" | awk '/^Deposit address:/ {print $3}')
+    if [[ $deposit_address == "$(jq -r .vault_address "$MAIN/anzen.json")" ]]; then
+        printf 'ERROR: deposits still default to the vault address\n' >&2
+        exit 1
+    fi
+    success "Recurring deposits now default to the savings lock."
+
+    step "Deposit a paycheck into savings"
+    anzen "$MAIN" phone send "$deposit_address" 25000000
+    confirm_transaction "Confirming the savings deposit"
+    success "Savings deposit confirmed."
+
+    step "Inspect coin ages with amounts hidden, then revealed"
+    anzen_capture coins_output "$MAIN" coins
+    if ! grep -q "Savings until $unlock_date · hidden" <<<"$coins_output" ||
+        ! grep -q "Locked: nobody can move it" <<<"$coins_output" ||
+        ! grep -q "Vault · hidden" <<<"$coins_output" ||
+        grep -q "sats" <<<"$coins_output"; then
+        printf 'ERROR: coin view did not hide amounts or show both pots\n%s\n' "$coins_output" >&2
+        exit 1
+    fi
+    anzen_capture coins_output "$MAIN" coins --reveal
+    if ! grep -q "25000000 sats" <<<"$coins_output"; then
+        printf 'ERROR: revealed coin view is missing the savings amount\n' >&2
+        exit 1
+    fi
+    success "Each coin shows how long it stays protected, without exposing amounts by default."
 }
 
 test_rollover_forgotten() {

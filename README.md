@@ -80,6 +80,12 @@ The immediate trigger spends the vault remainder and emergency connector, then c
 
 Connector change never returns to the controller address: phone revocation sends it to a fresh hot-wallet change address, while HWW revocation requires an explicitly displayed destination. A later annual rollover spends every live vault and connector output, resets recovery delays, creates only the renewed policy's connectors, and invalidates the old epoch.
 
+### Hard-locked savings
+
+`anzen savings create --unlock 2030-01-01` creates a savings address that nothing can spend before 00:00 UTC on that date, not even both devices together. After the date phone and HWW spend it together; if one device is lost, the phone alone can recover it 425 days after the date and the HWW alone 455 days after. Every path is dated, so savings never need a ceremony or renewal and deposits can arrive at the same address forever. The first lock becomes the default deposit address (`anzen deposit-address`), which makes it the natural target for recurring income. Several locks with different dates can be held at once. Each lock records the keys it was created with, so a phone rotation (which cannot move locked coins) leaves its address unchanged.
+
+`anzen coins` lists every vault and savings coin with how long it stays protected, most urgent first: vault coins count down to their phone-only recovery height (and flag a ceremony when it is within about 60 days), savings coins count down to their unlock date. Amounts and coin IDs stay hidden unless `--reveal` is passed.
+
 Presigned transactions are convenience permissions, not custody. Losing them cannot lose the bitcoin because every principal output still has the three vault-script paths above.
 
 For a concrete byte-level example of this graph—including txids, outpoints, locktimes, sequences, values, addresses, and scripts—see the checked-in [vault output test vector](test-vectors/vault-output-graph.json).
