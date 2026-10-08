@@ -57,6 +57,18 @@ pub trait Blockchain {
     fn scan_vault(&self, config: &VaultConfig) -> Result<Vec<VaultUtxo>>;
     fn scan_connectors(&self, config: &VaultConfig) -> Result<Vec<VaultUtxo>>;
     fn broadcast(&self, transaction: &Transaction) -> Result<bitcoin::Txid>;
+    /// Current fee rate in sat/vB for confirmation within `target_blocks`, or `None` when the
+    /// backend has no estimate (for example a fresh regtest chain).
+    fn estimate_fee_rate(&self, _target_blocks: u16) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    /// Submit a parent and its fee-bumping child together. Backends without package relay
+    /// broadcast them in order, which only works if the parent meets the mempool minimum alone.
+    fn broadcast_package(&self, parent: &Transaction, child: &Transaction) -> Result<()> {
+        self.broadcast(parent)?;
+        self.broadcast(child)?;
+        Ok(())
+    }
 }
 
 impl Blockchain for BitcoinCoreBackend {
@@ -93,6 +105,32 @@ impl Blockchain for BitcoinCoreBackend {
                 error,
             ))) if error.code == -27 => Ok(transaction.compute_txid()),
             result => result.context("Bitcoin Core transaction broadcast failed"),
+        }
+    }
+
+    fn estimate_fee_rate(&self, target_blocks: u16) -> Result<Option<u64>> {
+        let estimate = self
+            .client
+            .estimate_smart_fee(target_blocks, None)
+            .context("Bitcoin Core fee estimation failed")?;
+        Ok(estimate
+            .fee_rate
+            .and_then(|rate| super::fees::sat_per_vb_from_btc_per_kvb(rate.to_btc())))
+    }
+
+    fn broadcast_package(&self, parent: &Transaction, child: &Transaction) -> Result<()> {
+        // `submitpackage` (Bitcoin Core 28+) accepts a low-fee parent when the child pays for both.
+        let hex = [
+            bitcoin::consensus::encode::serialize_hex(parent),
+            bitcoin::consensus::encode::serialize_hex(child),
+        ];
+        let result: serde_json::Value = self
+            .client
+            .call("submitpackage", &[serde_json::json!(hex)])
+            .context("Bitcoin Core package submission failed")?;
+        match result.get("package_msg").and_then(|m| m.as_str()) {
+            Some("success") => Ok(()),
+            other => bail!("Bitcoin Core rejected the fee-bump package: {}", other.unwrap_or("no message")),
         }
     }
 }
@@ -220,6 +258,23 @@ impl Blockchain for ElectrumBackend {
             }
         }
         result.context("Electrum transaction broadcast failed")
+    }
+
+    fn estimate_fee_rate(&self, target_blocks: u16) -> Result<Option<u64>> {
+        let btc_per_kvb = self
+            .client
+            .inner
+            .estimate_fee(usize::from(target_blocks))
+            .context("Electrum fee estimation failed")?;
+        Ok(super::fees::sat_per_vb_from_btc_per_kvb(btc_per_kvb))
+    }
+
+    fn broadcast_package(&self, parent: &Transaction, child: &Transaction) -> Result<()> {
+        // Electrum has no package relay: the parent must be accepted on its own first.
+        self.broadcast(parent)
+            .context("Electrum rejected the parent; a package-relay backend is needed to bump it")?;
+        self.broadcast(child)?;
+        Ok(())
     }
 }
 

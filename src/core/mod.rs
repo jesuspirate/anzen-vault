@@ -7,6 +7,7 @@
 pub mod ceremony;
 pub mod chain;
 pub mod crypto;
+pub mod fees;
 pub mod keys;
 pub mod policy;
 pub mod recovery;
