@@ -41,6 +41,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
+bitcoinconsensus = "0.106.0"
 
 [profile.release]
 lto = "thin"

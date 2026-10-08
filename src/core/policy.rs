@@ -249,6 +249,125 @@ impl VaultPolicy {
     }
 }
 
+/// Seconds after the savings unlock date before the phone alone can recover a savings output
+/// (425 days, about 14 months), mirroring the vault's phone-priority recovery window.
+pub const SAVINGS_PHONE_RECOVERY_SECS: u32 = 425 * 86_400;
+/// Seconds after the savings unlock date before the HWW alone can recover (455 days).
+pub const SAVINGS_HWW_RECOVERY_SECS: u32 = 455 * 86_400;
+
+/// A hard-locked savings output. Nothing can spend it before `unlock`, not even both devices
+/// together. Every path uses an absolute calendar time (CLTV), so these outputs never need the
+/// annual rollover: deposits can arrive at any time and stay locked until the same date.
+///
+/// ```text
+/// tr(NUMS, { and_v(v:multi_a(2,phone,hww), after(unlock)),
+///            { and_v(v:pk(phone), after(unlock + 425d)),
+///              and_v(v:pk(hww),   after(unlock + 455d)) } })
+/// ```
+#[derive(Debug, Clone)]
+pub struct SavingsPolicy {
+    pub descriptor: Descriptor<DescriptorPublicKey>,
+    pub address: Address,
+    pub unlock: u32,
+    phone: XOnlyPublicKey,
+    hww: XOnlyPublicKey,
+}
+
+impl SavingsPolicy {
+    pub fn new_for_network(
+        phone: XOnlyPublicKey,
+        hww: XOnlyPublicKey,
+        unlock: u32,
+        network: Network,
+    ) -> Result<Self> {
+        if unlock < bitcoin::absolute::LOCK_TIME_THRESHOLD {
+            bail!("savings unlock must be a Unix time, not a block height");
+        }
+        let phone_after = unlock
+            .checked_add(SAVINGS_PHONE_RECOVERY_SECS)
+            .context("savings unlock too far in the future")?;
+        let hww_after = unlock
+            .checked_add(SAVINGS_HWW_RECOVERY_SECS)
+            .context("savings unlock too far in the future")?;
+        let descriptor_text = format!(
+            "tr({BIP341_NUMS_KEY},{{and_v(v:multi_a(2,{phone},{hww}),after({unlock})),{{and_v(v:pk({phone}),after({phone_after})),and_v(v:pk({hww}),after({hww_after}))}}}})"
+        );
+        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&descriptor_text)
+            .with_context(|| format!("invalid savings descriptor: {descriptor_text}"))?;
+        let address = descriptor
+            .derived_descriptor(&Secp256k1::verification_only(), 0)?
+            .address(network)?;
+        Ok(Self {
+            descriptor,
+            address,
+            unlock,
+            phone,
+            hww,
+        })
+    }
+
+    /// The earliest nLockTime a spend through `path` can use.
+    pub fn earliest_lock_time(&self, path: SpendPath) -> u32 {
+        match path {
+            SpendPath::Cooperative => self.unlock,
+            SpendPath::PhoneRecovery => self.unlock + SAVINGS_PHONE_RECOVERY_SECS,
+            SpendPath::HwwRecovery => self.unlock + SAVINGS_HWW_RECOVERY_SECS,
+        }
+    }
+
+    pub fn leaf(&self, path: SpendPath) -> Result<VaultLeaf> {
+        let derived = self
+            .descriptor
+            .derived_descriptor(&Secp256k1::verification_only(), 0)?;
+        let tr = match derived {
+            Descriptor::Tr(tr) => tr,
+            _ => bail!("savings descriptor is not Taproot"),
+        };
+        let spend_info = tr.spend_info();
+        let single_key = match path {
+            SpendPath::Cooperative => None,
+            SpendPath::PhoneRecovery => Some(self.phone),
+            SpendPath::HwwRecovery => Some(self.hww),
+        };
+        for (depth, miniscript) in tr.iter_scripts() {
+            let script = miniscript.encode();
+            let is_multi = script
+                .instructions()
+                .any(|i| matches!(i, Ok(bitcoin::script::Instruction::Op(OP_CHECKSIGADD))));
+            let matches = match single_key {
+                None => is_multi,
+                Some(key) => {
+                    !is_multi
+                        && script
+                            .as_bytes()
+                            .windows(32)
+                            .any(|w| w == key.serialize().as_slice())
+                }
+            };
+            if !matches {
+                continue;
+            }
+            let leaf_version = LeafVersion::TapScript;
+            let leaf_hash = TapLeafHash::from_script(&script, leaf_version);
+            let control_block = spend_info
+                .control_block(&(script.clone(), leaf_version))
+                .context("savings leaf has no Taproot control block")?;
+            return Ok(VaultLeaf {
+                path,
+                depth,
+                script,
+                leaf_hash,
+                control_block,
+            });
+        }
+        bail!("savings descriptor does not contain the requested {path:?} leaf")
+    }
+
+    pub fn descriptor_string(&self) -> String {
+        self.descriptor.to_string()
+    }
+}
+
 impl ControllerPolicy {
     pub fn new(phone: XOnlyPublicKey, hww: XOnlyPublicKey) -> Result<Self> {
         Self::new_for_network(phone, hww, Network::Regtest)
