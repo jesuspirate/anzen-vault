@@ -196,10 +196,10 @@
     },
     {
       "name": "emergency:trigger",
-      "txid": "0f41e88e82e457e7458354a6d5ad9c7750f588c139a064494319e7a285cf4b56",
+      "txid": "ff3dc655c765f7c6064769ab348f86b038c25ef775d4c5945f37009aaaad4e71",
       "version": 2,
       "lock_time": 0,
-      "fee_sats": 331,
+      "fee_sats": 344,
       "inputs": [
         {
           "txid": "5e0802f20e27e75e122f5ebec391113062220cb48bbe10926c392182ee9236aa",
@@ -227,7 +227,7 @@
         {
           "vout": 1,
           "purpose": "vault-change",
-          "value_sats": 9998226,
+          "value_sats": 9997973,
           "address": "bcrt1p3kvhr5s57cjv3hf9cr2sv08ydf6qu3fhl7qftxetx7eyrpxel7eqygxs62",
           "script_pubkey": "51208d9971d214f624c8dd25c0d5063ce46a740e4537ff80959b2b37b24184d9ffb2"
         },
@@ -237,25 +237,32 @@
           "value_sats": 1000,
           "address": "bcrt1ppudyghxc03hu0les2yqe005qmm5avemukgsnvwyx55szxma53eysu2342c",
           "script_pubkey": "51200f1a445cd87c6fc7ff30510197be80dee9d6677cb221363886a520236fb48e49"
+        },
+        {
+          "vout": 3,
+          "purpose": "fee-bump-anchor",
+          "value_sats": 240,
+          "address": "bcrt1pfeesnyr2tx",
+          "script_pubkey": "51024e73"
         }
       ]
     },
     {
       "name": "emergency:withdrawal",
-      "txid": "4c098eb266913a515fd245a14c4ab6bdc91143a9c8c3530eea003c40938caf03",
+      "txid": "dd79aaca6f4f2d07b16cbe82427b5c77a5a599182d84fcf77b649ae09d4d3ec5",
       "version": 2,
       "lock_time": 0,
       "fee_sats": 245,
       "inputs": [
         {
-          "txid": "0f41e88e82e457e7458354a6d5ad9c7750f588c139a064494319e7a285cf4b56",
+          "txid": "ff3dc655c765f7c6064769ab348f86b038c25ef775d4c5945f37009aaaad4e71",
           "vout": 0,
           "value_sats": 49999245,
           "sequence": 4195486,
           "role": "vault"
         },
         {
-          "txid": "0f41e88e82e457e7458354a6d5ad9c7750f588c139a064494319e7a285cf4b56",
+          "txid": "ff3dc655c765f7c6064769ab348f86b038c25ef775d4c5945f37009aaaad4e71",
           "vout": 2,
           "value_sats": 1000,
           "sequence": 4294967293,

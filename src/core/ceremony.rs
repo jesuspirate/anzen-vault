@@ -30,6 +30,12 @@ pub const DEFAULT_BATCH_DIR: &str = "ceremony/active";
 pub const SCHEDULE_FILE: &str = "phone/schedule.json";
 pub const POLICY_PACKAGE_KIND: &str = "vault-policy";
 
+/// The emergency trigger pays only vault and connector outputs, so it carries a small
+/// pay-to-anchor output (spendable by anyone, no signature) that the phone spends in a child
+/// transaction to raise the fee at broadcast time. 240 sats is the P2A dust threshold.
+pub const TRIGGER_ANCHOR_VALUE_SATS: u64 = 240;
+pub const TRIGGER_ANCHOR_VOUT: usize = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyLimits {
     pub monthly_limit_sats: u64,
@@ -367,6 +373,7 @@ pub fn build_policy_proposal_with_connectors(
         )?;
         emergency_staging_value_sats
             .checked_add(trigger_fee)
+            .and_then(|value| value.checked_add(TRIGGER_ANCHOR_VALUE_SATS))
             .and_then(|value| value.checked_add(minimum_vault_change))
             .context("emergency access reserve overflowed")?
     };
@@ -1078,7 +1085,7 @@ fn validate_connector_emergency(
         || trigger_tx.lock_time != absolute::LockTime::ZERO
         || trigger_tx.input[0].sequence != Sequence::MAX
         || trigger_tx.input[1].sequence != Sequence::ENABLE_RBF_NO_LOCKTIME
-        || trigger_tx.output.len() != 3
+        || trigger_tx.output.len() != 4
         || trigger_tx.output[0].script_pubkey != vault_script
         || trigger_tx.output[0].value.to_sat() != emergency.staging_value_sats
         || trigger_tx.output[1].script_pubkey != vault_script
@@ -1088,6 +1095,14 @@ fn validate_connector_emergency(
         bail!("emergency access trigger violates the approved policy");
     }
     validate_connector_output(&trigger_tx.output[2], &controller_script)?;
+    if trigger_tx.output[TRIGGER_ANCHOR_VOUT]
+        != (TxOut {
+            value: Amount::from_sat(TRIGGER_ANCHOR_VALUE_SATS),
+            script_pubkey: ScriptBuf::new_p2a(),
+        })
+    {
+        bail!("emergency access trigger lacks its fee-bump anchor");
+    }
     let withdrawal_connector = ConnectorState {
         outpoint: OutPoint::new(trigger_tx.compute_txid(), 2),
         value_sats: CONNECTOR_VALUE_SATS,
@@ -1299,6 +1314,7 @@ fn build_emergency_access(
         .to_sat()
         .checked_sub(staging_value_sats)
         .and_then(|value| value.checked_sub(trigger_fee))
+        .and_then(|value| value.checked_sub(TRIGGER_ANCHOR_VALUE_SATS))
         .context("vault remainder cannot fund the configured emergency access amount and fees")?;
     if vault_change_value_sats < vault_script.minimal_non_dust().to_sat() {
         bail!("emergency access trigger would create dust vault change");
@@ -1447,6 +1463,10 @@ fn emergency_trigger_template(
             TxOut {
                 value: Amount::from_sat(CONNECTOR_VALUE_SATS),
                 script_pubkey: controller_script,
+            },
+            TxOut {
+                value: Amount::from_sat(TRIGGER_ANCHOR_VALUE_SATS),
+                script_pubkey: ScriptBuf::new_p2a(),
             },
         ],
     }
@@ -1901,7 +1921,16 @@ mod tests {
             emergency.trigger_connector.outpoint
         );
         assert!(trigger.inputs[1].tap_script_sigs.is_empty());
-        assert_eq!(trigger.unsigned_tx.output.len(), 3);
+        assert_eq!(trigger.unsigned_tx.output.len(), 4);
+        assert!(
+            trigger.unsigned_tx.output[TRIGGER_ANCHOR_VOUT].script_pubkey == ScriptBuf::new_p2a()
+        );
+        assert_eq!(
+            trigger.unsigned_tx.output[TRIGGER_ANCHOR_VOUT]
+                .value
+                .to_sat(),
+            TRIGGER_ANCHOR_VALUE_SATS
+        );
         assert!(trigger.unsigned_tx.output[..2].iter().all(|output| {
             output.script_pubkey
                 == Address::from_str(&manifest.vault_address)

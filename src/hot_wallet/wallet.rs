@@ -176,6 +176,91 @@ impl HotWallet {
         Ok(Some(transaction))
     }
 
+    /// Build a child that spends `parent`'s output `vout` (which must pay this wallet) back to a
+    /// fresh change address, paying `child_fee` so the parent+child package reaches the target
+    /// fee rate. The parent may be unconfirmed and not yet broadcast.
+    pub fn build_cpfp_child(
+        &mut self,
+        parent: &Transaction,
+        vout: u32,
+        child_fee: Amount,
+    ) -> Result<Transaction> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        self.wallet.apply_unconfirmed_txs([(parent.clone(), now)]);
+        let outpoint = OutPoint {
+            txid: parent.compute_txid(),
+            vout,
+        };
+        if self.wallet.get_utxo(outpoint).is_none() {
+            anyhow::bail!("parent output {outpoint} does not pay this hot wallet");
+        }
+        let change_script = self.next_change_address()?.script_pubkey();
+        let mut builder = self.wallet.build_tx();
+        builder
+            .add_utxo(outpoint)?
+            .manually_selected_only()
+            .fee_absolute(child_fee)
+            .drain_to(change_script);
+        let mut psbt = builder.finish()?;
+        if !self.wallet.sign(&mut psbt, SignOptions::default())? {
+            anyhow::bail!("BDK could not finalize the fee-bump child");
+        }
+        let transaction = psbt.extract_tx()?;
+        self.wallet.persist(&mut self.db)?;
+        Ok(transaction)
+    }
+
+    /// Build a child that spends the parent's pay-to-anchor output `anchor_vout` plus hot-wallet
+    /// coins, paying `child_fee` and returning the rest to this wallet. Used for presigned
+    /// transactions with no hot-wallet output, such as the emergency trigger.
+    pub fn build_anchor_child(
+        &mut self,
+        parent: &Transaction,
+        anchor_vout: u32,
+        child_fee: Amount,
+    ) -> Result<Transaction> {
+        let anchor = parent
+            .output
+            .get(anchor_vout as usize)
+            .context("parent has no anchor output")?;
+        if anchor.script_pubkey != ScriptBuf::new_p2a() {
+            anyhow::bail!("parent output {anchor_vout} is not a pay-to-anchor output");
+        }
+        let outpoint = OutPoint {
+            txid: parent.compute_txid(),
+            vout: anchor_vout,
+        };
+        let anchor_input = bitcoin::psbt::Input {
+            non_witness_utxo: Some(parent.clone()),
+            witness_utxo: Some(anchor.clone()),
+            ..Default::default()
+        };
+        let change_script = self.next_change_address()?.script_pubkey();
+        let mut builder = self.wallet.build_tx();
+        // P2A is spent with an empty witness: only the zero-length item count.
+        builder
+            .add_foreign_utxo(outpoint, anchor_input, bitcoin::Weight::from_wu(1))?
+            .fee_absolute(child_fee)
+            .drain_to(change_script);
+        let mut psbt = builder.finish()?;
+        let anchor_index = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .position(|input| input.previous_output == outpoint)
+            .context("fee-bump child lost its anchor input")?;
+        psbt.inputs[anchor_index].final_script_witness = Some(bitcoin::Witness::new());
+        if !self.wallet.sign(&mut psbt, SignOptions::default())? {
+            anyhow::bail!("BDK could not finalize the anchor fee-bump child");
+        }
+        let transaction = psbt.extract_tx()?;
+        self.wallet.persist(&mut self.db)?;
+        Ok(transaction)
+    }
+
     pub fn build_payment(
         &mut self,
         destination: ScriptBuf,
