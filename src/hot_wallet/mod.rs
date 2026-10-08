@@ -630,7 +630,16 @@ fn broadcast_emergency_transaction(
         &phone.vault_keypair,
         &[1],
     )?;
+    let parent_fee = psbt_fee(&psbt)?;
     let transaction = finalize_vault_psbt(psbt)?;
+    if kind == EmergencyTransactionKind::Withdrawal {
+        // The withdrawal's only output pays the hot wallet, so the phone can bump it.
+        broadcast_with_fee_bump(data_dir, backend, &transaction, parent_fee, 0)
+            .with_context(|| format!("failed to broadcast emergency access {kind:?}"))?;
+        return Ok(txid);
+    }
+    // TODO: the trigger pays only vault and connector outputs; it needs a pay-to-anchor output
+    // (added at ceremony time) before the phone can bump it.
     let broadcast_txid = backend
         .broadcast(&transaction)
         .with_context(|| format!("failed to broadcast emergency access {kind:?}"))?;
@@ -687,11 +696,74 @@ pub fn broadcast_monthly(
         &phone.vault_keypair,
         &[1],
     )?;
+    let parent_fee = psbt_fee(&psbt)?;
     let transaction = finalize_vault_psbt(psbt)?;
-    let transaction_txid = backend
-        .broadcast(&transaction)
+    let transaction_txid = broadcast_with_fee_bump(data_dir, backend, &transaction, parent_fee, 0)
         .with_context(|| format!("failed to broadcast {kind:?} for allowance step {step}"))?;
     Ok(MonthlyBroadcastResult { transaction_txid })
+}
+
+/// Fee paid by a fully described PSBT: inputs (from `witness_utxo`) minus outputs.
+fn psbt_fee(psbt: &Psbt) -> Result<u64> {
+    let mut inputs = 0u64;
+    for input in &psbt.inputs {
+        inputs += input
+            .witness_utxo
+            .as_ref()
+            .context("policy PSBT input is missing its witness UTXO")?
+            .value
+            .to_sat();
+    }
+    let outputs: u64 = psbt.unsigned_tx.output.iter().map(|o| o.value.to_sat()).sum();
+    inputs
+        .checked_sub(outputs)
+        .context("policy PSBT outputs exceed its inputs")
+}
+
+/// Broadcast a presigned `parent`, bumping it with a child that spends its output `hot_vout`
+/// (which pays this phone's hot wallet) when the parent's frozen fee is below today's rate.
+fn broadcast_with_fee_bump(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+    parent: &Transaction,
+    parent_fee: u64,
+    hot_vout: u32,
+) -> Result<Txid> {
+    use crate::core::fees;
+    // A typical one-input, one-output P2TR key-path child.
+    const CHILD_VSIZE_ESTIMATE: u64 = 111;
+
+    let txid = parent.compute_txid();
+    let target = backend
+        .estimate_fee_rate(fees::DEFAULT_CONFIRMATION_TARGET)?
+        .unwrap_or(DEFAULT_FEE_RATE_SAT_VB);
+    let parent_vsize = parent.vsize() as u64;
+    let child_fee = fees::cpfp_child_fee(parent_vsize, parent_fee, CHILD_VSIZE_ESTIMATE, target)?;
+    if child_fee == 0 {
+        let broadcast = backend.broadcast(parent)?;
+        if broadcast != txid {
+            bail!("chain backend returned an unexpected transaction ID");
+        }
+        return Ok(txid);
+    }
+    let hot_value = parent
+        .output
+        .get(hot_vout as usize)
+        .context("presigned transaction has no hot-wallet output to bump from")?
+        .value
+        .to_sat();
+    fees::child_output_after_fee(hot_value, child_fee)?;
+    let mut wallet = HotWallet::open_or_create(data_dir)?;
+    let mut child = wallet.build_cpfp_child(parent, hot_vout, Amount::from_sat(child_fee))?;
+    // Rebuild once if the real child is larger than estimated, so the package still hits target.
+    let actual_vsize = child.vsize() as u64;
+    if actual_vsize > CHILD_VSIZE_ESTIMATE {
+        let fee = fees::cpfp_child_fee(parent_vsize, parent_fee, actual_vsize, target)?;
+        fees::child_output_after_fee(hot_value, fee)?;
+        child = wallet.build_cpfp_child(parent, hot_vout, Amount::from_sat(fee))?;
+    }
+    backend.broadcast_package(parent, &child)?;
+    Ok(txid)
 }
 
 fn revoke_connector_to_phone(
