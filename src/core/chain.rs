@@ -130,7 +130,10 @@ impl Blockchain for BitcoinCoreBackend {
             .context("Bitcoin Core package submission failed")?;
         match result.get("package_msg").and_then(|m| m.as_str()) {
             Some("success") => Ok(()),
-            other => bail!("Bitcoin Core rejected the fee-bump package: {}", other.unwrap_or("no message")),
+            other => bail!(
+                "Bitcoin Core rejected the fee-bump package: {}",
+                other.unwrap_or("no message")
+            ),
         }
     }
 }
@@ -271,8 +274,9 @@ impl Blockchain for ElectrumBackend {
 
     fn broadcast_package(&self, parent: &Transaction, child: &Transaction) -> Result<()> {
         // Electrum has no package relay: the parent must be accepted on its own first.
-        self.broadcast(parent)
-            .context("Electrum rejected the parent; a package-relay backend is needed to bump it")?;
+        self.broadcast(parent).context(
+            "Electrum rejected the parent; a package-relay backend is needed to bump it",
+        )?;
         self.broadcast(child)?;
         Ok(())
     }

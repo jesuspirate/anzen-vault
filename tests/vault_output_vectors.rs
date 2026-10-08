@@ -255,6 +255,7 @@ fn vault_output_graph_matches_checked_in_json_vector() {
                 "emergency-staging".to_owned(),
                 "vault-change".to_owned(),
                 "emergency-controller:withdrawal".to_owned(),
+                "fee-bump-anchor".to_owned(),
             ],
         ),
         vector_transaction(
@@ -325,6 +326,17 @@ fn vault_output_graph_matches_checked_in_json_vector() {
         transactions,
     };
     let actual = format!("{}\n", serde_json::to_string_pretty(&vector).unwrap());
+    if std::env::var_os("ANZEN_UPDATE_VECTORS").is_some() {
+        std::fs::write(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/test-vectors/vault-output-graph.json"
+            ),
+            &actual,
+        )
+        .unwrap();
+        return;
+    }
     let expected = include_str!("../test-vectors/vault-output-graph.json");
     assert_eq!(
         actual, expected,

@@ -39,7 +39,9 @@ pub fn cpfp_child_fee(
     target_sat_vb: u64,
 ) -> Result<u64> {
     if target_sat_vb > MAX_FEE_RATE_SAT_VB {
-        bail!("fee rate {target_sat_vb} sat/vB exceeds the {MAX_FEE_RATE_SAT_VB} sat/vB safety cap");
+        bail!(
+            "fee rate {target_sat_vb} sat/vB exceeds the {MAX_FEE_RATE_SAT_VB} sat/vB safety cap"
+        );
     }
     if parent_fee >= parent_vsize.saturating_mul(target_sat_vb) {
         return Ok(0);
@@ -77,7 +79,10 @@ mod tests {
         assert_eq!(sat_per_vb_from_btc_per_kvb(-1.0), None);
         assert_eq!(sat_per_vb_from_btc_per_kvb(0.0), None);
         assert_eq!(sat_per_vb_from_btc_per_kvb(f64::NAN), None);
-        assert_eq!(sat_per_vb_from_btc_per_kvb(0.000_000_01), Some(MIN_FEE_RATE_SAT_VB));
+        assert_eq!(
+            sat_per_vb_from_btc_per_kvb(0.000_000_01),
+            Some(MIN_FEE_RATE_SAT_VB)
+        );
         assert_eq!(sat_per_vb_from_btc_per_kvb(5.0), Some(MAX_FEE_RATE_SAT_VB));
     }
 
@@ -107,7 +112,10 @@ mod tests {
 
     #[test]
     fn small_releases_cannot_be_bumped_into_dust() {
-        assert_eq!(child_output_after_fee(10_000_000, 6_000).unwrap(), 9_994_000);
+        assert_eq!(
+            child_output_after_fee(10_000_000, 6_000).unwrap(),
+            9_994_000
+        );
         assert!(child_output_after_fee(6_200, 6_000).is_err());
     }
 }

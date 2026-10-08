@@ -638,14 +638,9 @@ fn broadcast_emergency_transaction(
             .with_context(|| format!("failed to broadcast emergency access {kind:?}"))?;
         return Ok(txid);
     }
-    // TODO: the trigger pays only vault and connector outputs; it needs a pay-to-anchor output
-    // (added at ceremony time) before the phone can bump it.
-    let broadcast_txid = backend
-        .broadcast(&transaction)
+    // The trigger pays no hot-wallet output, so the phone bumps it through its anchor.
+    broadcast_with_anchor_bump(data_dir, backend, &transaction, parent_fee)
         .with_context(|| format!("failed to broadcast emergency access {kind:?}"))?;
-    if broadcast_txid != txid {
-        bail!("chain backend returned an unexpected emergency transaction ID");
-    }
     Ok(txid)
 }
 
@@ -714,7 +709,12 @@ fn psbt_fee(psbt: &Psbt) -> Result<u64> {
             .value
             .to_sat();
     }
-    let outputs: u64 = psbt.unsigned_tx.output.iter().map(|o| o.value.to_sat()).sum();
+    let outputs: u64 = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .map(|o| o.value.to_sat())
+        .sum();
     inputs
         .checked_sub(outputs)
         .context("policy PSBT outputs exceed its inputs")
@@ -761,6 +761,56 @@ fn broadcast_with_fee_bump(
         let fee = fees::cpfp_child_fee(parent_vsize, parent_fee, actual_vsize, target)?;
         fees::child_output_after_fee(hot_value, fee)?;
         child = wallet.build_cpfp_child(parent, hot_vout, Amount::from_sat(fee))?;
+    }
+    backend.broadcast_package(parent, &child)?;
+    Ok(txid)
+}
+
+/// Broadcast a presigned `parent` that carries a pay-to-anchor output, bumping it with a child
+/// funded by hot-wallet coins when the parent's frozen fee is below today's rate.
+fn broadcast_with_anchor_bump(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+    parent: &Transaction,
+    parent_fee: u64,
+) -> Result<Txid> {
+    use crate::core::fees;
+    // Anchor input (41 vB) plus one P2TR key-path input and one P2TR change output.
+    const CHILD_VSIZE_ESTIMATE: u64 = 152;
+    let anchor_vout = ceremony::TRIGGER_ANCHOR_VOUT as u32;
+
+    let txid = parent.compute_txid();
+    let target = backend
+        .estimate_fee_rate(fees::DEFAULT_CONFIRMATION_TARGET)?
+        .unwrap_or(DEFAULT_FEE_RATE_SAT_VB);
+    let parent_vsize = parent.vsize() as u64;
+    let child_fee = fees::cpfp_child_fee(parent_vsize, parent_fee, CHILD_VSIZE_ESTIMATE, target)?;
+    if child_fee == 0 {
+        let broadcast = backend.broadcast(parent)?;
+        if broadcast != txid {
+            bail!("chain backend returned an unexpected transaction ID");
+        }
+        return Ok(txid);
+    }
+    let mut wallet = HotWallet::open_or_create(data_dir)?;
+    let mut child =
+        match wallet.build_anchor_child(parent, anchor_vout, Amount::from_sat(child_fee)) {
+            Ok(child) => child,
+            // An empty phone wallet must never block emergency access: send the trigger at its
+            // presigned fee and let the user bump it later once the phone holds coins.
+            Err(error) => {
+                eprintln!("warning: broadcasting without a fee bump: {error:#}");
+                let broadcast = backend.broadcast(parent)?;
+                if broadcast != txid {
+                    bail!("chain backend returned an unexpected transaction ID");
+                }
+                return Ok(txid);
+            }
+        };
+    let actual_vsize = child.vsize() as u64;
+    if actual_vsize > CHILD_VSIZE_ESTIMATE {
+        let fee = fees::cpfp_child_fee(parent_vsize, parent_fee, actual_vsize, target)?;
+        child = wallet.build_anchor_child(parent, anchor_vout, Amount::from_sat(fee))?;
     }
     backend.broadcast_package(parent, &child)?;
     Ok(txid)
