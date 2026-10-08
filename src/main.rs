@@ -76,6 +76,10 @@ enum PhoneCommand {
         /// One delayed emergency withdrawal available during this vault epoch; zero disables it.
         #[arg(long, default_value_t = 0)]
         emergency_access_limit: u64,
+        /// Years presigned in this ceremony. With 2, the second year's renewal is signed now and
+        /// broadcast later with `phone renew`, so the HWW is needed only every two years.
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
+        years: u8,
         #[arg(long)]
         output: PathBuf,
         /// Override the captured current Unix time (regtest-only).
@@ -84,8 +88,15 @@ enum PhoneCommand {
     },
     /// Verify an HWW-approved policy, broadcast its rollover, and store artifacts.
     ActivatePolicy { approved_policy: PathBuf },
+    /// Broadcast the presigned second-year renewal once it unlocks (360 days after the rollover).
+    Renew,
     /// Broadcast the next presigned allowance authorization after its relative delay.
-    Authorize { step: u8 },
+    Authorize {
+        step: u8,
+        /// Use the epoch a presigned renewal replaced, for its unclaimed months.
+        #[arg(long)]
+        previous: bool,
+    },
     /// Return the difference between an authorization and a lower soft limit.
     ApplySoftLimit {
         step: u8,
@@ -93,7 +104,12 @@ enum PhoneCommand {
         limit: u64,
     },
     /// Revoke this allowance step and every later step in its chain.
-    Revoke { step: u8 },
+    Revoke {
+        step: u8,
+        /// Use the epoch a presigned renewal replaced.
+        #[arg(long)]
+        previous: bool,
+    },
     /// Execute or cancel the epoch's presigned emergency-access package.
     Emergency {
         #[command(subcommand)]
@@ -397,6 +413,7 @@ fn run_phone(
         PhoneCommand::SetPolicy {
             monthly_limit,
             emergency_access_limit,
+            years,
             output,
             now,
         } => phone_set_policy(
@@ -404,18 +421,26 @@ fn run_phone(
             rpc_args,
             monthly_limit,
             emergency_access_limit,
+            years,
             now,
             &output,
         )?,
         PhoneCommand::ActivatePolicy { approved_policy } => {
             phone_activate_policy(data_dir, rpc_args, &approved_policy)?
         }
-        PhoneCommand::Authorize { step } => {
+        PhoneCommand::Renew => {
+            let backend = rpc_args.connect_hot(data_dir)?;
+            let schedule = hot_wallet::activate_presigned_renewal(data_dir, backend.as_ref())?;
+            println!("Presigned renewal broadcast: {}", schedule.rollover_txid);
+            println!("Allowance steps scheduled: {}", schedule.entries.len());
+        }
+        PhoneCommand::Authorize { step, previous } => {
             broadcast_monthly(
                 data_dir,
                 rpc_args,
                 step,
                 core::ceremony::TransactionKind::Authorization,
+                previous,
             )?;
         }
         PhoneCommand::ApplySoftLimit { step, limit } => {
@@ -429,12 +454,13 @@ fn run_phone(
                 ),
             }
         }
-        PhoneCommand::Revoke { step } => {
+        PhoneCommand::Revoke { step, previous } => {
             broadcast_monthly(
                 data_dir,
                 rpc_args,
                 step,
                 core::ceremony::TransactionKind::Revocation,
+                previous,
             )?;
         }
         PhoneCommand::Emergency { command } => {
@@ -789,6 +815,7 @@ fn phone_set_policy(
     rpc_args: &ChainArgs,
     monthly_limit: u64,
     emergency_access_limit: u64,
+    years: u8,
     now: Option<i64>,
     output: &Path,
 ) -> Result<()> {
@@ -807,6 +834,7 @@ fn phone_set_policy(
         now,
         monthly_limit,
         emergency_access_limit,
+        years,
         &workspace,
     )?;
     let package = core::ceremony::package_from_batch(&workspace)?;
@@ -824,12 +852,13 @@ fn hww_confirm_policy(data_dir: &Path, proposal: &Path, output: &Path, yes: bool
     let workspace = data_dir.join("hww/policy-review");
     reset_workspace(&workspace)?;
     core::ceremony::materialize_policy_package(&package, &workspace)?;
-    let approved_manifest = cold_wallet::approve_policy(data_dir, &workspace)?;
-    eprintln!(
-        "HWW validated and signed all {} PSBTs after one approval",
-        core::ceremony::manifest_transactions(&approved_manifest).len()
-    );
+    cold_wallet::approve_policy(data_dir, &workspace)?;
     let approved = core::ceremony::package_from_batch(&workspace)?;
+    let signed = core::ceremony::manifest_transactions(&approved.manifest).len()
+        + approved.next.as_ref().map_or(0, |next| {
+            core::ceremony::manifest_transactions(&next.manifest).len()
+        });
+    eprintln!("HWW validated and signed all {signed} PSBTs after one approval");
     write_artifact(output, &approved)?;
     report_artifact(output, "HWW-approved policy")?;
     Ok(())
@@ -890,9 +919,14 @@ fn broadcast_monthly(
     rpc_args: &ChainArgs,
     step: u8,
     kind: core::ceremony::TransactionKind,
+    previous: bool,
 ) -> Result<()> {
     let backend = rpc_args.connect_hot(data_dir)?;
-    let result = hot_wallet::broadcast_monthly(data_dir, backend.as_ref(), step, kind)?;
+    let result = if previous {
+        hot_wallet::broadcast_previous_monthly(data_dir, backend.as_ref(), step, kind)?
+    } else {
+        hot_wallet::broadcast_monthly(data_dir, backend.as_ref(), step, kind)?
+    };
     let action = match kind {
         core::ceremony::TransactionKind::Authorization => "Authorization",
         core::ceremony::TransactionKind::Revocation => "Revocation",
@@ -1121,6 +1155,13 @@ fn print_manifest(manifest: &core::ceremony::BatchManifest, stderr: bool) -> Res
             "WARNING: balance funds only {} of {} monthly allowances",
             manifest.allowance_count,
             core::MONTHS_PER_ROLLOVER
+        )?;
+    }
+    if manifest.has_presigned_renewal {
+        writeln!(
+            output,
+            "Presigned renewal: second year included, broadcast after {} seconds (~360 days)",
+            core::PRESIGNED_RENEWAL_DELAY_SECONDS
         )?;
     }
     writeln!(output, "Rollover txid: {}", manifest.rollover.unsigned_txid)?;
