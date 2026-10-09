@@ -18,6 +18,34 @@ use std::str::FromStr;
 pub const BIP341_NUMS_KEY: &str =
     "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
 
+/// A Taproot script policy whose leaves are selected by [`SpendPath`]. Both the vault and the
+/// hard-locked savings policies have one cooperative leaf and two single-key recovery leaves, so
+/// PSBT construction, signing and verification are shared between them.
+pub trait TaprootPolicy {
+    fn leaf(&self, path: SpendPath) -> Result<VaultLeaf>;
+    fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>>;
+}
+
+impl TaprootPolicy for VaultPolicy {
+    fn leaf(&self, path: SpendPath) -> Result<VaultLeaf> {
+        VaultPolicy::leaf(self, path)
+    }
+
+    fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>> {
+        VaultPolicy::definite_descriptor(self)
+    }
+}
+
+impl TaprootPolicy for SavingsPolicy {
+    fn leaf(&self, path: SpendPath) -> Result<VaultLeaf> {
+        SavingsPolicy::leaf(self, path)
+    }
+
+    fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>> {
+        SavingsPolicy::definite_descriptor(self)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VaultPolicy {
     pub descriptor: Descriptor<DescriptorPublicKey>,
@@ -304,6 +332,12 @@ impl SavingsPolicy {
             phone,
             hww,
         })
+    }
+
+    pub fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>> {
+        self.descriptor
+            .at_derivation_index(0)
+            .context("savings descriptor could not be made definite")
     }
 
     /// The earliest nLockTime a spend through `path` can use.

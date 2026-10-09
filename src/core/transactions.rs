@@ -1,5 +1,5 @@
 use super::{
-    policy::{ControllerPath, ControllerPolicy, SpendPath, VaultPolicy},
+    policy::{ControllerPath, ControllerPolicy, SpendPath, TaprootPolicy, VaultPolicy},
     types::VaultUtxo,
 };
 use anyhow::{Context, Result, bail};
@@ -16,10 +16,10 @@ use bitcoin::{
 use miniscript::psbt::{PsbtExt, PsbtSighashMsg};
 use std::collections::BTreeSet;
 
-pub fn create_vault_psbt(
+pub fn create_vault_psbt<P: TaprootPolicy + ?Sized>(
     transaction: Transaction,
     prevouts: &[TxOut],
-    policy: &VaultPolicy,
+    policy: &P,
 ) -> Result<Psbt> {
     if transaction.input.len() != prevouts.len() {
         bail!(
@@ -189,9 +189,9 @@ pub fn build_controller_revocation_psbt(
     ))
 }
 
-pub fn sign_vault_psbt(
+pub fn sign_vault_psbt<P: TaprootPolicy + ?Sized>(
     psbt: &mut Psbt,
-    policy: &VaultPolicy,
+    policy: &P,
     path: SpendPath,
     keypair: &Keypair,
 ) -> Result<()> {
@@ -199,9 +199,9 @@ pub fn sign_vault_psbt(
     sign_vault_psbt_inputs(psbt, policy, path, keypair, &indexes)
 }
 
-pub fn sign_vault_psbt_inputs(
+pub fn sign_vault_psbt_inputs<P: TaprootPolicy + ?Sized>(
     psbt: &mut Psbt,
-    policy: &VaultPolicy,
+    policy: &P,
     path: SpendPath,
     keypair: &Keypair,
     input_indexes: &[usize],
@@ -285,9 +285,9 @@ pub fn sign_controller_psbt_inputs(
     Ok(())
 }
 
-pub fn verify_vault_psbt_signature(
+pub fn verify_vault_psbt_signature<P: TaprootPolicy + ?Sized>(
     psbt: &Psbt,
-    policy: &VaultPolicy,
+    policy: &P,
     path: SpendPath,
     signing_pubkey: XOnlyPublicKey,
 ) -> Result<()> {
@@ -295,9 +295,9 @@ pub fn verify_vault_psbt_signature(
     verify_vault_psbt_signatures(psbt, policy, path, signing_pubkey, &indexes)
 }
 
-pub fn verify_vault_psbt_signatures(
+pub fn verify_vault_psbt_signatures<P: TaprootPolicy + ?Sized>(
     psbt: &Psbt,
-    policy: &VaultPolicy,
+    policy: &P,
     path: SpendPath,
     signing_pubkey: XOnlyPublicKey,
     input_indexes: &[usize],
@@ -392,9 +392,9 @@ pub fn signed_vsize(transaction: &Transaction) -> u64 {
     transaction.vsize() as u64
 }
 
-pub fn estimate_vault_vsize(
+pub fn estimate_vault_vsize<P: TaprootPolicy + ?Sized>(
     transaction: &Transaction,
-    policy: &VaultPolicy,
+    policy: &P,
     path: SpendPath,
 ) -> Result<u64> {
     let leaf = policy.leaf(path)?;

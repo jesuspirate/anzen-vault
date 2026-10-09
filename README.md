@@ -86,6 +86,8 @@ Connector change never returns to the controller address: phone revocation sends
 
 `anzen coins` lists every vault and savings coin with how long it stays protected, most urgent first: vault coins count down to their phone-only recovery height (and flag a ceremony when it is within about 60 days), savings coins count down to their unlock date. Amounts and coin IDs stay hidden unless `--reveal` is passed.
 
+Once the chain's median time passes the unlock date, `anzen phone savings-spend DEST --unlock YYYY-MM-DD --output spend.json` builds a spend of every coin in that lock at today's fee rate and adds the phone's signature; `anzen hww confirm-savings-spend spend.json --output approved.json` shows the destination, amount and fee before the HWW signs, and `anzen phone broadcast-savings-spend approved.json` sends it. `--unlock` can be left out when there is only one lock. If a device is lost, `anzen phone recover-savings DEST` works 425 days after the date and `anzen hww recover-savings DEST` 455 days after. After a phone-key rotation the phone finds the key that created the lock in its rotation history. Savings spends are built when they are used, not presigned, so they need no CPFP: the fee rate is fetched at that moment and capped at 1,000 sat/vB.
+
 Presigned transactions are convenience permissions, not custody. Losing them cannot lose the bitcoin because every principal output still has the three vault-script paths above.
 
 For a concrete byte-level example of this graph—including txids, outpoints, locktimes, sequences, values, addresses, and scripts—see the checked-in [vault output test vector](test-vectors/vault-output-graph.json).

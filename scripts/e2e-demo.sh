@@ -38,6 +38,7 @@ readonly TESTS=(
     rollover-on-time
     rollover-forgotten
     savings-lock
+    savings-spend
 )
 
 list_tests() {
@@ -1019,6 +1020,70 @@ test_savings_lock() {
     success "Each coin shows how long it stays protected, without exposing amounts by default."
 }
 
+test_savings_spend() {
+    local first_date second_date first_unlock second_unlock receiver
+    local first_address second_address proposal approved coins_output
+    setup_vault
+
+    step "Create two savings locks a day apart and deposit into both"
+    first_date=$(date -u -d "@$((NOW + 2 * 24 * 60 * 60))" +%Y-%m-%d)
+    second_date=$(date -u -d "@$((NOW + 3 * 24 * 60 * 60))" +%Y-%m-%d)
+    first_unlock=$(date -u -d "$first_date" +%s)
+    second_unlock=$(date -u -d "$second_date" +%s)
+    anzen "$MAIN" savings create --unlock "$first_date"
+    anzen "$MAIN" savings create --unlock "$second_date"
+    first_address=$(jq -r --argjson u "$first_unlock" '.savings_locks[] | select(.unlock == $u) | .address' "$MAIN/anzen.json")
+    second_address=$(jq -r --argjson u "$second_unlock" '.savings_locks[] | select(.unlock == $u) | .address' "$MAIN/anzen.json")
+    anzen "$MAIN" phone send "$first_address" 30000000
+    anzen "$MAIN" phone send "$second_address" 20000000
+    confirm_transaction "Confirming both savings deposits"
+    success "Both savings locks hold a deposit."
+
+    make_receiver receiver "Savings receiver"
+    proposal="${E2E_TEST}-savings-spend.json"
+    approved="${E2E_TEST}-approved-savings-spend.json"
+
+    step "Try to spend savings before the unlock date"
+    expect_failure "nothing can move savings before its date, not even both devices" \
+        "$MAIN" phone savings-spend "$receiver" --unlock "$first_date" --output "$proposal"
+
+    advance_mtp_to "$first_unlock" "Advance time past the first unlock date"
+
+    step "Spend the first lock with phone + HWW"
+    anzen "$MAIN" phone savings-spend "$receiver" --unlock "$first_date" --output "$proposal"
+    anzen "$MAIN" hww confirm-savings-spend "$proposal" --output "$approved" --yes
+    anzen "$MAIN" phone broadcast-savings-spend "$approved"
+    confirm_transaction "Confirming the savings spend"
+    anzen_capture coins_output "$MAIN" coins
+    if ! grep -q "Savings until $second_date · hidden" <<<"$coins_output" ||
+        grep -q "Savings until $first_date" <<<"$coins_output"; then
+        printf 'ERROR: the first savings lock was not emptied\n%s\n' "$coins_output" >&2
+        exit 1
+    fi
+    success "The unlocked savings reached the receiver; the second lock is untouched."
+
+    step "Try single-key recovery of the second lock before its recovery date"
+    expect_failure "one device alone must wait 425 days after the unlock date" \
+        "$MAIN" phone recover-savings "$receiver" --unlock "$second_date"
+    expect_failure "the HWW alone must wait 455 days after the unlock date" \
+        "$MAIN" hww recover-savings "$receiver" --unlock "$second_date"
+
+    advance_mtp_to "$((second_unlock + 425 * 24 * 60 * 60))" \
+        "Advance time 425 days past the second unlock date"
+
+    step "Recover the second lock with the phone alone"
+    expect_failure "the HWW alone still waits another 30 days" \
+        "$MAIN" hww recover-savings "$receiver" --unlock "$second_date"
+    anzen "$MAIN" phone recover-savings "$receiver" --unlock "$second_date"
+    confirm_transaction "Confirming the phone savings recovery"
+    anzen_capture coins_output "$MAIN" coins
+    if grep -q "Savings until" <<<"$coins_output"; then
+        printf 'ERROR: savings coins remain after recovery\n%s\n' "$coins_output" >&2
+        exit 1
+    fi
+    success "Each savings path opened exactly on its date."
+}
+
 test_rollover_forgotten() {
     local phone_target hww_target current_mtp
     setup_vault
@@ -1072,6 +1137,7 @@ case "$E2E_TEST" in
     rollover-on-time) test_rollover_on_time ;;
     rollover-forgotten) test_rollover_forgotten ;;
     savings-lock) test_savings_lock ;;
+    savings-spend) test_savings_spend ;;
     *)
         printf 'ERROR: test %s is listed but has no case here\n' "$E2E_TEST" >&2
         exit 1

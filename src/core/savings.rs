@@ -228,12 +228,13 @@ pub fn coin_ages(
             .context("savings recovery date overflowed")?;
         // Savings recovery is dated, so HWW recovery (a month later) never comes first.
         const { assert!(SAVINGS_HWW_RECOVERY_SECS > SAVINGS_PHONE_RECOVERY_SECS) };
-        let status = if now < u64::from(lock.unlock) {
+        // A CLTV spend needs the median time past strictly beyond the date.
+        let status = if now <= u64::from(lock.unlock) {
             CoinStatus::Locked {
                 unlock: lock.unlock,
                 seconds_left: u64::from(lock.unlock) - now,
             }
-        } else if now < u64::from(phone_recovery_at) {
+        } else if now <= u64::from(phone_recovery_at) {
             CoinStatus::Unlocked { phone_recovery_at }
         } else {
             CoinStatus::SavingsRecoveryOpen { phone_recovery_at }
@@ -370,12 +371,21 @@ mod tests {
             .unwrap()[0]
                 .status
         };
+        // A CLTV path opens once the median time past is strictly beyond its date.
         assert!(matches!(
             status_at(u64::from(JAN_2030)),
+            CoinStatus::Locked { .. }
+        ));
+        assert!(matches!(
+            status_at(u64::from(JAN_2030) + 1),
             CoinStatus::Unlocked { .. }
         ));
         assert!(matches!(
             status_at(u64::from(JAN_2030 + SAVINGS_PHONE_RECOVERY_SECS)),
+            CoinStatus::Unlocked { .. }
+        ));
+        assert!(matches!(
+            status_at(u64::from(JAN_2030 + SAVINGS_PHONE_RECOVERY_SECS) + 1),
             CoinStatus::SavingsRecoveryOpen { .. }
         ));
     }
