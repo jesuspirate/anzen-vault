@@ -1077,6 +1077,11 @@ case "$E2E_TEST" in
     both-compromised) test_both_compromised ;;
     rollover-on-time) test_rollover_on_time ;;
     rollover-forgotten) test_rollover_forgotten ;;
+    presigned-renewal) test_presigned_renewal ;;
+    *)
+        printf 'ERROR: test %s is listed but has no case here\n' "$E2E_TEST" >&2
+        exit 1
+        ;;
 esac
 
 printf '\n✨ Test passed: %s\n' "$E2E_TEST"
