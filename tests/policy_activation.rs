@@ -91,7 +91,7 @@ fn setup() -> (tempfile::TempDir, Backend) {
 
 fn approved_batch(dir: &Path, backend: &Backend, name: &str, limit: u64) -> PathBuf {
     let batch = dir.join(name);
-    hot_wallet::propose_policy(dir, backend, Utc::now(), limit, 50_000_000, &batch).unwrap();
+    hot_wallet::propose_policy(dir, backend, Utc::now(), limit, 50_000_000, 1, &batch).unwrap();
     cold_wallet::approve_policy(dir, &batch).unwrap();
     batch
 }
@@ -331,5 +331,64 @@ fn rotation_rejects_an_incompletely_signed_renewal_before_any_broadcast() {
     assert_eq!(
         load_config(dir.path()).unwrap().vault_descriptor,
         config.vault_descriptor
+    );
+}
+
+#[test]
+fn presigned_renewal_spends_the_first_year_remainder_and_replaces_the_schedule() {
+    let (dir, backend) = setup();
+    let batch = dir.path().join("two-years");
+    hot_wallet::propose_policy(
+        dir.path(),
+        &backend,
+        Utc::now(),
+        10_000_000,
+        50_000_000,
+        2,
+        &batch,
+    )
+    .unwrap();
+    cold_wallet::approve_policy(dir.path(), &batch).unwrap();
+    let first = hot_wallet::activate_policy(dir.path(), &backend, &batch).unwrap();
+    let first_manifest = ceremony::load_manifest(&batch).unwrap();
+    assert!(first_manifest.has_presigned_renewal);
+
+    let second = hot_wallet::activate_presigned_renewal(dir.path(), &backend).unwrap();
+    assert_ne!(second.rollover_txid, first.rollover_txid);
+    let broadcasts = backend.broadcasts.borrow();
+    assert_eq!(broadcasts.len(), 2);
+    let renewal = &broadcasts[1];
+    assert_eq!(renewal.compute_txid().to_string(), second.rollover_txid);
+    assert_eq!(
+        renewal.input[0].previous_output,
+        OutPoint::new(
+            first.rollover_txid.parse().unwrap(),
+            first_manifest.remainder_vout
+        )
+    );
+    drop(broadcasts);
+    let previous_steps = |schedule: &Schedule| {
+        schedule
+            .previous_entries
+            .iter()
+            .map(|entry| entry.authorization_txid.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        previous_steps(&second),
+        first
+            .entries
+            .iter()
+            .map(|entry| entry.authorization_txid.clone())
+            .collect::<Vec<_>>(),
+        "unclaimed first-year months stay claimable"
+    );
+    assert_eq!(
+        hot_wallet::load_schedule(dir.path()).unwrap().rollover_txid,
+        second.rollover_txid
+    );
+    assert!(
+        hot_wallet::activate_presigned_renewal(dir.path(), &backend).is_err(),
+        "a renewal carries no further renewal"
     );
 }

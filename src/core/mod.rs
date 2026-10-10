@@ -33,3 +33,8 @@ pub const MONTHLY_ALLOWANCE_DELAY_SECONDS: u32 = 5_063 * 512;
 // BIP68 time locks use 512-second units. This is the smallest representable delay that is at
 // least one week: ceil(604_800 / 512) * 512 = 605_184 seconds.
 pub const EMERGENCY_ACCESS_DELAY_SECONDS: u32 = 1_182 * 512;
+// A presigned renewal spends the previous epoch's cold remainder after 360 days (60,750
+// 512-second units). Twelve 30-day allowance hops take at least 360 days, and the phone-only
+// recovery path opens only after 61,200 blocks (about 425 days), leaving about two months to
+// confirm the renewal.
+pub const PRESIGNED_RENEWAL_DELAY_SECONDS: u32 = 60_750 * 512;

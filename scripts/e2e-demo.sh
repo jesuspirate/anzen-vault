@@ -39,6 +39,7 @@ readonly TESTS=(
     rollover-forgotten
     savings-lock
     savings-spend
+    presigned-renewal
 )
 
 list_tests() {
@@ -347,12 +348,13 @@ ceremony() {
     local now=$1
     local monthly_limit=${2:-$DEFAULT_MONTHLY_LIMIT_SATS}
     local emergency_access_limit=${3:-0}
+    local years=${4:-2}
     local proposal="${E2E_TEST}-policy.json"
     local approved="${E2E_TEST}-approved-policy.json"
     anzen_filtered '
-        /^(PHONE POLICY PROPOSAL|Cold storage descriptor:|Vault address:|Policy controller address:|Policy controller reserve:|Monthly spending:|Monthly limit:|Emergency access:|Emergency access limit:|Emergency access delay:|Fee rate:|Total input:|Allowance steps:|Allowance hop delay:|WARNING:|Rollover txid:|Rollover fee:|Initial allowance-chain UTXO:|Rollover remainder:|Emergency trigger txid:|Emergency withdrawal txid:|Emergency hot address:|Phone signed PSBTs:|Phone-signed policy proposal:)/ { print }
+        /^(PHONE POLICY PROPOSAL|Cold storage descriptor:|Vault address:|Policy controller address:|Policy controller reserve:|Monthly spending:|Monthly limit:|Emergency access:|Emergency access limit:|Emergency access delay:|Fee rate:|Total input:|Allowance steps:|Allowance hop delay:|WARNING:|Presigned renewal:|Rollover txid:|Rollover fee:|Initial allowance-chain UTXO:|Rollover remainder:|Emergency trigger txid:|Emergency withdrawal txid:|Emergency hot address:|Phone signed PSBTs:|Phone-signed policy proposal:)/ { print }
     ' "$MAIN" phone set-policy --monthly-limit "$monthly_limit" \
-        --emergency-access-limit "$emergency_access_limit" \
+        --emergency-access-limit "$emergency_access_limit" --years "$years" \
         --output "$proposal" --now "$now"
     anzen_filtered '
         /^(SIMULATED HWW|Policy controller address:|Policy controller reserve:|Monthly spending:|Monthly limit:|Emergency access:|Emergency access limit:|Emergency access delay:|Allowance steps:|Allowance hop delay:|Rollover txid:|Initial allowance-chain UTXO:|Rollover remainder:|Emergency trigger txid:|Emergency withdrawal txid:|Emergency hot address:|Phone signed PSBTs:|HWW validated and signed|HWW-approved policy:)/ { print }
@@ -641,7 +643,7 @@ test_hww_revoke() {
 test_partial_funding() {
     setup_vault 350000
     step "Run rollover with only enough funds for the earliest allowances"
-    ceremony "$NOW" 100000
+    ceremony "$NOW" 100000 0 1
     confirm_transaction "Confirming the partial annual rollover"
     status_compact
     success "Three sequential allowances funded; rollover continued."
@@ -1084,6 +1086,49 @@ test_savings_spend() {
     success "Each savings path opened exactly on its date."
 }
 
+test_presigned_renewal() {
+    local initial_rollover_height renewal_date
+    setup_vault
+
+    step "Presign two years in one HWW ceremony"
+    ceremony "$NOW"
+    confirm_transaction "Confirming the first-year rollover"
+    initial_rollover_height=$(node_height)
+    success "One HWW approval covered the first year and its presigned renewal."
+
+    step "Try the renewal before it unlocks"
+    expect_failure "the renewal unlocks 360 days after the first-year rollover" \
+        "$MAIN" phone renew
+    success "The presigned renewal cannot be broadcast early."
+
+    renewal_date=$((NOW + 361 * 24 * 60 * 60))
+    step "Wait about a year without crossing either recovery deadline"
+    mine_to_next_height "$((initial_rollover_height + BLOCKS_PER_YEAR - 11))" \
+        "Mining a year of real block height"
+    advance_mtp_to "$renewal_date" "Advance the calendar past the renewal date"
+    expect_failure "phone recovery is still locked at the renewal date" \
+        "$MAIN" phone recover "$MINING_ADDRESS"
+    success "Renewal date reached before either recovery path activated."
+
+    step "Start the second year from the phone alone"
+    anzen "$MAIN" phone renew
+    confirm_transaction "Confirming the presigned second-year rollover"
+    require_live_controllers 2
+    success "Second year started without the HWW."
+
+    step "Claim an unclaimed first-year month after the renewal"
+    anzen "$MAIN" phone authorize 1 --previous
+    confirm_transaction "Confirming the first-year allowance"
+    success "Unclaimed first-year months stay claimable after the renewal."
+
+    step "Reach the first-year phone-recovery deadline"
+    mine_to_next_height "$((initial_rollover_height + PHONE_RECOVERY_BLOCKS))" \
+        "Mining until the first-year phone-recovery deadline"
+    expect_failure "the renewal reset the cold remainder's recovery timer" \
+        "$MAIN" phone recover "$MINING_ADDRESS"
+    success "Renewed savings stayed locked past the old recovery deadline."
+}
+
 test_rollover_forgotten() {
     local phone_target hww_target current_mtp
     setup_vault
@@ -1138,6 +1183,7 @@ case "$E2E_TEST" in
     rollover-forgotten) test_rollover_forgotten ;;
     savings-lock) test_savings_lock ;;
     savings-spend) test_savings_spend ;;
+    presigned-renewal) test_presigned_renewal ;;
     *)
         printf 'ERROR: test %s is listed but has no case here\n' "$E2E_TEST" >&2
         exit 1
