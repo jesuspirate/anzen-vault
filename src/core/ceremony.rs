@@ -1,6 +1,6 @@
 use super::{
     CONNECTOR_VALUE_SATS, DEFAULT_FEE_RATE_SAT_VB, EMERGENCY_ACCESS_DELAY_SECONDS,
-    MONTHLY_ALLOWANCE_DELAY_SECONDS, MONTHS_PER_ROLLOVER,
+    MONTHLY_ALLOWANCE_DELAY_SECONDS, MONTHS_PER_ROLLOVER, PRESIGNED_RENEWAL_DELAY_SECONDS,
     crypto::EncryptedBlob,
     keys::DeviceKeys,
     policy::{ControllerPath, ControllerPolicy, SpendPath, VaultPolicy},
@@ -29,11 +29,14 @@ use std::{
 pub const DEFAULT_BATCH_DIR: &str = "ceremony/active";
 pub const SCHEDULE_FILE: &str = "phone/schedule.json";
 pub const POLICY_PACKAGE_KIND: &str = "vault-policy";
+/// Subdirectory of a ceremony that holds its presigned next-epoch renewal.
+pub const NEXT_BATCH_DIR: &str = "next";
 
 /// The emergency trigger pays only vault and connector outputs, so it carries a small
 /// pay-to-anchor output (spendable by anyone, no signature) that the phone spends in a child
 /// transaction to raise the fee at broadcast time. 240 sats is the P2A dust threshold.
-pub const TRIGGER_ANCHOR_VALUE_SATS: u64 = 240;
+pub const ANCHOR_VALUE_SATS: u64 = 240;
+pub const TRIGGER_ANCHOR_VALUE_SATS: u64 = ANCHOR_VALUE_SATS;
 pub const TRIGGER_ANCHOR_VOUT: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +88,17 @@ pub struct EmergencyAccessPolicy {
     pub withdrawal: BatchTransaction,
 }
 
+/// Ties a presigned renewal to the epoch it renews: its rollover spends that epoch's cold
+/// remainder, and only after a relative delay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenewalLink {
+    pub parent_rollover_txid: String,
+    pub outpoint: OutPoint,
+    pub value_sats: u64,
+    pub delay_seconds: u32,
+    pub delay_sequence: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchManifest {
     pub version: u8,
@@ -116,6 +130,15 @@ pub struct BatchManifest {
     pub emergency_access: Option<EmergencyAccessPolicy>,
     pub phone_approved: bool,
     pub hww_approved: bool,
+    /// Set when this epoch is a presigned renewal of an earlier one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renews: Option<RenewalLink>,
+    /// A presigned renewal's rollover carries a pay-to-anchor output so the phone can bump it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollover_anchor_vout: Option<u32>,
+    /// Whether this ceremony also holds the next epoch's renewal in `NEXT_BATCH_DIR`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_presigned_renewal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +210,10 @@ pub struct Schedule {
     pub entries: Vec<ScheduleEntry>,
     #[serde(default)]
     pub emergency_access: Option<EmergencyAccessSchedule>,
+    /// After a presigned renewal, the previous epoch's allowance steps. Its chain is not swept
+    /// by the renewal, so any unclaimed months stay claimable alongside the new epoch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_entries: Vec<ScheduleEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +222,8 @@ pub struct PolicyPackage {
     pub kind: String,
     pub manifest: BatchManifest,
     pub psbts: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<Box<PolicyPackage>>,
 }
 
 /// Supplies fresh phone receive addresses without coupling the protocol rules to a wallet SDK.
@@ -214,11 +243,19 @@ pub fn package_from_batch(batch_dir: &Path) -> Result<PolicyPackage> {
             .with_context(|| format!("failed to read packaged PSBT {}", transaction.psbt_file))?;
         psbts.insert(transaction.psbt_file.clone(), text.trim().to_owned());
     }
+    let next = if manifest.has_presigned_renewal {
+        Some(Box::new(package_from_batch(
+            &batch_dir.join(NEXT_BATCH_DIR),
+        )?))
+    } else {
+        None
+    };
     Ok(PolicyPackage {
         version: 5,
         kind: POLICY_PACKAGE_KIND.to_owned(),
         manifest,
         psbts,
+        next,
     })
 }
 
@@ -257,7 +294,11 @@ pub fn materialize_policy_package(package: &PolicyPackage, batch_dir: &Path) -> 
             format!("{psbt}\n").as_bytes(),
         )?;
     }
-    Ok(())
+    match (&package.next, package.manifest.has_presigned_renewal) {
+        (Some(next), true) => materialize_policy_package(next, &batch_dir.join(NEXT_BATCH_DIR)),
+        (None, false) => Ok(()),
+        _ => bail!("policy package renewal does not match its manifest"),
+    }
 }
 
 pub fn build_policy_proposal(
@@ -277,6 +318,105 @@ pub fn build_policy_proposal_with_connectors(
     config: &VaultConfig,
     vault_utxos: &[VaultUtxo],
     controller_utxos: &[VaultUtxo],
+    now: DateTime<Utc>,
+    limits: PolicyLimits,
+    batch_dir: &Path,
+    phone: &DeviceKeys,
+    hot: &mut impl HotAddressProvider,
+) -> Result<BatchManifest> {
+    build_epoch(
+        config,
+        vault_utxos,
+        controller_utxos,
+        None,
+        now,
+        limits,
+        batch_dir,
+        phone,
+        hot,
+    )
+}
+
+/// Build this epoch's ceremony and, when `presigned_years` is 2, the next epoch's renewal in
+/// `NEXT_BATCH_DIR`. The renewal's rollover spends this epoch's cold remainder after
+/// `PRESIGNED_RENEWAL_DELAY_SECONDS`, so one HWW ceremony covers two years.
+#[allow(clippy::too_many_arguments)]
+pub fn build_policy_proposal_with_renewal(
+    config: &VaultConfig,
+    vault_utxos: &[VaultUtxo],
+    controller_utxos: &[VaultUtxo],
+    now: DateTime<Utc>,
+    limits: PolicyLimits,
+    presigned_years: u8,
+    batch_dir: &Path,
+    phone: &DeviceKeys,
+    hot: &mut impl HotAddressProvider,
+) -> Result<BatchManifest> {
+    if !(1..=2).contains(&presigned_years) {
+        bail!("a ceremony can presign one or two years");
+    }
+    let mut manifest = build_epoch(
+        config,
+        vault_utxos,
+        controller_utxos,
+        None,
+        now,
+        limits,
+        batch_dir,
+        phone,
+        hot,
+    )?;
+    if presigned_years == 1 {
+        return Ok(manifest);
+    }
+    let link = renewal_link(&manifest)?;
+    let remainder = VaultUtxo {
+        outpoint: link.outpoint,
+        txout: TxOut {
+            value: Amount::from_sat(link.value_sats),
+            script_pubkey: Address::from_str(&config.vault_address)?
+                .require_network(config.bitcoin_network()?)?
+                .script_pubkey(),
+        },
+        confirmation_height: 0,
+    };
+    build_epoch(
+        config,
+        &[remainder],
+        &[],
+        Some(&link),
+        now,
+        limits,
+        &batch_dir.join(NEXT_BATCH_DIR),
+        phone,
+        hot,
+    )
+    .context("the vault balance cannot fund a presigned second year; presign one year instead")?;
+    manifest.has_presigned_renewal = true;
+    write_json(&batch_dir.join("manifest.json"), &manifest)?;
+    Ok(manifest)
+}
+
+/// The renewal that the epoch described by `parent` must be followed by.
+fn renewal_link(parent: &BatchManifest) -> Result<RenewalLink> {
+    Ok(RenewalLink {
+        parent_rollover_txid: parent.rollover.unsigned_txid.clone(),
+        outpoint: OutPoint::new(
+            parent.rollover.unsigned_txid.parse()?,
+            parent.remainder_vout,
+        ),
+        value_sats: parent.remainder_value_sats,
+        delay_seconds: PRESIGNED_RENEWAL_DELAY_SECONDS,
+        delay_sequence: renewal_delay_sequence()?.to_consensus_u32(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_epoch(
+    config: &VaultConfig,
+    vault_utxos: &[VaultUtxo],
+    controller_utxos: &[VaultUtxo],
+    renewal: Option<&RenewalLink>,
     now: DateTime<Utc>,
     limits: PolicyLimits,
     batch_dir: &Path,
@@ -322,9 +462,14 @@ pub fn build_policy_proposal_with_connectors(
     let total_input_sats = vault_input_sats
         .checked_add(controller_input_sats)
         .context("policy input total overflowed")?;
+    let has_anchor = renewal.is_some();
+    let anchor_sats = if has_anchor { ANCHOR_VALUE_SATS } else { 0 };
+    let vault_sequence = renewal.map_or(Sequence::MAX, |link| {
+        Sequence::from_consensus(link.delay_sequence)
+    });
     let mut input_template = vault_utxos
         .iter()
-        .map(|utxo| vault_input(utxo.outpoint, Sequence::MAX))
+        .map(|utxo| vault_input(utxo.outpoint, vault_sequence))
         .collect::<Vec<_>>();
     input_template.extend(
         controller_utxos
@@ -426,6 +571,7 @@ pub fn build_policy_proposal_with_connectors(
                 controller_script.clone(),
                 true,
                 emergency_access_limit_sats > 0,
+                has_anchor,
             );
             let fee = estimate_policy_vsize(
                 &template,
@@ -443,12 +589,14 @@ pub fn build_policy_proposal_with_connectors(
                 .and_then(|value| {
                     value.checked_add(CONNECTOR_VALUE_SATS * connector_outputs as u64)
                 })
+                .and_then(|value| value.checked_add(anchor_sats))
                 .context("allowance rollover requirement overflowed")?;
             if total_input_sats >= required {
                 let remainder = total_input_sats
                     - fee
                     - allowance_value
-                    - CONNECTOR_VALUE_SATS * connector_outputs as u64;
+                    - CONNECTOR_VALUE_SATS * connector_outputs as u64
+                    - anchor_sats;
                 selected_rollover = Some((count, allowance_value, fee, remainder));
                 break;
             }
@@ -467,6 +615,7 @@ pub fn build_policy_proposal_with_connectors(
                     controller_script.clone(),
                     false,
                     emergency_access_limit_sats > 0,
+                    has_anchor,
                 );
                 let fee = estimate_policy_vsize(
                     &template,
@@ -483,6 +632,7 @@ pub fn build_policy_proposal_with_connectors(
                     .and_then(|value| {
                         value.checked_sub(CONNECTOR_VALUE_SATS * connector_outputs as u64)
                     })
+                    .and_then(|value| value.checked_sub(anchor_sats))
                     .context("vault balance cannot pay the rollover fee")?;
                 (0, 0, fee, remainder)
             }
@@ -502,6 +652,7 @@ pub fn build_policy_proposal_with_connectors(
         controller_script.clone(),
         allowance_count > 0,
         emergency_access_limit_sats > 0,
+        has_anchor,
     );
     let rollover_txid = rollover_tx.compute_txid();
     let mut prevouts = vault_utxos
@@ -714,6 +865,11 @@ pub fn build_policy_proposal_with_connectors(
         emergency_access,
         phone_approved: true,
         hww_approved: false,
+        renews: renewal.cloned(),
+        rollover_anchor_vout: has_anchor
+            .then(|| u32::try_from(rollover_tx.output.len() - 1))
+            .transpose()?,
+        has_presigned_renewal: false,
     };
     write_json(&batch_dir.join("manifest.json"), &manifest)?;
     Ok(manifest)
@@ -761,6 +917,9 @@ pub fn validate_approved_batch(
                     .context("rollover controller input cannot finalize")?;
             }
         }
+    }
+    if let Some(next) = load_presigned_renewal(manifest, batch_dir)? {
+        validate_approved_batch(config, &next, &batch_dir.join(NEXT_BATCH_DIR))?;
     }
     Ok(policy)
 }
@@ -810,10 +969,45 @@ pub fn validate_batch(
     let vault_indexes = transaction_indexes(&manifest.rollover.vault_input_indexes)?;
     let controller_indexes = transaction_indexes(&manifest.rollover.controller_input_indexes)?;
     validate_input_partition(rollover_tx.input.len(), &vault_indexes, &controller_indexes)?;
+    let expected_vault_sequence = match &manifest.renews {
+        Some(link) => {
+            let expected_delay = renewal_delay_sequence()?;
+            if link.delay_seconds != PRESIGNED_RENEWAL_DELAY_SECONDS
+                || link.delay_sequence != expected_delay.to_consensus_u32()
+                || vault_indexes.len() != 1
+                || !controller_indexes.is_empty()
+                || rollover_tx.input[vault_indexes[0]].previous_output != link.outpoint
+                || manifest.vault_input_sats != link.value_sats
+            {
+                bail!("presigned renewal does not spend the renewed epoch's remainder");
+            }
+            expected_delay
+        }
+        None => Sequence::MAX,
+    };
+    let has_anchor = manifest.renews.is_some();
     let expected_output_count = usize::from(manifest.allowance_count > 0)
         + 1
         + usize::from(manifest.allowance_count > 0)
-        + usize::from(manifest.emergency_access_limit_sats > 0);
+        + usize::from(manifest.emergency_access_limit_sats > 0)
+        + usize::from(has_anchor);
+    let expected_anchor_vout = has_anchor
+        .then(|| u32::try_from(expected_output_count - 1))
+        .transpose()?;
+    if manifest.rollover_anchor_vout != expected_anchor_vout {
+        bail!("rollover anchor does not match the approved policy");
+    }
+    if let Some(vout) = expected_anchor_vout {
+        let anchor = rollover_tx
+            .output
+            .get(vout as usize)
+            .context("rollover anchor vout is out of range")?;
+        if anchor.script_pubkey != ScriptBuf::new_p2a()
+            || anchor.value.to_sat() != ANCHOR_VALUE_SATS
+        {
+            bail!("rollover anchor output does not match the approved policy");
+        }
+    }
     if rollover_tx.compute_txid().to_string() != manifest.rollover.unsigned_txid
         || rollover_tx.version != Version::TWO
         || rollover_tx.lock_time != absolute::LockTime::ZERO
@@ -822,7 +1016,7 @@ pub fn validate_batch(
         || rollover_tx.output.len() != expected_output_count
         || vault_indexes
             .iter()
-            .any(|index| rollover_tx.input[*index].sequence != Sequence::MAX)
+            .any(|index| rollover_tx.input[*index].sequence != expected_vault_sequence)
         || controller_indexes
             .iter()
             .any(|index| rollover_tx.input[*index].sequence != Sequence::ENABLE_RBF_NO_LOCKTIME)
@@ -908,7 +1102,36 @@ pub fn validate_batch(
 
     validate_allowances(config, manifest, batch_dir, &policy, &controller, &rollover)?;
     validate_connector_emergency(config, manifest, batch_dir, &policy, &controller, &rollover)?;
+    if let Some(next) = load_presigned_renewal(manifest, batch_dir)? {
+        validate_batch(config, &next, &batch_dir.join(NEXT_BATCH_DIR))?;
+    }
     Ok(policy)
+}
+
+/// Load the presigned renewal a ceremony carries and check that it renews exactly this epoch
+/// with the same limits. Renewals are one level deep: a renewal never carries its own.
+pub fn load_presigned_renewal(
+    manifest: &BatchManifest,
+    batch_dir: &Path,
+) -> Result<Option<BatchManifest>> {
+    if !manifest.has_presigned_renewal {
+        return Ok(None);
+    }
+    if manifest.renews.is_some() {
+        bail!("a presigned renewal cannot carry another renewal");
+    }
+    let next = load_manifest(&batch_dir.join(NEXT_BATCH_DIR))?;
+    if next.renews.as_ref() != Some(&renewal_link(manifest)?)
+        || next.has_presigned_renewal
+        || next.network != manifest.network
+        || next.monthly_limit_sats != manifest.monthly_limit_sats
+        || next.emergency_access_limit_sats != manifest.emergency_access_limit_sats
+        || next.phone_approved != manifest.phone_approved
+        || next.hww_approved != manifest.hww_approved
+    {
+        bail!("presigned renewal does not match the epoch it renews");
+    }
+    Ok(Some(next))
 }
 
 fn validate_allowances(
@@ -1582,6 +1805,7 @@ fn authorization_template(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rollover_template(
     inputs: Vec<TxIn>,
     allowance_value: Option<u64>,
@@ -1590,12 +1814,14 @@ fn rollover_template(
     controller_script: ScriptBuf,
     monthly_connector: bool,
     emergency_connector: bool,
+    anchor: bool,
 ) -> Transaction {
     let mut outputs = Vec::with_capacity(
         usize::from(allowance_value.is_some())
             + 1
             + usize::from(monthly_connector)
-            + usize::from(emergency_connector),
+            + usize::from(emergency_connector)
+            + usize::from(anchor),
     );
     if let Some(value) = allowance_value {
         outputs.push(TxOut {
@@ -1613,12 +1839,23 @@ fn rollover_template(
             script_pubkey: controller_script.clone(),
         });
     }
+    if anchor {
+        outputs.push(TxOut {
+            value: Amount::from_sat(ANCHOR_VALUE_SATS),
+            script_pubkey: ScriptBuf::new_p2a(),
+        });
+    }
     Transaction {
         version: Version::TWO,
         lock_time: absolute::LockTime::ZERO,
         input: inputs,
         output: outputs,
     }
+}
+
+fn renewal_delay_sequence() -> Result<Sequence> {
+    Sequence::from_seconds_ceil(PRESIGNED_RENEWAL_DELAY_SECONDS)
+        .context("presigned renewal delay cannot be represented by BIP68")
 }
 
 fn emergency_delay_sequence() -> Result<Sequence> {
@@ -1784,6 +2021,123 @@ mod tests {
             },
             confirmation_height: 1,
         }
+    }
+
+    fn prepare_two_years(data_dir: &Path, config: &VaultConfig, batch_dir: &Path) -> BatchManifest {
+        let phone = load_device_keys(data_dir, PHONE_DEVICE_FILE).unwrap();
+        let mut hot = HotWallet::open_or_create(data_dir).unwrap();
+        build_policy_proposal_with_renewal(
+            config,
+            &[fake_utxo(config, 400_000_000)],
+            &[],
+            Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap(),
+            PolicyLimits {
+                monthly_limit_sats: 10_000_000,
+                emergency_access_limit_sats: 50_000_000,
+            },
+            2,
+            batch_dir,
+            &phone,
+            &mut hot,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn two_year_ceremony_presigns_a_delayed_renewal_of_the_remainder() {
+        let dir = tempfile::tempdir().unwrap();
+        let initialized = initialize(dir.path()).unwrap();
+        let batch = dir.path().join("batch");
+        let first = prepare_two_years(dir.path(), &initialized.config, &batch);
+        assert!(first.has_presigned_renewal);
+        assert_eq!(first.allowance_count, MONTHS_PER_ROLLOVER);
+
+        let next_dir = batch.join(NEXT_BATCH_DIR);
+        let next = load_manifest(&next_dir).unwrap();
+        let link = next.renews.clone().unwrap();
+        assert_eq!(link.parent_rollover_txid, first.rollover.unsigned_txid);
+        assert_eq!(link.value_sats, first.remainder_value_sats);
+        assert_eq!(next.allowance_count, MONTHS_PER_ROLLOVER);
+        assert!(next.emergency_access.is_some());
+        assert!(!next.has_presigned_renewal);
+
+        let rollover = read_psbt(&next_dir.join(&next.rollover.psbt_file)).unwrap();
+        let tx = &rollover.unsigned_tx;
+        assert_eq!(tx.input.len(), 1);
+        assert_eq!(
+            tx.input[0].previous_output,
+            OutPoint::new(
+                first.rollover.unsigned_txid.parse().unwrap(),
+                first.remainder_vout
+            )
+        );
+        assert_eq!(
+            tx.input[0].sequence,
+            Sequence::from_seconds_ceil(PRESIGNED_RENEWAL_DELAY_SECONDS).unwrap()
+        );
+        let anchor_vout = next.rollover_anchor_vout.unwrap() as usize;
+        assert_eq!(anchor_vout, tx.output.len() - 1);
+        assert_eq!(tx.output[anchor_vout].script_pubkey, ScriptBuf::new_p2a());
+
+        let approved = cold_wallet::approve_policy(dir.path(), &batch).unwrap();
+        assert!(approved.hww_approved);
+        assert!(load_manifest(&next_dir).unwrap().hww_approved);
+        validate_approved_batch(&initialized.config, &approved, &batch).unwrap();
+        let renewal =
+            finalize_vault_psbt(read_psbt(&next_dir.join(&next.rollover.psbt_file)).unwrap());
+        assert!(renewal.is_ok(), "the renewal rollover is fully presigned");
+
+        let package = package_from_batch(&batch).unwrap();
+        let restored = dir.path().join("restored");
+        materialize_policy_package(&package, &restored).unwrap();
+        validate_approved_batch(
+            &initialized.config,
+            &load_manifest(&restored).unwrap(),
+            &restored,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn hww_rejects_a_renewal_without_its_relative_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let initialized = initialize(dir.path()).unwrap();
+        let batch = dir.path().join("batch");
+        prepare_two_years(dir.path(), &initialized.config, &batch);
+        let next_dir = batch.join(NEXT_BATCH_DIR);
+        let mut next = load_manifest(&next_dir).unwrap();
+        let path = next_dir.join(&next.rollover.psbt_file);
+        let mut psbt = read_psbt(&path).unwrap();
+        psbt.unsigned_tx.input[0].sequence = Sequence::MAX;
+        next.rollover.unsigned_txid = psbt.unsigned_tx.compute_txid().to_string();
+        write_psbt(&path, &psbt).unwrap();
+        write_json(&next_dir.join("manifest.json"), &next).unwrap();
+        assert!(cold_wallet::approve_policy(dir.path(), &batch).is_err());
+    }
+
+    #[test]
+    fn hww_rejects_a_renewal_of_a_different_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let initialized = initialize(dir.path()).unwrap();
+        let batch = dir.path().join("batch");
+        prepare_two_years(dir.path(), &initialized.config, &batch);
+        let next_dir = batch.join(NEXT_BATCH_DIR);
+        let mut next = load_manifest(&next_dir).unwrap();
+        let link = next.renews.as_mut().unwrap();
+        link.outpoint.vout += 1;
+        write_json(&next_dir.join("manifest.json"), &next).unwrap();
+        assert!(cold_wallet::approve_policy(dir.path(), &batch).is_err());
+    }
+
+    #[test]
+    fn package_without_its_declared_renewal_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let initialized = initialize(dir.path()).unwrap();
+        let batch = dir.path().join("batch");
+        prepare_two_years(dir.path(), &initialized.config, &batch);
+        let mut package = package_from_batch(&batch).unwrap();
+        package.next = None;
+        assert!(materialize_policy_package(&package, &dir.path().join("restored")).is_err());
     }
 
     #[test]

@@ -48,7 +48,7 @@ fn real_regtest_runs_sequential_allowances_whole_chain_revocation_and_soft_limit
     let now = DateTime::from_timestamp(captured_now, 0).unwrap();
     let batch_dir = dir.path().join("batch");
     let prepared =
-        hot_wallet::propose_policy(dir.path(), &rpc, now, 10_000_000, 0, &batch_dir).unwrap();
+        hot_wallet::propose_policy(dir.path(), &rpc, now, 10_000_000, 0, 1, &batch_dir).unwrap();
     assert_eq!(prepared.allowance_count, 12);
     let approved = cold_wallet::approve_policy(dir.path(), &batch_dir).unwrap();
     assert!(approved.hww_approved);
@@ -160,7 +160,8 @@ fn real_regtest_enforces_emergency_delay_and_cancellation() {
     let captured_now = Utc::now().timestamp().max(chain_time);
     let now = DateTime::from_timestamp(captured_now, 0).unwrap();
     let batch_dir = dir.path().join("emergency-cancel-batch");
-    hot_wallet::propose_policy(dir.path(), &rpc, now, 10_000_000, 50_000_000, &batch_dir).unwrap();
+    hot_wallet::propose_policy(dir.path(), &rpc, now, 10_000_000, 50_000_000, 1, &batch_dir)
+        .unwrap();
     cold_wallet::approve_policy(dir.path(), &batch_dir).unwrap();
     hot_wallet::activate_policy(dir.path(), &rpc, &batch_dir).unwrap();
     set_policy_limits(dir.path(), 10_000_000, 50_000_000).unwrap();
@@ -204,7 +205,8 @@ fn real_regtest_releases_emergency_access_after_one_week() {
     let captured_now = Utc::now().timestamp().max(chain_time);
     let now = DateTime::from_timestamp(captured_now, 0).unwrap();
     let batch_dir = dir.path().join("emergency-withdraw-batch");
-    hot_wallet::propose_policy(dir.path(), &rpc, now, 10_000_000, 50_000_000, &batch_dir).unwrap();
+    hot_wallet::propose_policy(dir.path(), &rpc, now, 10_000_000, 50_000_000, 1, &batch_dir)
+        .unwrap();
     cold_wallet::approve_policy(dir.path(), &batch_dir).unwrap();
     hot_wallet::activate_policy(dir.path(), &rpc, &batch_dir).unwrap();
     set_policy_limits(dir.path(), 10_000_000, 50_000_000).unwrap();
@@ -249,7 +251,8 @@ fn real_regtest_hww_revokes_every_live_policy_controller() {
     let chain_time = rpc.chain_info().unwrap().median_time as i64;
     let now = DateTime::from_timestamp(Utc::now().timestamp().max(chain_time), 0).unwrap();
     let batch_dir = dir.path().join("hww-revoke-batch");
-    hot_wallet::propose_policy(dir.path(), &rpc, now, 10_000_000, 50_000_000, &batch_dir).unwrap();
+    hot_wallet::propose_policy(dir.path(), &rpc, now, 10_000_000, 50_000_000, 1, &batch_dir)
+        .unwrap();
     cold_wallet::approve_policy(dir.path(), &batch_dir).unwrap();
     let schedule = hot_wallet::activate_policy(dir.path(), &rpc, &batch_dir).unwrap();
     rpc.mine(1, &mining_address).unwrap();
