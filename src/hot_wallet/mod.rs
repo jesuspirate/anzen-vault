@@ -366,6 +366,7 @@ pub fn propose_policy(
     now: DateTime<Utc>,
     monthly_limit_sats: u64,
     emergency_access_limit_sats: u64,
+    presigned_years: u8,
     batch_dir: &Path,
 ) -> Result<BatchManifest> {
     let config = load_config(data_dir)?;
@@ -374,7 +375,7 @@ pub fn propose_policy(
     let connectors = backend.scan_connectors(&config)?;
     let phone = load_device_keys(data_dir, PHONE_DEVICE_FILE)?;
     let mut wallet = HotWallet::open_or_create(data_dir)?;
-    ceremony::build_policy_proposal_with_connectors(
+    ceremony::build_policy_proposal_with_renewal(
         &config,
         &utxos,
         &connectors,
@@ -383,9 +384,42 @@ pub fn propose_policy(
             monthly_limit_sats,
             emergency_access_limit_sats,
         },
+        presigned_years,
         batch_dir,
         &phone,
         &mut wallet,
+    )
+}
+
+/// Broadcast the active epoch's presigned renewal and switch to its schedule. Its rollover is
+/// valid only once the current rollover's cold remainder is 360 days old.
+pub fn activate_presigned_renewal(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+) -> Result<Schedule> {
+    let schedule = load_schedule(data_dir)?;
+    let blob: crate::core::crypto::EncryptedBlob = crate::core::storage::read_json(
+        &data_dir
+            .join("phone/transactions")
+            .join(&schedule.rollover_txid)
+            .join("approved-policy.json"),
+    )
+    .context("the active policy's approval record is missing")?;
+    let package = open_approved_policy(data_dir, ApprovedPolicyInput::Encrypted(blob))?;
+    if package.manifest.rollover.unsigned_txid != schedule.rollover_txid {
+        bail!("the stored approval does not belong to the active policy");
+    }
+    let next = package
+        .next
+        .context("the active policy has no presigned renewal; run a new HWW ceremony")?;
+    let renewal_dir = data_dir
+        .join("phone/renewals")
+        .join(&next.manifest.rollover.unsigned_txid);
+    if !renewal_dir.join("manifest.json").is_file() {
+        ceremony::materialize_policy_package(&next, &renewal_dir)?;
+    }
+    activate_policy(data_dir, backend, &renewal_dir).context(
+        "presigned renewal was not accepted; it unlocks 360 days after the current rollover confirmed",
     )
 }
 
@@ -487,7 +521,16 @@ pub fn activate_policy(
             })
         })
         .transpose()?;
+    // A presigned renewal leaves the previous allowance chain in place, so keep its steps.
+    let previous_entries = match (&manifest.renews, previous_epoch) {
+        (Some(link), Some(previous)) if link.parent_rollover_txid == previous.to_string() => {
+            load_schedule(data_dir)?.entries
+        }
+        (Some(_), _) => bail!("presigned renewal does not renew the active policy"),
+        (None, _) => Vec::new(),
+    };
     let schedule = Schedule {
+        previous_entries,
         version: 5,
         rollover_txid: rollover.compute_txid().to_string(),
         controller_descriptor: manifest.controller_descriptor.clone(),
@@ -500,9 +543,18 @@ pub fn activate_policy(
         emergency_access,
     };
     write_json(&epoch_dir.join("schedule.json"), &schedule)?;
-    let broadcast_txid = backend
-        .broadcast(&rollover)
-        .context("failed to broadcast rollover transaction")?;
+    let broadcast_txid = match manifest.rollover_anchor_vout {
+        // A presigned renewal's fee was fixed a year ago; bump it to today's rate.
+        Some(anchor_vout) => broadcast_with_anchor_bump(
+            data_dir,
+            backend,
+            &rollover,
+            manifest.rollover.fee_sats,
+            anchor_vout,
+        ),
+        None => backend.broadcast(&rollover),
+    }
+    .context("failed to broadcast rollover transaction")?;
     if broadcast_txid != rollover.compute_txid() {
         bail!("chain backend returned an unexpected rollover transaction ID");
     }
@@ -639,8 +691,14 @@ fn broadcast_emergency_transaction(
         return Ok(txid);
     }
     // The trigger pays no hot-wallet output, so the phone bumps it through its anchor.
-    broadcast_with_anchor_bump(data_dir, backend, &transaction, parent_fee)
-        .with_context(|| format!("failed to broadcast emergency access {kind:?}"))?;
+    broadcast_with_anchor_bump(
+        data_dir,
+        backend,
+        &transaction,
+        parent_fee,
+        ceremony::TRIGGER_ANCHOR_VOUT as u32,
+    )
+    .with_context(|| format!("failed to broadcast emergency access {kind:?}"))?;
     Ok(txid)
 }
 
@@ -650,9 +708,33 @@ pub fn broadcast_monthly(
     step: u8,
     kind: TransactionKind,
 ) -> Result<MonthlyBroadcastResult> {
+    broadcast_monthly_entry(data_dir, backend, step, kind, false)
+}
+
+/// Like `broadcast_monthly`, for a step of the epoch that a presigned renewal replaced.
+pub fn broadcast_previous_monthly(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+    step: u8,
+    kind: TransactionKind,
+) -> Result<MonthlyBroadcastResult> {
+    broadcast_monthly_entry(data_dir, backend, step, kind, true)
+}
+
+fn broadcast_monthly_entry(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+    step: u8,
+    kind: TransactionKind,
+    previous: bool,
+) -> Result<MonthlyBroadcastResult> {
     let schedule = load_schedule(data_dir)?;
-    let entry = schedule
-        .entries
+    let entries = if previous {
+        &schedule.previous_entries
+    } else {
+        &schedule.entries
+    };
+    let entry = entries
         .iter()
         .find(|entry| entry.step == step)
         .with_context(|| format!("no allowance exists for step {step}"))?;
@@ -773,11 +855,11 @@ fn broadcast_with_anchor_bump(
     backend: &dyn HotWalletBackend,
     parent: &Transaction,
     parent_fee: u64,
+    anchor_vout: u32,
 ) -> Result<Txid> {
     use crate::core::fees;
     // Anchor input (41 vB) plus one P2TR key-path input and one P2TR change output.
     const CHILD_VSIZE_ESTIMATE: u64 = 152;
-    let anchor_vout = ceremony::TRIGGER_ANCHOR_VOUT as u32;
 
     let txid = parent.compute_txid();
     let target = backend

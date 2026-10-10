@@ -179,6 +179,10 @@ fn approve_policy_for_config(
     }
     manifest.hww_approved = true;
     write_json(&batch_dir.join("manifest.json"), &manifest)?;
+    // The parent validation above already checked that the renewal spends this epoch's remainder.
+    if manifest.has_presigned_renewal {
+        approve_policy_for_config(data_dir, config, &batch_dir.join(ceremony::NEXT_BATCH_DIR))?;
+    }
     Ok(manifest)
 }
 
