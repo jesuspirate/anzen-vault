@@ -154,6 +154,23 @@ enum PhoneCommand {
     },
     /// Verify and broadcast an HWW-approved cooperative sweep.
     BroadcastSweep { approved_sweep: PathBuf },
+    /// Build and phone-sign a spend of every coin in an unlocked savings lock.
+    SavingsSpend {
+        destination: String,
+        /// The lock's unlock date (YYYY-MM-DD); optional when there is only one lock.
+        #[arg(long)]
+        unlock: Option<String>,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify and broadcast an HWW-approved savings spend.
+    BroadcastSavingsSpend { approved_spend: PathBuf },
+    /// Move a savings lock's coins with the phone alone, 425 days after its unlock date.
+    RecoverSavings {
+        destination: String,
+        #[arg(long)]
+        unlock: Option<String>,
+    },
     /// Propose a new phone key while preserving the active vault policy.
     RotateKey {
         /// Grind until the new vault address begins with bc1pvault or bcrt1pvault.
@@ -210,6 +227,20 @@ enum HwwCommand {
         destination: String,
         #[arg(long)]
         yes: bool,
+    },
+    /// Validate and sign a phone-created savings spend.
+    ConfirmSavingsSpend {
+        proposal: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Move a savings lock's coins with the HWW alone, 455 days after its unlock date.
+    RecoverSavings {
+        destination: String,
+        #[arg(long)]
+        unlock: Option<String>,
     },
     /// Validate and sign a phone-created cooperative sweep.
     ConfirmSweep {
@@ -547,6 +578,36 @@ fn run_phone(
                 hot_wallet::broadcast_cooperative_sweep(data_dir, backend.as_ref(), &package)?;
             print_sweep_result("Cooperative vault sweep broadcast", &result);
         }
+        PhoneCommand::SavingsSpend {
+            destination,
+            unlock,
+            output,
+        } => {
+            let address = configured_address(data_dir, &destination)?;
+            let unlock = unlock.as_deref().map(parse_unlock_date).transpose()?;
+            let backend = rpc_args.connect_hot(data_dir)?;
+            let package =
+                hot_wallet::create_savings_spend(data_dir, backend.as_ref(), unlock, &address)?;
+            report_savings_spend(&package, artifact_reports_to_stderr(&output))?;
+            write_artifact(&output, &package)?;
+            report_artifact(&output, "Phone-signed savings spend")?;
+        }
+        PhoneCommand::BroadcastSavingsSpend { approved_spend } => {
+            let package: core::savings_spend::SavingsSpendPackage = read_artifact(&approved_spend)?;
+            let backend = rpc_args.connect_hot(data_dir)?;
+            let result = hot_wallet::broadcast_savings_spend(data_dir, backend.as_ref(), &package)?;
+            print_spend_result("Savings spend broadcast", &result, package.fee_rate_sat_vb);
+        }
+        PhoneCommand::RecoverSavings {
+            destination,
+            unlock,
+        } => {
+            let address = configured_address(data_dir, &destination)?;
+            let unlock = unlock.as_deref().map(parse_unlock_date).transpose()?;
+            let backend = rpc_args.connect_hot(data_dir)?;
+            let result = hot_wallet::recover_savings(data_dir, backend.as_ref(), unlock, &address)?;
+            print_sweep_result_line("Phone savings recovery broadcast", &result);
+        }
         PhoneCommand::RotateKey { vanity, output } => {
             let backend = rpc_args.connect_hot(data_dir)?;
             let package = if vanity {
@@ -701,6 +762,50 @@ fn run_hww(
             }
             println!("HWW policy revocation broadcast: {txid}");
             println!("Revoked controller outputs: {}", connectors.len());
+        }
+        HwwCommand::ConfirmSavingsSpend {
+            proposal,
+            output,
+            yes,
+        } => {
+            let package: core::savings_spend::SavingsSpendPackage = read_artifact(&proposal)?;
+            core::savings_spend::validate_savings_spend(
+                &core::storage::load_config(data_dir)?,
+                &package,
+            )?;
+            report_savings_spend(&package, true)?;
+            require_hww_approval(yes, proposal.as_path(), "savings spend")?;
+            let approved = cold_wallet::approve_savings_spend(data_dir, &package)?;
+            eprintln!("HWW validated and signed the savings spend");
+            write_artifact(&output, &approved)?;
+            report_artifact(&output, "HWW-approved savings spend")?;
+        }
+        HwwCommand::RecoverSavings {
+            destination,
+            unlock,
+        } => {
+            let destination = configured_address(data_dir, &destination)?;
+            let unlock = unlock.as_deref().map(parse_unlock_date).transpose()?;
+            let config = core::storage::load_config(data_dir)?;
+            let lock = core::savings_spend::find_lock(&config, unlock)?.clone();
+            let backend = rpc_args.connect_chain(data_dir)?;
+            let tip = backend.chain_tip()?;
+            let utxos = backend.scan_savings(&lock.address(config.bitcoin_network()?)?)?;
+            let fee_rate = core::savings_spend::current_fee_rate(backend.as_ref())?;
+            let (transaction, result) = cold_wallet::recover_savings(
+                data_dir,
+                &config,
+                &lock,
+                &utxos,
+                tip.median_time,
+                &destination,
+                fee_rate,
+            )?;
+            let txid = backend.broadcast(&transaction)?;
+            if txid != result.txid {
+                bail!("chain backend returned an unexpected HWW savings recovery transaction ID");
+            }
+            print_sweep_result_line("HWW savings recovery broadcast", &result);
         }
         HwwCommand::ConfirmSweep {
             proposal,
@@ -1043,14 +1148,7 @@ fn run_savings(data_dir: &Path, command: SavingsCommand) -> Result<()> {
     let mut config = core::storage::load_config(data_dir)?;
     match command {
         SavingsCommand::Create { unlock, default } => {
-            let date = chrono::NaiveDate::parse_from_str(&unlock, "%Y-%m-%d")
-                .with_context(|| format!("invalid unlock date {unlock}; use YYYY-MM-DD"))?;
-            let timestamp = date
-                .and_hms_opt(0, 0, 0)
-                .context("invalid unlock time")?
-                .and_utc()
-                .timestamp();
-            let unlock = u32::try_from(timestamp).context("unlock date is out of range")?;
+            let unlock = parse_unlock_date(&unlock)?;
             let lock = core::savings::add_lock(
                 &mut config,
                 unlock,
@@ -1074,6 +1172,18 @@ fn run_savings(data_dir: &Path, command: SavingsCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A savings unlock date: 00:00 UTC on a YYYY-MM-DD day.
+fn parse_unlock_date(text: &str) -> Result<u32> {
+    let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .with_context(|| format!("invalid unlock date {text}; use YYYY-MM-DD"))?;
+    let timestamp = date
+        .and_hms_opt(0, 0, 0)
+        .context("invalid unlock time")?
+        .and_utc()
+        .timestamp();
+    u32::try_from(timestamp).context("unlock date is out of range")
 }
 
 fn format_unix_date(timestamp: u32) -> String {
@@ -1388,6 +1498,32 @@ fn report_sweep(package: &core::recovery::CooperativeSweepPackage, stderr: bool)
     Ok(())
 }
 
+fn report_savings_spend(
+    package: &core::savings_spend::SavingsSpendPackage,
+    stderr: bool,
+) -> Result<()> {
+    let mut output: Box<dyn Write> = if stderr {
+        Box::new(io::stderr().lock())
+    } else {
+        Box::new(io::stdout().lock())
+    };
+    writeln!(output, "SAVINGS SPEND")?;
+    writeln!(output, "Savings lock: {}", format_unix_date(package.unlock))?;
+    writeln!(output, "Destination: {}", package.destination)?;
+    writeln!(output, "Coins: {}", package.input_count)?;
+    writeln!(output, "Sent: {} sats", package.sent_sats)?;
+    writeln!(
+        output,
+        "Fee: {} sats ({} sat/vB)",
+        package.fee_sats, package.fee_rate_sat_vb
+    )?;
+    writeln!(output, "Phone signed: {}", package.phone_approved)?;
+    if package.hww_approved {
+        writeln!(output, "HWW signed: true")?;
+    }
+    Ok(())
+}
+
 fn report_rotation(package: &core::recovery::PhoneRotationPackage, stderr: bool) -> Result<()> {
     let mut output: Box<dyn Write> = if stderr {
         Box::new(io::stderr().lock())
@@ -1460,6 +1596,21 @@ fn print_sweep_result(label: &str, result: &core::recovery::SweepResult) {
     println!("Inputs: {}", result.input_count);
     println!("Sent: {} sats", result.sent_sats);
     println!("Fee: {} sats (1 sat/vB)", result.fee_sats);
+}
+
+fn print_spend_result(label: &str, result: &core::recovery::SweepResult, fee_rate: u64) {
+    println!("{label}: {}", result.txid);
+    println!("Coins: {}", result.input_count);
+    println!("Sent: {} sats", result.sent_sats);
+    println!("Fee: {} sats ({fee_rate} sat/vB)", result.fee_sats);
+}
+
+/// For spends whose fee rate was fetched live and is not stored in a package.
+fn print_sweep_result_line(label: &str, result: &core::recovery::SweepResult) {
+    println!("{label}: {}", result.txid);
+    println!("Coins: {}", result.input_count);
+    println!("Sent: {} sats", result.sent_sats);
+    println!("Fee: {} sats", result.fee_sats);
 }
 
 fn reset_workspace(path: &Path) -> Result<()> {

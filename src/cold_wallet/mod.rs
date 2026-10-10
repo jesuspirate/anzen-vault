@@ -12,6 +12,8 @@ use crate::core::{
         self, CooperativeSweepPackage, PhoneRecoveryPackage, PhoneRotationPackage, SweepPath,
         SweepResult,
     },
+    savings::SavingsLock,
+    savings_spend::{self, SavingsSpendPackage},
     social::{self, CloudRecoveryBackup, RecoveryPayload},
     storage::{
         DeviceFile, HWW_DEVICE_FILE, HWW_PUBLIC_FILE, InitializedDevice, PHONE_BACKUP_FILE,
@@ -232,6 +234,39 @@ pub fn recover(
     )?;
     let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
     recovery::sign_recovery_sweep(plan, SweepPath::HwwRecovery, &hww)
+}
+
+/// Validate a phone-built savings spend and add the HWW signature.
+pub fn approve_savings_spend(
+    data_dir: &Path,
+    package: &SavingsSpendPackage,
+) -> Result<SavingsSpendPackage> {
+    let config = load_config(data_dir)?;
+    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
+    savings_spend::approve_savings_spend(&config, package, &hww)
+}
+
+/// Move a savings lock's coins with the HWW alone, 455 days after its unlock date.
+pub fn recover_savings(
+    data_dir: &Path,
+    config: &VaultConfig,
+    lock: &SavingsLock,
+    utxos: &[VaultUtxo],
+    median_time: u64,
+    destination: &Address,
+    fee_rate_sat_vb: u64,
+) -> Result<(Transaction, SweepResult)> {
+    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
+    savings_spend::sign_savings_recovery(
+        config,
+        lock,
+        utxos,
+        median_time,
+        SpendPath::HwwRecovery,
+        destination,
+        fee_rate_sat_vb,
+        &hww,
+    )
 }
 
 /// Revoke every currently live policy state with the HWW controller path.
