@@ -32,6 +32,9 @@ pub struct VaultConfig {
     pub monthly_limit_sats: u64,
     #[serde(default)]
     pub emergency_access_limit_sats: u64,
+    /// Hard-locked savings outputs, one per unlock date. See `core::savings`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub savings_locks: Vec<crate::core::savings::SavingsLock>,
 }
 
 impl VaultConfig {
@@ -133,6 +136,7 @@ pub fn initialize_vault_for_network(data_dir: &Path, network: Network) -> Result
         hww_recovery_blocks: HWW_RECOVERY_BLOCKS,
         monthly_limit_sats: 0,
         emergency_access_limit_sats: 0,
+        savings_locks: Vec::new(),
     };
     write_json(&data_dir.join(CONFIG_FILE), &config)?;
 
@@ -162,6 +166,10 @@ pub fn set_policy_limits(
     config.emergency_access_limit_sats = emergency_access_limit_sats;
     write_json(&config_path(data_dir), &config)?;
     Ok(config)
+}
+
+pub fn save_config(data_dir: &Path, config: &VaultConfig) -> Result<()> {
+    write_json(&config_path(data_dir), config)
 }
 
 fn config_path(data_dir: &Path) -> PathBuf {

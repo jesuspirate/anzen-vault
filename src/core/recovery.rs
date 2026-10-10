@@ -375,6 +375,9 @@ pub fn rotated_config(
         hww_recovery_blocks: old_config.hww_recovery_blocks,
         monthly_limit_sats: old_config.monthly_limit_sats,
         emergency_access_limit_sats: old_config.emergency_access_limit_sats,
+        // Savings locks keep the keys they were created with: nothing can move them before
+        // their date, so a rotation cannot sweep them.
+        savings_locks: old_config.savings_locks.clone(),
     })
 }
 
