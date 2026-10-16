@@ -397,3 +397,103 @@ fn openpgp_friend_decrypts_the_descriptor_bound_cloud_backup() {
         .success()
         .stdout(predicate::str::contains("Phone key restored"));
 }
+
+#[test]
+fn health_checks_and_recovery_kit_work_without_a_chain_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap();
+    for args in [["phone", "init"], ["hww", "init"]] {
+        Command::cargo_bin("anzen")
+            .unwrap()
+            .arg("--data-dir")
+            .arg(data_dir)
+            .args(args)
+            .assert()
+            .success();
+    }
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["--data-dir", data_dir, "init"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["--data-dir", data_dir, "health", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Phone: never checked"))
+        .stdout(predicate::str::contains("Hardware wallet: never checked"));
+
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["--data-dir", data_dir, "health", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Phone: healthy"))
+        .stdout(predicate::str::contains("Hardware wallet: healthy"));
+
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["--data-dir", data_dir, "health", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Next check due"))
+        .stdout(predicate::str::contains("never checked").not());
+
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args([
+            "--data-dir",
+            data_dir,
+            "savings",
+            "create",
+            "--unlock",
+            "2030-01-01",
+        ])
+        .assert()
+        .success();
+
+    let kit = dir.path().join("kit.html");
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args([
+            "--data-dir",
+            data_dir,
+            "recovery-kit",
+            "--owner",
+            "Jet",
+            "--output",
+        ])
+        .arg(&kit)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Recovery kit written"));
+    let html = std::fs::read_to_string(&kit).unwrap();
+    assert!(html.contains("How to get to Jet&#39;s vault"));
+    assert!(html.contains("Savings lock opening January 1, 2030"));
+    assert!(html.contains("Working</span> last checked"));
+    assert!(
+        !html.contains("mnemonic"),
+        "the kit must never contain secrets"
+    );
+
+    // A different hardware wallet is caught.
+    let other = tempfile::tempdir().unwrap();
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["--data-dir", other.path().to_str().unwrap(), "hww", "init"])
+        .assert()
+        .success();
+    std::fs::copy(
+        other.path().join("hww/device.json"),
+        dir.path().join("hww/device.json"),
+    )
+    .unwrap();
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["--data-dir", data_dir, "health", "check", "--device", "hww"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Hardware wallet: FAILED"));
+}

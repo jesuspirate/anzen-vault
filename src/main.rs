@@ -63,11 +63,43 @@ enum Command {
         #[arg(long)]
         reveal: bool,
     },
+    /// Prove each device still holds its vault key, and show when the next check is due.
+    Health {
+        #[command(subcommand)]
+        command: HealthCommand,
+    },
+    /// Write a printable, plain-language recovery kit for heirs and recovery friends.
+    RecoveryKit {
+        /// Where to write the kit (an HTML file; print it or save it as PDF from any browser).
+        #[arg(long)]
+        output: PathBuf,
+        /// The owner's name, shown on the cover.
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// Regtest-only node controls used by the end-to-end tests.
     Node {
         #[command(subcommand)]
         command: NodeCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum HealthCommand {
+    /// Ask a device (or both) to sign a fresh challenge and record the result.
+    Check {
+        /// Which device to check; both when omitted.
+        #[arg(long, value_enum)]
+        device: Option<HealthDevice>,
+    },
+    /// Show when each device was last checked and when the next check is due.
+    Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum HealthDevice {
+    Phone,
+    Hww,
 }
 
 #[derive(Debug, Subcommand)]
@@ -364,6 +396,8 @@ fn main() -> Result<()> {
         Command::Phone { command } => run_phone(command, &cli.data_dir, &cli.chain, network),
         Command::Hww { command } => run_hww(command, &cli.data_dir, &cli.chain, network),
         Command::Social { command } => run_social(command, &cli.data_dir, &cli.chain),
+        Command::Health { command } => run_health(&cli.data_dir, command),
+        Command::RecoveryKit { output, owner } => write_recovery_kit(&cli.data_dir, &output, owner),
         Command::Node { command } => run_node(command, &cli.chain, network),
     }
 }
@@ -1037,6 +1071,141 @@ fn print_active_policy(data_dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn run_health(data_dir: &Path, command: HealthCommand) -> Result<()> {
+    use core::health::{self, Device};
+    let config = core::storage::load_config(data_dir)?;
+    match command {
+        HealthCommand::Check { device } => {
+            let devices = match device {
+                Some(HealthDevice::Phone) => vec![Device::Phone],
+                Some(HealthDevice::Hww) => vec![Device::Hww],
+                None => Device::ALL.to_vec(),
+            };
+            let mut failed = false;
+            for device in devices {
+                let challenge =
+                    health::Challenge::new(&config, device, chrono::Utc::now().timestamp())?;
+                let answer = match device {
+                    Device::Phone => hot_wallet::sign_health_challenge(data_dir, &challenge),
+                    Device::Hww => cold_wallet::sign_health_challenge(data_dir, &challenge),
+                };
+                match answer.and_then(|signature| health::verify(&challenge, &signature)) {
+                    Ok(record) => {
+                        health::append_record(data_dir, record)?;
+                        println!(
+                            "{}: healthy. It still holds the vault key. Next check due {}.",
+                            device.label(),
+                            format_unix_date_i64(
+                                challenge.issued_at + health::HEALTH_CHECK_INTERVAL_SECS
+                            )
+                        );
+                    }
+                    Err(error) => {
+                        failed = true;
+                        println!("{}: FAILED. {error:#}", device.label());
+                    }
+                }
+            }
+            if failed {
+                bail!(
+                    "a device failed its health check; replace it while the other key still works"
+                );
+            }
+        }
+        HealthCommand::Status => {
+            let history = health::load_history(data_dir)?;
+            let now = chrono::Utc::now().timestamp();
+            for device in Device::ALL {
+                let line = match health::device_health(&config, &history, device, now) {
+                    health::DeviceHealth::NeverChecked => {
+                        "never checked. Run: anzen health check".to_owned()
+                    }
+                    health::DeviceHealth::Healthy { checked_at, due_at } => format!(
+                        "healthy, checked {}. Next check due {}.",
+                        format_unix_date_i64(checked_at),
+                        format_unix_date_i64(due_at)
+                    ),
+                    health::DeviceHealth::Due { checked_at, .. } => format!(
+                        "check overdue, last checked {}. Run: anzen health check",
+                        format_unix_date_i64(checked_at)
+                    ),
+                };
+                println!("{}: {line}", device.label());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_recovery_kit(data_dir: &Path, output: &Path, owner: Option<String>) -> Result<()> {
+    use core::{health, kit};
+    let config = core::storage::load_config(data_dir)?;
+    let network = config.bitcoin_network()?;
+    let mut savings = Vec::with_capacity(config.savings_locks.len());
+    for lock in &config.savings_locks {
+        savings.push(kit::KitSavings {
+            unlock: lock.unlock,
+            address: lock.address.clone(),
+            descriptor: lock.policy(network)?.descriptor.to_string(),
+            default_deposit: lock.default_deposit,
+            uses_earlier_phone_key: lock.phone_vault_pubkey != config.phone_vault_pubkey,
+        });
+    }
+    let backup_path = data_dir.join(core::storage::PHONE_BACKUP_FILE);
+    let friends = if backup_path.exists() {
+        let backup: core::social::CloudRecoveryBackup = core::storage::read_json(&backup_path)?;
+        backup
+            .friends
+            .iter()
+            .map(|friend| kit::KitFriend {
+                name: core::social::friend_user_id(friend.public_key_armored.as_bytes()),
+                fingerprint: friend.fingerprint.clone(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let now = chrono::Utc::now().timestamp();
+    let history = health::load_history(data_dir)?;
+    let health = health::Device::ALL
+        .into_iter()
+        .map(|device| {
+            (
+                device,
+                health::device_health(&config, &history, device, now),
+            )
+        })
+        .collect();
+    let html = kit::render(&kit::KitInput {
+        owner,
+        generated_at: now,
+        network,
+        vault_descriptor: config.vault_descriptor.clone(),
+        vault_address: config.vault_address.clone(),
+        phone_recovery_blocks: config.phone_recovery_blocks,
+        hww_recovery_blocks: config.hww_recovery_blocks,
+        monthly_limit_sats: config.monthly_limit_sats,
+        emergency_access_limit_sats: config.emergency_access_limit_sats,
+        savings,
+        friends,
+        health,
+    });
+    fs::write(output, html).with_context(|| format!("failed to write {}", output.display()))?;
+    println!("Recovery kit written: {}", output.display());
+    println!(
+        "It holds no keys and cannot move coins, but it shows where they are. Keep it private."
+    );
+    println!("Print it (or save it as PDF) and fill in page 5 by hand.");
+    Ok(())
+}
+
+fn format_unix_date_i64(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0).map_or_else(
+        || timestamp.to_string(),
+        |date| date.format("%Y-%m-%d").to_string(),
+    )
 }
 
 fn run_savings(data_dir: &Path, command: SavingsCommand) -> Result<()> {
