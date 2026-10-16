@@ -56,6 +56,10 @@ pub trait Blockchain {
     fn chain_tip(&self) -> Result<ChainTip>;
     fn scan_vault(&self, config: &VaultConfig) -> Result<Vec<VaultUtxo>>;
     fn scan_connectors(&self, config: &VaultConfig) -> Result<Vec<VaultUtxo>>;
+    /// Confirmed outputs paying a hard-locked savings address.
+    fn scan_savings(&self, _address: &Address) -> Result<Vec<VaultUtxo>> {
+        bail!("this chain backend cannot scan savings addresses")
+    }
     fn broadcast(&self, transaction: &Transaction) -> Result<bitcoin::Txid>;
     /// Current fee rate in sat/vB for confirmation within `target_blocks`, or `None` when the
     /// backend has no estimate (for example a fresh regtest chain).
@@ -96,6 +100,13 @@ impl Blockchain for BitcoinCoreBackend {
 
     fn scan_connectors(&self, config: &VaultConfig) -> Result<Vec<VaultUtxo>> {
         BitcoinCoreBackend::scan_connectors(self, config)
+    }
+
+    fn scan_savings(&self, address: &Address) -> Result<Vec<VaultUtxo>> {
+        if !address.as_unchecked().is_valid_for_network(self.network) {
+            bail!("refusing to scan a savings address from another network");
+        }
+        self.scan_address(&address.to_string(), "savings")
     }
 
     fn broadcast(&self, transaction: &Transaction) -> Result<bitcoin::Txid> {
@@ -246,6 +257,13 @@ impl Blockchain for ElectrumBackend {
         }
         let controller = controller_policy(config)?;
         self.scan_script(&controller.address.script_pubkey(), "controller")
+    }
+
+    fn scan_savings(&self, address: &Address) -> Result<Vec<VaultUtxo>> {
+        if !address.as_unchecked().is_valid_for_network(self.network) {
+            bail!("refusing to scan a savings address from another network");
+        }
+        self.scan_script(&address.script_pubkey(), "savings")
     }
 
     fn broadcast(&self, transaction: &Transaction) -> Result<bitcoin::Txid> {

@@ -110,6 +110,7 @@ fn fixed_config(phone: &DeviceKeys, hww: &DeviceKeys) -> VaultConfig {
         hww_recovery_blocks: HWW_RECOVERY_BLOCKS,
         monthly_limit_sats: 0,
         emergency_access_limit_sats: 0,
+        savings_locks: Vec::new(),
     }
 }
 

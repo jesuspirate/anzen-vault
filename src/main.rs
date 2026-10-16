@@ -50,11 +50,38 @@ enum Command {
         #[command(subcommand)]
         command: SocialCommand,
     },
+    /// Hard-locked savings addresses that nothing can spend before their date.
+    Savings {
+        #[command(subcommand)]
+        command: SavingsCommand,
+    },
+    /// Print where recurring deposits should go (the default savings lock, if any).
+    DepositAddress,
+    /// Show how long each vault and savings coin stays protected, most urgent first.
+    Coins {
+        /// Show amounts and coin IDs instead of hiding them.
+        #[arg(long)]
+        reveal: bool,
+    },
     /// Regtest-only node controls used by the end-to-end tests.
     Node {
         #[command(subcommand)]
         command: NodeCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SavingsCommand {
+    /// Create a savings address that unlocks at 00:00 UTC on the given date (YYYY-MM-DD).
+    Create {
+        #[arg(long)]
+        unlock: String,
+        /// Make it the default deposit address (the first lock always is).
+        #[arg(long)]
+        default: bool,
+    },
+    /// List savings locks and their addresses.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -331,6 +358,9 @@ fn main() -> Result<()> {
         Command::Init => initialize_vault(&cli.data_dir, network),
         Command::Policy => print_active_policy(&cli.data_dir),
         Command::Status => print_status(&cli.data_dir, &cli.chain),
+        Command::Savings { command } => run_savings(&cli.data_dir, command),
+        Command::DepositAddress => print_deposit_address(&cli.data_dir),
+        Command::Coins { reveal } => print_coins(&cli.data_dir, &cli.chain, reveal),
         Command::Phone { command } => run_phone(command, &cli.data_dir, &cli.chain, network),
         Command::Hww { command } => run_hww(command, &cli.data_dir, &cli.chain, network),
         Command::Social { command } => run_social(command, &cli.data_dir, &cli.chain),
@@ -1005,6 +1035,147 @@ fn print_active_policy(data_dir: &Path) -> Result<()> {
             "Emergency access delay: {} seconds (~1 week)",
             core::EMERGENCY_ACCESS_DELAY_SECONDS
         );
+    }
+    Ok(())
+}
+
+fn run_savings(data_dir: &Path, command: SavingsCommand) -> Result<()> {
+    let mut config = core::storage::load_config(data_dir)?;
+    match command {
+        SavingsCommand::Create { unlock, default } => {
+            let date = chrono::NaiveDate::parse_from_str(&unlock, "%Y-%m-%d")
+                .with_context(|| format!("invalid unlock date {unlock}; use YYYY-MM-DD"))?;
+            let timestamp = date
+                .and_hms_opt(0, 0, 0)
+                .context("invalid unlock time")?
+                .and_utc()
+                .timestamp();
+            let unlock = u32::try_from(timestamp).context("unlock date is out of range")?;
+            let lock = core::savings::add_lock(
+                &mut config,
+                unlock,
+                chrono::Utc::now().timestamp(),
+                default,
+            )?;
+            core::storage::save_config(data_dir, &config)?;
+            println!("Savings lock created");
+            print_savings_lock(&lock)?;
+        }
+        SavingsCommand::List => {
+            if config.savings_locks.is_empty() {
+                println!(
+                    "No savings locks. Create one with: anzen savings create --unlock YYYY-MM-DD"
+                );
+            }
+            for lock in &config.savings_locks {
+                lock.policy(config.bitcoin_network()?)?;
+                print_savings_lock(lock)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_unix_date(timestamp: u32) -> String {
+    chrono::DateTime::from_timestamp(i64::from(timestamp), 0).map_or_else(
+        || timestamp.to_string(),
+        |date| date.format("%Y-%m-%d").to_string(),
+    )
+}
+
+fn print_savings_lock(lock: &core::savings::SavingsLock) -> Result<()> {
+    println!("Unlocks: {}", format_unix_date(lock.unlock));
+    println!("Address: {}", lock.address);
+    println!(
+        "Phone-only recovery from: {}",
+        format_unix_date(lock.unlock + core::policy::SAVINGS_PHONE_RECOVERY_SECS)
+    );
+    println!(
+        "HWW-only recovery from: {}",
+        format_unix_date(lock.unlock + core::policy::SAVINGS_HWW_RECOVERY_SECS)
+    );
+    if lock.default_deposit {
+        println!("Default deposit address: yes");
+    }
+    Ok(())
+}
+
+fn print_deposit_address(data_dir: &Path) -> Result<()> {
+    let config = core::storage::load_config(data_dir)?;
+    match core::savings::deposit_target(&config) {
+        core::savings::DepositTarget::Savings(lock) => {
+            lock.policy(config.bitcoin_network()?)?;
+            println!("Deposit address: {}", lock.address);
+            println!(
+                "Savings lock until {}: no ceremony needed, nothing can move it before then.",
+                format_unix_date(lock.unlock)
+            );
+        }
+        core::savings::DepositTarget::Vault(address) => {
+            println!("Deposit address: {address}");
+            println!(
+                "Vault deposit: include it in an HWW ceremony within about 14 months. Create a savings lock to avoid that."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_coins(data_dir: &Path, rpc_args: &ChainArgs, reveal: bool) -> Result<()> {
+    use core::savings::{CoinPot, CoinStatus};
+    let config = core::storage::load_config(data_dir)?;
+    let network = config.bitcoin_network()?;
+    let backend = rpc_args.connect_chain(data_dir)?;
+    let tip = backend.chain_tip()?;
+    let vault = backend.scan_vault(&config)?;
+    let mut savings = Vec::with_capacity(config.savings_locks.len());
+    for lock in &config.savings_locks {
+        let address = lock.address(network)?;
+        savings.push((lock.clone(), backend.scan_savings(&address)?));
+    }
+    let coins = core::savings::coin_ages(&config, &tip, &vault, &savings)?;
+    if coins.is_empty() {
+        println!("No vault or savings coins yet.");
+    }
+    for (index, coin) in coins.iter().enumerate() {
+        let pot = match coin.pot {
+            CoinPot::Vault => "Vault".to_owned(),
+            CoinPot::Savings { unlock } => format!("Savings until {}", format_unix_date(unlock)),
+        };
+        let amount = if reveal {
+            format!("{} sats", coin.value_sats)
+        } else {
+            "hidden".to_owned()
+        };
+        println!("Coin {} · {pot} · {amount}", index + 1);
+        if reveal {
+            println!("  ID: {}", coin.outpoint);
+        }
+        let days = coin.status.days_left().unwrap_or_default();
+        let line = match coin.status {
+            CoinStatus::Protected { .. } => {
+                format!("Safe: needs phone + HWW. Phone-only recovery opens in ~{days} days.")
+            }
+            CoinStatus::CeremonyDue { .. } => format!(
+                "Ceremony due: phone-only recovery opens in ~{days} days. Renew or run an HWW ceremony."
+            ),
+            CoinStatus::RecoveryOpen { .. } => {
+                "Recovery open: the phone key alone can move it. Run an HWW ceremony now."
+                    .to_owned()
+            }
+            CoinStatus::Locked { .. } => {
+                format!("Locked: nobody can move it for ~{days} days. No ceremony needed.")
+            }
+            CoinStatus::Unlocked { phone_recovery_at } => format!(
+                "Unlocked: phone + HWW can move it. Phone-only recovery opens {}.",
+                format_unix_date(phone_recovery_at)
+            ),
+            CoinStatus::SavingsRecoveryOpen { .. } => {
+                "Recovery open: the phone key alone can move it. Move it with phone + HWW."
+                    .to_owned()
+            }
+        };
+        println!("  {line}");
     }
     Ok(())
 }

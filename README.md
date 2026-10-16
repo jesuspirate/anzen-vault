@@ -82,6 +82,12 @@ Connector change never returns to the controller address: phone revocation sends
 
 By default one HWW ceremony presigns two years (`phone set-policy --years 2`). The second year's rollover spends the first year's cold remainder and carries a BIP68 delay of 360 days, so it cannot be broadcast early; the HWW checks that link before signing. After the delay, `anzen phone renew` broadcasts it from the phone alone (bumping its fee through a pay-to-anchor output), which resets the recovery delays well before the first year's single-key recovery opens after about 425 days. The renewal does not sweep the first year's allowance chain, so unclaimed first-year months stay claimable with `phone authorize <step> --previous`. Deposits made after the ceremony are not covered by the renewal and need a new ceremony. `--years 1` keeps the yearly ceremony.
 
+### Hard-locked savings
+
+`anzen savings create --unlock 2030-01-01` creates a savings address that nothing can spend before 00:00 UTC on that date, not even both devices together. After the date phone and HWW spend it together; if one device is lost, the phone alone can recover it 425 days after the date and the HWW alone 455 days after. Every path is dated, so savings never need a ceremony or renewal and deposits can arrive at the same address forever. The first lock becomes the default deposit address (`anzen deposit-address`), which makes it the natural target for recurring income. Several locks with different dates can be held at once. Each lock records the keys it was created with, so a phone rotation (which cannot move locked coins) leaves its address unchanged.
+
+`anzen coins` lists every vault and savings coin with how long it stays protected, most urgent first: vault coins count down to their phone-only recovery height (and flag a ceremony when it is within about 60 days), savings coins count down to their unlock date. Amounts and coin IDs stay hidden unless `--reveal` is passed.
+
 Presigned transactions are convenience permissions, not custody. Losing them cannot lose the bitcoin because every principal output still has the three vault-script paths above.
 
 For a concrete byte-level example of this graph—including txids, outpoints, locktimes, sequences, values, addresses, and scripts—see the checked-in [vault output test vector](test-vectors/vault-output-graph.json).
