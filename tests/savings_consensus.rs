@@ -2,15 +2,16 @@
 //! spend and checked with Bitcoin Core's own script interpreter
 //! (libbitcoinconsensus 26). A rejection here is a rejection by every node.
 
-use anzen::core::policy::{
-    SAVINGS_HWW_RECOVERY_SECS, SAVINGS_PHONE_RECOVERY_SECS, SavingsPolicy, SpendPath,
+use anzen::core::{
+    keys::DeviceKeys,
+    policy::{SAVINGS_HWW_RECOVERY_SECS, SAVINGS_PHONE_RECOVERY_SECS, SavingsPolicy, SpendPath},
 };
 use bitcoin::{
     Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
     absolute::LockTime,
     hashes::Hash,
-    key::{Keypair, Secp256k1},
-    secp256k1::{All, Message, rand::thread_rng},
+    key::Secp256k1,
+    secp256k1::{All, Message},
     sighash::{Prevouts, SighashCache, TapSighashType},
     transaction::Version,
 };
@@ -19,26 +20,25 @@ const UNLOCK: u32 = 1_924_992_000; // 2031-01-01 00:00 UTC
 
 struct Devices {
     secp: Secp256k1<All>,
-    phone: Keypair,
-    hww: Keypair,
-    thief: Keypair,
+    phone: DeviceKeys,
+    hww: DeviceKeys,
+    thief: DeviceKeys,
 }
 
 fn devices() -> Devices {
     let secp = Secp256k1::new();
-    let mut rng = thread_rng();
     Devices {
-        phone: Keypair::new(&secp, &mut rng),
-        hww: Keypair::new(&secp, &mut rng),
-        thief: Keypair::new(&secp, &mut rng),
+        phone: DeviceKeys::generate(&secp).unwrap(),
+        hww: DeviceKeys::generate(&secp).unwrap(),
+        thief: DeviceKeys::generate(&secp).unwrap(),
         secp,
     }
 }
 
 fn policy(d: &Devices) -> SavingsPolicy {
     SavingsPolicy::new_for_network(
-        d.phone.x_only_public_key().0,
-        d.hww.x_only_public_key().0,
+        d.phone.vault_pubkey,
+        d.hww.vault_pubkey,
         UNLOCK,
         Network::Regtest,
     )
@@ -47,12 +47,13 @@ fn policy(d: &Devices) -> SavingsPolicy {
 
 /// Spend the savings output through `path`, signed by `signers` in witness
 /// order (for the 2-of-2 leaf: hww first, then phone, since the phone key is
-/// checked first and so its signature must sit on top of the stack).
+/// checked first and so its signature must sit on top of the stack). Each device signs with
+/// the child key its leaf names.
 fn spend(
     d: &Devices,
     p: &SavingsPolicy,
     path: SpendPath,
-    signers: &[&Keypair],
+    signers: &[&DeviceKeys],
     lock_time: u32,
     sequence: Sequence,
 ) -> Result<(), bitcoinconsensus::Error> {
@@ -88,7 +89,11 @@ fn spend(
     let msg = Message::from_digest(sighash.to_byte_array());
     let mut w = Witness::new();
     for k in signers {
-        w.push(d.secp.sign_schnorr(&msg, k).as_ref());
+        w.push(
+            d.secp
+                .sign_schnorr(&msg, k.vault_keypair.for_path(path))
+                .as_ref(),
+        );
     }
     w.push(leaf.script.as_bytes());
     w.push(leaf.control_block.serialize());
@@ -218,8 +223,8 @@ fn block_height_unlocks_are_rejected() {
     let d = devices();
     assert!(
         SavingsPolicy::new_for_network(
-            d.phone.x_only_public_key().0,
-            d.hww.x_only_public_key().0,
+            d.phone.vault_pubkey,
+            d.hww.vault_pubkey,
             900_000,
             Network::Regtest
         )

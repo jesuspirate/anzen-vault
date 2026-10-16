@@ -25,7 +25,7 @@ use super::{
 use anyhow::{Context, Result, bail};
 use bitcoin::{
     Address, Amount, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute,
-    secp256k1::XOnlyPublicKey, transaction::Version,
+    transaction::Version,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -289,7 +289,7 @@ pub fn approve_savings_spend(
         &psbt,
         &policy,
         SpendPath::Cooperative,
-        XOnlyPublicKey::from_str(&lock.phone_vault_pubkey)?,
+        crate::core::keys::VaultKey::from_str(&lock.phone_vault_pubkey)?,
     )?;
     if hww.vault_pubkey.to_string() != lock.hww_vault_pubkey {
         bail!("HWW key does not match the savings lock");
@@ -319,7 +319,7 @@ pub fn finalize_savings_spend(
             &psbt,
             &policy,
             SpendPath::Cooperative,
-            XOnlyPublicKey::from_str(key)?,
+            crate::core::keys::VaultKey::from_str(key)?,
         )?;
     }
     let transaction = finalize_vault_psbt(psbt)?;

@@ -1,4 +1,5 @@
 use super::{
+    keys::{VaultKey, VaultKeypairs},
     policy::{ControllerPath, ControllerPolicy, SpendPath, TaprootPolicy, VaultPolicy},
     types::VaultUtxo,
 };
@@ -193,21 +194,23 @@ pub fn sign_vault_psbt<P: TaprootPolicy + ?Sized>(
     psbt: &mut Psbt,
     policy: &P,
     path: SpendPath,
-    keypair: &Keypair,
+    keys: &VaultKeypairs,
 ) -> Result<()> {
     let indexes = (0..psbt.inputs.len()).collect::<Vec<_>>();
-    sign_vault_psbt_inputs(psbt, policy, path, keypair, &indexes)
+    sign_vault_psbt_inputs(psbt, policy, path, keys, &indexes)
 }
 
 pub fn sign_vault_psbt_inputs<P: TaprootPolicy + ?Sized>(
     psbt: &mut Psbt,
     policy: &P,
     path: SpendPath,
-    keypair: &Keypair,
+    keys: &VaultKeypairs,
     input_indexes: &[usize],
 ) -> Result<()> {
     validate_default_sighashes(psbt)?;
     let secp = Secp256k1::new();
+    // Each leaf names its own child of the device's account key.
+    let keypair = keys.for_path(path);
     let (signing_pubkey, _) = XOnlyPublicKey::from_keypair(keypair);
     let leaf = policy.leaf(path)?;
 
@@ -289,21 +292,22 @@ pub fn verify_vault_psbt_signature<P: TaprootPolicy + ?Sized>(
     psbt: &Psbt,
     policy: &P,
     path: SpendPath,
-    signing_pubkey: XOnlyPublicKey,
+    signer: VaultKey,
 ) -> Result<()> {
     let indexes = (0..psbt.inputs.len()).collect::<Vec<_>>();
-    verify_vault_psbt_signatures(psbt, policy, path, signing_pubkey, &indexes)
+    verify_vault_psbt_signatures(psbt, policy, path, signer, &indexes)
 }
 
 pub fn verify_vault_psbt_signatures<P: TaprootPolicy + ?Sized>(
     psbt: &Psbt,
     policy: &P,
     path: SpendPath,
-    signing_pubkey: XOnlyPublicKey,
+    signer: VaultKey,
     input_indexes: &[usize],
 ) -> Result<()> {
     validate_default_sighashes(psbt)?;
     let secp = Secp256k1::verification_only();
+    let signing_pubkey = signer.for_path(path);
     let leaf = policy.leaf(path)?;
     for &index in input_indexes {
         if index >= psbt.inputs.len() {
@@ -525,7 +529,7 @@ mod tests {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(19_999_800),
-                script_pubkey: ScriptBuf::new_p2tr(&secp, phone.vault_pubkey, None),
+                script_pubkey: ScriptBuf::new_p2tr(&secp, phone.vault_pubkey.cooperative(), None),
             }],
         };
         let psbt = create_vault_psbt(tx, &[prevout], &policy).unwrap();
@@ -558,7 +562,7 @@ mod tests {
             &mut controller_signed,
             &controller,
             ControllerPath::Phone,
-            &phone.vault_keypair,
+            &phone.vault_keypair.cooperative,
             &[0],
         )
         .unwrap();
@@ -585,7 +589,7 @@ mod tests {
                     &mut psbt,
                     &controller,
                     ControllerPath::Phone,
-                    &phone.vault_keypair,
+                    &phone.vault_keypair.cooperative,
                     &[0],
                 )
                 .is_err()
@@ -619,7 +623,7 @@ mod tests {
                     &psbt,
                     &controller,
                     ControllerPath::Phone,
-                    phone.vault_pubkey,
+                    phone.vault_pubkey.cooperative(),
                     &[0],
                 )
                 .unwrap_err()
@@ -774,7 +778,7 @@ mod tests {
             ],
             output: vec![TxOut {
                 value: Amount::from_sat(1_009_000),
-                script_pubkey: ScriptBuf::new_p2tr(&secp, phone.vault_pubkey, None),
+                script_pubkey: ScriptBuf::new_p2tr(&secp, phone.vault_pubkey.cooperative(), None),
             }],
         };
         let mut psbt = create_policy_psbt(tx, &prevouts, &[0], &[1], &vault, &controller).unwrap();
@@ -800,7 +804,7 @@ mod tests {
                 &mut psbt.clone(),
                 &controller,
                 ControllerPath::Phone,
-                &phone.vault_keypair,
+                &phone.vault_keypair.cooperative,
                 &[0],
             )
             .is_err()
@@ -809,7 +813,7 @@ mod tests {
             &mut psbt,
             &controller,
             ControllerPath::Phone,
-            &phone.vault_keypair,
+            &phone.vault_keypair.cooperative,
             &[1],
         )
         .unwrap();
@@ -824,7 +828,7 @@ mod tests {
         let phone = DeviceKeys::generate(&secp).unwrap();
         let hww = DeviceKeys::generate(&secp).unwrap();
         let controller = ControllerPolicy::new(phone.vault_pubkey, hww.vault_pubkey).unwrap();
-        let destination = ScriptBuf::new_p2tr(&secp, phone.vault_pubkey, None);
+        let destination = ScriptBuf::new_p2tr(&secp, phone.vault_pubkey.cooperative(), None);
         let utxo = VaultUtxo {
             outpoint: OutPoint::null(),
             txout: TxOut {
@@ -855,8 +859,8 @@ mod tests {
             CONNECTOR_VALUE_SATS
         );
         for (path, keypair) in [
-            (ControllerPath::Phone, &phone.vault_keypair),
-            (ControllerPath::Hww, &hww.vault_keypair),
+            (ControllerPath::Phone, &phone.vault_keypair.cooperative),
+            (ControllerPath::Hww, &hww.vault_keypair.cooperative),
         ] {
             let mut psbt = unsigned.clone();
             sign_controller_psbt_inputs(&mut psbt, &controller, path, keypair, &[0]).unwrap();
