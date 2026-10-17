@@ -3,6 +3,8 @@
 //! Keep this module deliberately small and readable. It may depend on `crate::core`, but never on
 //! `crate::hot_wallet`.
 
+pub mod ledger;
+
 use crate::core::{
     ceremony::{self, BatchManifest},
     crypto::{self, EncryptedBlob},
@@ -14,6 +16,7 @@ use crate::core::{
     },
     savings::SavingsLock,
     savings_spend::{self, SavingsSpendPackage},
+    signer::VaultSigner,
     social::{self, CloudRecoveryBackup, RecoveryPayload},
     storage::{
         DeviceFile, HWW_DEVICE_FILE, HWW_PUBLIC_FILE, InitializedDevice, PHONE_BACKUP_FILE,
@@ -21,8 +24,7 @@ use crate::core::{
         load_device_keys, network_name, read_json, validate_supported_network, write_json,
     },
     transactions::{
-        build_controller_revocation_psbt, finalize_vault_psbt, sign_controller_psbt_inputs,
-        sign_vault_psbt, sign_vault_psbt_inputs, verify_controller_psbt_signatures,
+        build_controller_revocation_psbt, finalize_vault_psbt, verify_controller_psbt_signatures,
         verify_vault_psbt_signature, verify_vault_psbt_signatures,
     },
     types::VaultUtxo,
@@ -82,12 +84,41 @@ pub fn initialize(data_dir: &Path, network: Network) -> Result<InitializedDevice
     })
 }
 
+/// Use a Ledger as the HWW. Only its public vault key is stored.
+pub fn initialize_ledger(data_dir: &Path, network: Network) -> Result<crate::core::keys::VaultKey> {
+    validate_supported_network(network)?;
+    for existing in [HWW_DEVICE_FILE, HWW_PUBLIC_FILE] {
+        if data_dir.join(existing).exists() {
+            anyhow::bail!(
+                "HWW already initialized at {}",
+                data_dir.join(existing).display()
+            );
+        }
+    }
+    if data_dir.join(PHONE_DEVICE_FILE).exists()
+        && load_device(data_dir, PHONE_DEVICE_FILE)?.bitcoin_network()? != network
+    {
+        anyhow::bail!("initialize the HWW for the same network as the phone");
+    }
+    let vault_key = ledger::initialize(data_dir, network, 0)?;
+    write_json(
+        &data_dir.join(HWW_PUBLIC_FILE),
+        &PublicDeviceFile {
+            version: 1,
+            kind: "hww-public-key".to_owned(),
+            network: network_name(network).to_owned(),
+            vault_pubkey: vault_key.to_string(),
+        },
+    )?;
+    Ok(vault_key)
+}
+
 pub fn decrypt_phone_backup(data_dir: &Path) -> Result<String> {
     let config = load_config(data_dir)?;
-    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
+    let hww = load_hww(data_dir)?;
     let backup =
-        load_or_migrate_cloud_backup(data_dir, &data_dir.join(PHONE_BACKUP_FILE), &config, &hww)?;
-    let payload = social::decrypt_with_hww(&backup, &hww.seed)?;
+        load_or_migrate_cloud_backup(data_dir, &data_dir.join(PHONE_BACKUP_FILE), &config, &*hww)?;
+    let payload = social::decrypt_with_hww(&backup, &hww.backup_secret()?)?;
     payload.validate_against(&config)?;
     Ok(payload.phone_mnemonic)
 }
@@ -98,8 +129,12 @@ pub fn create_cloud_recovery_backup(
     config: &VaultConfig,
 ) -> Result<CloudRecoveryBackup> {
     let phone = load_device_keys(data_dir, PHONE_DEVICE_FILE)?;
-    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
-    let backup = social::create_backup(&RecoveryPayload::new(config, &phone)?, &hww.seed, &[])?;
+    let hww = load_hww(data_dir)?;
+    let backup = social::create_backup(
+        &RecoveryPayload::new(config, &phone)?,
+        &hww.backup_secret()?,
+        &[],
+    )?;
     write_json(&data_dir.join(PHONE_BACKUP_FILE), &backup)?;
     Ok(backup)
 }
@@ -117,11 +152,12 @@ pub fn sign_health_challenge(
 /// Add a 1-of-N OpenPGP recovery friend by wrapping the existing symmetric backup key.
 pub fn add_recovery_friend(data_dir: &Path, public_key: &[u8]) -> Result<String> {
     let config = load_config(data_dir)?;
-    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
+    let hww = load_hww(data_dir)?;
     let mut backup =
-        load_or_migrate_cloud_backup(data_dir, &data_dir.join(PHONE_BACKUP_FILE), &config, &hww)?;
-    social::decrypt_with_hww(&backup, &hww.seed)?.validate_against(&config)?;
-    let fingerprint = social::add_friend(&mut backup, &hww.seed, public_key)?;
+        load_or_migrate_cloud_backup(data_dir, &data_dir.join(PHONE_BACKUP_FILE), &config, &*hww)?;
+    let secret = hww.backup_secret()?;
+    social::decrypt_with_hww(&backup, &secret)?.validate_against(&config)?;
+    let fingerprint = social::add_friend(&mut backup, &secret, public_key)?;
     write_json(&data_dir.join(PHONE_BACKUP_FILE), &backup)?;
     Ok(fingerprint)
 }
@@ -146,8 +182,8 @@ fn approve_policy_for_config(
         crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)?,
         config.bitcoin_network()?,
     )?;
-    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
-    if hww.vault_pubkey.to_string() != config.hww_vault_pubkey {
+    let hww = load_hww(data_dir)?;
+    if hww.vault_key().to_string() != config.hww_vault_pubkey {
         anyhow::bail!("HWW key does not match the configured vault policy");
     }
 
@@ -180,13 +216,7 @@ fn approve_policy_for_config(
                 &controller_indexes,
             )?;
         }
-        sign_vault_psbt_inputs(
-            &mut psbt,
-            &policy,
-            SpendPath::Cooperative,
-            &hww.vault_keypair,
-            &vault_indexes,
-        )?;
+        hww.sign_vault_inputs(&mut psbt, &policy, SpendPath::Cooperative, &vault_indexes)?;
         ceremony::write_psbt(&path, &psbt)?;
     }
     manifest.hww_approved = true;
@@ -203,9 +233,9 @@ pub fn decrypt_phone_backup_package(
     backup_path: &Path,
 ) -> Result<PhoneRecoveryPackage> {
     let config = load_config(data_dir)?;
-    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
-    let backup = load_or_migrate_cloud_backup(data_dir, backup_path, &config, &hww)?;
-    let payload = social::decrypt_with_hww(&backup, &hww.seed)?;
+    let hww = load_hww(data_dir)?;
+    let backup = load_or_migrate_cloud_backup(data_dir, backup_path, &config, &*hww)?;
+    let payload = social::decrypt_with_hww(&backup, &hww.backup_secret()?)?;
     payload.validate_against(&config)?;
     let words = payload.phone_mnemonic;
     let phone = DeviceKeys::parse_for_network_at_index(
@@ -242,8 +272,8 @@ pub fn recover(
         SweepPath::HwwRecovery,
         destination,
     )?;
-    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
-    recovery::sign_recovery_sweep(plan, SweepPath::HwwRecovery, &hww)
+    let hww = load_hww(data_dir)?;
+    recovery::sign_recovery_sweep(plan, SweepPath::HwwRecovery, &*hww)
 }
 
 /// Validate a phone-built savings spend and add the HWW signature.
@@ -252,8 +282,8 @@ pub fn approve_savings_spend(
     package: &SavingsSpendPackage,
 ) -> Result<SavingsSpendPackage> {
     let config = load_config(data_dir)?;
-    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
-    savings_spend::approve_savings_spend(&config, package, &hww)
+    let hww = load_hww(data_dir)?;
+    savings_spend::approve_savings_spend(&config, package, &*hww)
 }
 
 /// Move a savings lock's coins with the HWW alone, 455 days after its unlock date.
@@ -266,7 +296,7 @@ pub fn recover_savings(
     destination: &Address,
     fee_rate_sat_vb: u64,
 ) -> Result<(Transaction, SweepResult)> {
-    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
+    let hww = load_hww(data_dir)?;
     savings_spend::sign_savings_recovery(
         config,
         lock,
@@ -275,7 +305,7 @@ pub fn recover_savings(
         SpendPath::HwwRecovery,
         destination,
         fee_rate_sat_vb,
-        &hww,
+        &*hww,
     )
 }
 
@@ -290,13 +320,13 @@ pub fn revoke_policy(
     destination: &Address,
 ) -> Result<Transaction> {
     let phone_pubkey = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)?;
-    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
-    if hww.vault_pubkey.to_string() != config.hww_vault_pubkey {
+    let hww = load_hww(data_dir)?;
+    if hww.vault_key().to_string() != config.hww_vault_pubkey {
         anyhow::bail!("HWW key does not match the configured vault policy");
     }
     let controller = ControllerPolicy::new_for_network(
         phone_pubkey,
-        hww.vault_pubkey,
+        hww.vault_key(),
         config.bitcoin_network()?,
     )?;
     // TODO(production): obtain a current feerate and support explicit fee inputs/RBF/CPFP. The
@@ -308,13 +338,7 @@ pub fn revoke_policy(
         &controller,
     )?;
     let indexes = (0..psbt.inputs.len()).collect::<Vec<_>>();
-    sign_controller_psbt_inputs(
-        &mut psbt,
-        &controller,
-        ControllerPath::Hww,
-        &hww.vault_keypair.cooperative,
-        &indexes,
-    )?;
+    hww.sign_controller_inputs(&mut psbt, &controller, ControllerPath::Hww, &indexes)?;
     finalize_vault_psbt(psbt)
 }
 
@@ -334,16 +358,11 @@ fn approve_cooperative_sweep_for_config(
     let (policy, mut psbt) = recovery::validate_cooperative_sweep(config, package)?;
     let phone_pubkey = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)?;
     verify_vault_psbt_signature(&psbt, &policy, SpendPath::Cooperative, phone_pubkey)?;
-    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
-    if hww.vault_pubkey.to_string() != config.hww_vault_pubkey {
+    let hww = load_hww(data_dir)?;
+    if hww.vault_key().to_string() != config.hww_vault_pubkey {
         anyhow::bail!("HWW key does not match the configured vault policy");
     }
-    sign_vault_psbt(
-        &mut psbt,
-        &policy,
-        SpendPath::Cooperative,
-        &hww.vault_keypair,
-    )?;
+    hww.sign_all_vault_inputs(&mut psbt, &policy, SpendPath::Cooperative)?;
     let mut approved = package.clone();
     approved.psbt = psbt.to_string();
     approved.hww_approved = true;
@@ -373,19 +392,20 @@ pub fn approve_phone_rotation(
         reset_workspace(&workspace)?;
     }
 
-    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
+    let hww = load_hww(data_dir)?;
     let current_backup = load_or_migrate_cloud_backup(
         data_dir,
         &data_dir.join(PHONE_BACKUP_FILE),
         &old_config,
-        &hww,
+        &*hww,
     )?;
-    social::decrypt_with_hww(&current_backup, &hww.seed)?.validate_against(&old_config)?;
+    let secret = hww.backup_secret()?;
+    social::decrypt_with_hww(&current_backup, &secret)?.validate_against(&old_config)?;
     let friend_public_keys = social::friend_public_keys(&current_backup);
     let payload = RecoveryPayload::new(&new_config, &new_phone)?;
     approved.cloud_recovery_backup = Some(social::create_backup(
         &payload,
-        &hww.seed,
+        &secret,
         &friend_public_keys,
     )?);
     Ok(approved)
@@ -395,23 +415,33 @@ fn load_or_migrate_cloud_backup(
     data_dir: &Path,
     backup_path: &Path,
     config: &VaultConfig,
-    hww: &DeviceKeys,
+    hww: &dyn VaultSigner,
 ) -> Result<CloudRecoveryBackup> {
     if let Ok(backup) = read_json::<CloudRecoveryBackup>(backup_path) {
         return Ok(backup);
     }
     let legacy: EncryptedBlob = read_json(backup_path)
         .context("backup is neither a cloud recovery envelope nor a legacy phone backup")?;
-    let words = crypto::decrypt(&hww.seed, "phone-seed-backup", &legacy)?;
+    let secret = hww.backup_secret()?;
+    let words = crypto::decrypt(&secret, "phone-seed-backup", &legacy)?;
     let words = String::from_utf8(words.to_vec()).context("legacy phone backup was not UTF-8")?;
     let phone =
         DeviceKeys::parse_for_network(&Secp256k1::new(), &words, config.bitcoin_network()?)?;
     let payload = RecoveryPayload::new(config, &phone)?;
-    let migrated = social::create_backup(&payload, &hww.seed, &[])?;
+    let migrated = social::create_backup(&payload, &secret, &[])?;
     if backup_path == data_dir.join(PHONE_BACKUP_FILE) {
         write_json(backup_path, &migrated)?;
     }
     Ok(migrated)
+}
+
+/// The vault's HWW: a Ledger when one was set up with `hww init --ledger`, otherwise the
+/// software stand-in.
+pub fn load_hww(data_dir: &Path) -> Result<Box<dyn VaultSigner>> {
+    if ledger::is_ledger_hww(data_dir) {
+        return Ok(Box::new(ledger::LedgerHww::open(data_dir)?));
+    }
+    Ok(Box::new(load_device_keys(data_dir, HWW_DEVICE_FILE)?))
 }
 
 fn reset_workspace(path: &Path) -> Result<()> {

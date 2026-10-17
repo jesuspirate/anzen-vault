@@ -97,9 +97,7 @@ pub fn initialize_vault_for_network(data_dir: &Path, network: Network) -> Result
     let secp = Secp256k1::new();
     let phone_file = load_device(data_dir, PHONE_DEVICE_FILE)
         .context("initialize the phone before the vault")?;
-    let hww_file =
-        load_device(data_dir, HWW_DEVICE_FILE).context("initialize the HWW before the vault")?;
-    if phone_file.bitcoin_network()? != network || hww_file.bitcoin_network()? != network {
+    if phone_file.bitcoin_network()? != network {
         bail!("phone, HWW, and vault must be initialized for the same network");
     }
     let phone = DeviceKeys::parse_for_network_at_index(
@@ -108,27 +106,14 @@ pub fn initialize_vault_for_network(data_dir: &Path, network: Network) -> Result
         network,
         phone_file.vault_key_index,
     )?;
-    let hww = DeviceKeys::parse_for_network_at_index(
-        &secp,
-        &hww_file.mnemonic,
-        network,
-        hww_file.vault_key_index,
-    )?;
-    if data_dir.join(HWW_PUBLIC_FILE).exists() {
-        let public_hww = load_public_device(data_dir, HWW_PUBLIC_FILE)?;
-        if public_hww.bitcoin_network()? != network
-            || public_hww.parsed_vault_pubkey()? != hww.vault_pubkey
-        {
-            bail!("HWW public metadata does not match the initialized HWW key");
-        }
-    }
-    let policy = VaultPolicy::new_for_network(phone.vault_pubkey, hww.vault_pubkey, network)?;
+    let hww_vault_key = hww_vault_key(data_dir, network)?;
+    let policy = VaultPolicy::new_for_network(phone.vault_pubkey, hww_vault_key, network)?;
     let (hot_external, hot_internal) = phone.hot_descriptors(&secp)?;
     let config = VaultConfig {
         version: 1,
         network: network_name(network).to_owned(),
         phone_vault_pubkey: phone.vault_pubkey.to_string(),
-        hww_vault_pubkey: hww.vault_pubkey.to_string(),
+        hww_vault_pubkey: hww_vault_key.to_string(),
         phone_hot_external_descriptor: hot_external,
         phone_hot_internal_descriptor: hot_internal,
         vault_descriptor: policy.descriptor_string(),
@@ -142,6 +127,38 @@ pub fn initialize_vault_for_network(data_dir: &Path, network: Network) -> Result
     write_json(&data_dir.join(CONFIG_FILE), &config)?;
 
     Ok(config)
+}
+
+/// The HWW's vault key: from its key store when the HWW is the software stand-in, otherwise
+/// from the public record a hardware wallet left at setup.
+fn hww_vault_key(data_dir: &Path, network: Network) -> Result<crate::core::keys::VaultKey> {
+    let public = data_dir.join(HWW_PUBLIC_FILE);
+    let public_key = if public.exists() {
+        let public_hww = load_public_device(data_dir, HWW_PUBLIC_FILE)?;
+        if public_hww.bitcoin_network()? != network {
+            bail!("phone, HWW, and vault must be initialized for the same network");
+        }
+        Some(public_hww.parsed_vault_pubkey()?)
+    } else {
+        None
+    };
+    if !data_dir.join(HWW_DEVICE_FILE).exists() {
+        return public_key.context("initialize the HWW before the vault");
+    }
+    let hww_file = load_device(data_dir, HWW_DEVICE_FILE)?;
+    if hww_file.bitcoin_network()? != network {
+        bail!("phone, HWW, and vault must be initialized for the same network");
+    }
+    let hww = DeviceKeys::parse_for_network_at_index(
+        &Secp256k1::new(),
+        &hww_file.mnemonic,
+        network,
+        hww_file.vault_key_index,
+    )?;
+    if public_key.is_some_and(|key| key != hww.vault_pubkey) {
+        bail!("HWW public metadata does not match the initialized HWW key");
+    }
+    Ok(hww.vault_pubkey)
 }
 
 pub fn load_config(data_dir: &Path) -> Result<VaultConfig> {

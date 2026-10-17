@@ -83,6 +83,11 @@ fn policy_address(
 pub trait TaprootPolicy {
     fn leaf(&self, path: SpendPath) -> Result<VaultLeaf>;
     fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>>;
+    /// The multipath descriptor, as registered with a hardware wallet.
+    fn descriptor(&self) -> &Descriptor<DescriptorPublicKey>;
+    fn address(&self) -> &Address;
+    /// Name a hardware wallet shows when it registers or signs for this policy.
+    fn wallet_name(&self) -> String;
 }
 
 impl TaprootPolicy for VaultPolicy {
@@ -93,6 +98,18 @@ impl TaprootPolicy for VaultPolicy {
     fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>> {
         VaultPolicy::definite_descriptor(self)
     }
+
+    fn descriptor(&self) -> &Descriptor<DescriptorPublicKey> {
+        &self.descriptor
+    }
+
+    fn address(&self) -> &Address {
+        &self.address
+    }
+
+    fn wallet_name(&self) -> String {
+        "Anzen vault".to_owned()
+    }
 }
 
 impl TaprootPolicy for SavingsPolicy {
@@ -102,6 +119,27 @@ impl TaprootPolicy for SavingsPolicy {
 
     fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>> {
         SavingsPolicy::definite_descriptor(self)
+    }
+
+    fn descriptor(&self) -> &Descriptor<DescriptorPublicKey> {
+        &self.descriptor
+    }
+
+    fn address(&self) -> &Address {
+        &self.address
+    }
+
+    fn wallet_name(&self) -> String {
+        let date = chrono::DateTime::from_timestamp(i64::from(self.unlock), 0)
+            .map(|time| time.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| self.unlock.to_string());
+        format!("Anzen savings {date}")
+    }
+}
+
+impl ControllerPolicy {
+    pub fn wallet_name(&self) -> String {
+        "Anzen connector".to_owned()
     }
 }
 

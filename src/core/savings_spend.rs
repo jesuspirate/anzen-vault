@@ -15,6 +15,7 @@ use super::{
     policy::{SavingsPolicy, SpendPath},
     recovery::SweepResult,
     savings::SavingsLock,
+    signer::VaultSigner,
     storage::VaultConfig,
     transactions::{
         create_vault_psbt, estimate_vault_vsize, finalize_vault_psbt, sign_vault_psbt,
@@ -282,7 +283,7 @@ pub fn validate_savings_spend(
 pub fn approve_savings_spend(
     config: &VaultConfig,
     package: &SavingsSpendPackage,
-    hww: &DeviceKeys,
+    hww: &dyn VaultSigner,
 ) -> Result<SavingsSpendPackage> {
     let (lock, policy, mut psbt) = validate_savings_spend(config, package)?;
     verify_vault_psbt_signature(
@@ -291,15 +292,10 @@ pub fn approve_savings_spend(
         SpendPath::Cooperative,
         crate::core::keys::VaultKey::from_str(&lock.phone_vault_pubkey)?,
     )?;
-    if hww.vault_pubkey.to_string() != lock.hww_vault_pubkey {
+    if hww.vault_key().to_string() != lock.hww_vault_pubkey {
         bail!("HWW key does not match the savings lock");
     }
-    sign_vault_psbt(
-        &mut psbt,
-        &policy,
-        SpendPath::Cooperative,
-        &hww.vault_keypair,
-    )?;
+    hww.sign_all_vault_inputs(&mut psbt, &policy, SpendPath::Cooperative)?;
     let mut approved = package.clone();
     approved.psbt = psbt.to_string();
     approved.hww_approved = true;
@@ -342,14 +338,14 @@ pub fn sign_savings_recovery(
     path: SpendPath,
     destination: &Address,
     fee_rate_sat_vb: u64,
-    signer: &DeviceKeys,
+    signer: &dyn VaultSigner,
 ) -> Result<(Transaction, SweepResult)> {
     let expected_key = match path {
         SpendPath::Cooperative => bail!("a cooperative savings spend needs both devices"),
         SpendPath::PhoneRecovery => &lock.phone_vault_pubkey,
         SpendPath::HwwRecovery => &lock.hww_vault_pubkey,
     };
-    if signer.vault_pubkey.to_string() != *expected_key {
+    if signer.vault_key().to_string() != *expected_key {
         bail!("this device key did not create the savings lock");
     }
     check_fee_rate(fee_rate_sat_vb)?;
@@ -364,7 +360,7 @@ pub fn sign_savings_recovery(
         destination,
         fee_rate_sat_vb,
     )?;
-    sign_vault_psbt(&mut plan.psbt, &policy, path, &signer.vault_keypair)?;
+    signer.sign_all_vault_inputs(&mut plan.psbt, &policy, path)?;
     let transaction = finalize_vault_psbt(plan.psbt)?;
     let result = SweepResult {
         txid: transaction.compute_txid(),

@@ -20,6 +20,11 @@ struct Cli {
     #[arg(long, global = true)]
     dangerously_enable_mainnet: bool,
 
+    /// Create the devices and vault on signet, the public test network. Later commands follow
+    /// the vault's own network.
+    #[arg(long, global = true, conflicts_with = "dangerously_enable_mainnet")]
+    signet: bool,
+
     #[command(flatten)]
     chain: ChainArgs,
 
@@ -227,8 +232,13 @@ enum EmergencyCommand {
 
 #[derive(Debug, Subcommand)]
 enum HwwCommand {
-    /// Create the simulated HWW key and encrypt the phone backup.
-    Init,
+    /// Create the simulated HWW key, or with --ledger use a Ledger's key.
+    Init {
+        /// Use a Ledger running the Bitcoin app (Bitcoin Test on signet and regtest) instead of
+        /// the simulated HWW. Set ANZEN_LEDGER=tcp:HOST:PORT to use Ledger's emulator.
+        #[arg(long)]
+        ledger: bool,
+    },
     /// Validate one high-level policy and sign its complete PSBT batch.
     ConfirmPolicy {
         proposal: PathBuf,
@@ -352,7 +362,7 @@ impl ChainArgs {
         self.chain_backend.map_or_else(
             || match network {
                 Network::Regtest => Ok(ChainBackendKind::Rpc),
-                Network::Bitcoin => Ok(ChainBackendKind::Electrum),
+                Network::Bitcoin | Network::Signet => Ok(ChainBackendKind::Electrum),
                 other => bail!("unsupported vault network: {other}"),
             },
             Ok,
@@ -363,6 +373,7 @@ impl ChainArgs {
         let default_url = match network {
             Network::Regtest => "http://127.0.0.1:18443",
             Network::Bitcoin => "http://127.0.0.1:8332",
+            Network::Signet => "http://127.0.0.1:38332",
             other => bail!("unsupported Bitcoin Core network: {other}"),
         };
         core::chain::BitcoinCoreBackend::connect(
@@ -416,7 +427,12 @@ enum NodeCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let network = command_network(&cli.data_dir, cli.dangerously_enable_mainnet, &cli.command)?;
+    let network = command_network(
+        &cli.data_dir,
+        cli.dangerously_enable_mainnet,
+        cli.signet,
+        &cli.command,
+    )?;
     match cli.command {
         Command::Init => initialize_vault(&cli.data_dir, network),
         Command::Policy => print_active_policy(&cli.data_dir),
@@ -727,7 +743,13 @@ fn run_hww(
     network: Network,
 ) -> Result<()> {
     match command {
-        HwwCommand::Init => {
+        HwwCommand::Init { ledger: true } => {
+            let key = cold_wallet::initialize_ledger(data_dir, network)?;
+            println!("Ledger set up as the HWW ({})", network_label(network));
+            println!("HWW vault key: {key}");
+            println!("The Ledger keeps its key; nothing secret was written to disk");
+        }
+        HwwCommand::Init { ledger: false } => {
             let hww = cold_wallet::initialize(data_dir, network)?;
             println!("Simulated HWW initialized ({})", network_label(network));
             println!("HWW mnemonic: {}", hww.mnemonic);
@@ -1832,6 +1854,7 @@ fn configured_address(data_dir: &Path, text: &str) -> Result<bitcoin::Address> {
 fn command_network(
     data_dir: &Path,
     dangerously_enable_mainnet: bool,
+    signet: bool,
     _command: &Command,
 ) -> Result<Network> {
     let configured = if core::storage::config_exists(data_dir) {
@@ -1846,6 +1869,11 @@ fn command_network(
             core::storage::load_device(data_dir, core::storage::HWW_DEVICE_FILE)?
                 .bitcoin_network()?,
         )
+    } else if data_dir.join(core::storage::HWW_PUBLIC_FILE).exists() {
+        Some(
+            core::storage::load_public_device(data_dir, core::storage::HWW_PUBLIC_FILE)?
+                .bitcoin_network()?,
+        )
     } else {
         None
     };
@@ -1858,9 +1886,17 @@ fn command_network(
         (Some(Network::Regtest), true) => bail!(
             "vault is configured for regtest; --dangerously-enable-mainnet cannot change an existing vault"
         ),
-        (Some(Network::Regtest), false) => Ok(Network::Regtest),
+        (Some(Network::Regtest), false) if !signet => Ok(Network::Regtest),
+        (Some(Network::Signet), true) => bail!(
+            "vault is configured for signet; --dangerously-enable-mainnet cannot change an existing vault"
+        ),
+        (Some(Network::Signet), false) => Ok(Network::Signet),
+        (Some(other), _) if signet => {
+            bail!("vault is configured for {other}; --signet cannot change an existing vault")
+        }
         (Some(other), _) => bail!("unsupported vault network: {other}"),
         (None, true) => Ok(Network::Bitcoin),
+        (None, false) if signet => Ok(Network::Signet),
         (None, false) => Ok(Network::Regtest),
     }
 }
@@ -1869,6 +1905,7 @@ fn network_label(network: Network) -> &'static str {
     match network {
         Network::Bitcoin => "MAINNET — REAL FUNDS",
         Network::Regtest => "REGTEST ONLY",
+        Network::Signet => "SIGNET (TEST COINS)",
         _ => "UNSUPPORTED NETWORK",
     }
 }

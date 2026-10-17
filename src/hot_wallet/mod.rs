@@ -83,8 +83,8 @@ use crate::core::{
     DEFAULT_FEE_RATE_SAT_VB,
     keys::DeviceKeys,
     storage::{
-        DeviceFile, HWW_DEVICE_FILE, HWW_PUBLIC_FILE, InitializedDevice, PHONE_DEVICE_FILE,
-        VaultConfig, load_config, load_device_keys, load_public_device, network_name, read_json,
+        DeviceFile, HWW_PUBLIC_FILE, InitializedDevice, PHONE_DEVICE_FILE, VaultConfig,
+        load_config, load_device_keys, load_public_device, network_name, read_json,
         validate_supported_network, write_json,
     },
     transactions::{
@@ -169,7 +169,7 @@ where
     if worker_count == 0 {
         bail!("vanity search requires at least one worker thread");
     }
-    if !data_dir.join(HWW_DEVICE_FILE).exists() {
+    if !data_dir.join(HWW_PUBLIC_FILE).exists() {
         bail!("initialize the HWW before using phone init --vanity");
     }
     let public_hww = load_public_device(data_dir, HWW_PUBLIC_FILE)

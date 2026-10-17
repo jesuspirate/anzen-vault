@@ -15,6 +15,7 @@ pub mod policy;
 pub mod recovery;
 pub mod savings;
 pub mod savings_spend;
+pub mod signer;
 pub mod social;
 pub mod storage;
 pub mod transactions;
