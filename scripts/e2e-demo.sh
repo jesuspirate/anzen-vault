@@ -329,9 +329,16 @@ init_vault() {
     anzen_filtered '
         /^(Simulated phone initialized|Phone mnemonic:|Phone vault key:)/ { print }
     ' "$MAIN" phone init
-    anzen_filtered '
-        /^(Simulated HWW initialized|HWW mnemonic:|HWW vault key:|HWW ready)/ { print }
-    ' "$MAIN" hww init
+    if [[ -n ${ANZEN_LEDGER:-} ]]; then
+        # Run the HWW side on a Ledger (or Ledger's emulator) instead of the simulated HWW.
+        anzen_filtered '
+            /^(Ledger set up|HWW vault key:)/ { print }
+        ' "$MAIN" hww init --ledger
+    else
+        anzen_filtered '
+            /^(Simulated HWW initialized|HWW mnemonic:|HWW vault key:|HWW ready)/ { print }
+        ' "$MAIN" hww init
+    fi
     anzen_filtered '
         /^(Vault initialized|Cold storage descriptor:|Vault address:|Phone recovery:|HWW recovery:|Monthly spending:|Emergency access:|Cloud recovery backup:)/ { print }
     ' "$MAIN" init

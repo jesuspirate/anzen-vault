@@ -3,6 +3,7 @@ use super::{
     ceremony::{PolicyPackage, Schedule, is_supported_policy_package},
     keys::DeviceKeys,
     policy::{SpendPath, VaultPolicy},
+    signer::VaultSigner,
     social::CloudRecoveryBackup,
     storage::{DeviceFile, VaultConfig, load_config, read_json},
     transactions::{
@@ -162,17 +163,12 @@ pub fn prepare_sweep(
 pub fn sign_recovery_sweep(
     mut plan: SweepPlan,
     path: SweepPath,
-    signer: &DeviceKeys,
+    signer: &dyn VaultSigner,
 ) -> Result<(Transaction, SweepResult)> {
     if path == SweepPath::Cooperative {
         bail!("cooperative sweeps require both device signatures");
     }
-    sign_vault_psbt(
-        &mut plan.psbt,
-        &plan.policy,
-        path.policy_path(),
-        &signer.vault_keypair,
-    )?;
+    signer.sign_all_vault_inputs(&mut plan.psbt, &plan.policy, path.policy_path())?;
     let transaction = finalize_vault_psbt(plan.psbt)?;
     let result = SweepResult {
         txid: transaction.compute_txid(),

@@ -160,6 +160,18 @@ Emergency access: disabled
 
 The new vault starts with monthly spending and emergency access disabled. `anzen init` prints the static cold-storage descriptor, vault address, and recovery delays, but does not create or sign a spending policy.
 
+### Use a Ledger as the HWW
+
+A Ledger Nano S Plus, Nano X, Stax or Flex running the stock Bitcoin app (version 2.1 or later) can replace the simulated HWW. Use the "Bitcoin Test" app for regtest and signet. Build with USB support, and point `ANZEN_LEDGER` at the device:
+
+```console
+$ cargo build --release --features ledger-usb   # needs libudev-dev on Linux
+$ export ANZEN_LEDGER=usb                        # or tcp:127.0.0.1:9999 for the Speculos emulator
+$ anzen --signet hww init --ledger
+```
+
+The Ledger keeps its key. On first use of each policy the device asks you to register it ("Register account") and shows the vault address so you can compare it. Every later HWW step asks you to review a transaction or, to unlock the encrypted cloud backup, to sign the fixed message "Anzen: unlock the vault recovery backup (v1)". Ceremony transactions spend coins from outside the vault, so the Ledger warns about external inputs; that is expected.
+
 ### Set or replace the vault policy
 
 The phone proposes the policy and signs its side of each vault input. The HWW independently reconstructs the graph, asks for one approval, and signs the other vault side. Future controller inputs stay unsigned until the phone executes an action, so neither device commits revocation authority into the annual package. This real regtest policy combines a 0.1 BTC monthly limit with one cancellable 0.5 BTC emergency withdrawal:

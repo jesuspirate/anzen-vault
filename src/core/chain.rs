@@ -23,6 +23,7 @@ pub const MAINNET_ELECTRUM_SERVERS: &[&str] = &[
 ];
 
 pub const REGTEST_ELECTRUM_SERVERS: &[&str] = &["tcp://127.0.0.1:50001"];
+pub const SIGNET_ELECTRUM_SERVERS: &[&str] = &["ssl://mempool.space:60602"];
 
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
@@ -154,6 +155,7 @@ impl ElectrumBackend {
         let servers = match network {
             Network::Bitcoin => MAINNET_ELECTRUM_SERVERS,
             Network::Regtest => REGTEST_ELECTRUM_SERVERS,
+            Network::Signet => SIGNET_ELECTRUM_SERVERS,
             other => bail!("unsupported Electrum network: {other}"),
         };
         Self::connect(network, servers)
