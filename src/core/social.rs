@@ -388,7 +388,6 @@ mod tests {
     #[test]
     fn encrypted_recovery_payload_preserves_a_vanity_vault_key_index() {
         use crate::core::{policy::VaultPolicy, recovery::rotated_config};
-        use bitcoin::secp256k1::XOnlyPublicKey;
         use std::str::FromStr;
 
         let dir = tempfile::tempdir().unwrap();
@@ -406,7 +405,8 @@ mod tests {
             crate::core::storage::HWW_DEVICE_FILE,
         )
         .unwrap();
-        let hww_pubkey = XOnlyPublicKey::from_str(&initialized.config.hww_vault_pubkey).unwrap();
+        let hww_pubkey =
+            crate::core::keys::VaultKey::from_str(&initialized.config.hww_vault_pubkey).unwrap();
         let policy = VaultPolicy::new(phone.vault_pubkey, hww_pubkey).unwrap();
         let config = rotated_config(&initialized.config, &phone, &policy).unwrap();
         let backup = create_backup(

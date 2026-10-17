@@ -11,7 +11,7 @@ use super::{
     types::VaultUtxo,
 };
 use anyhow::{Context, Result, bail};
-use bitcoin::{Address, Network, OutPoint, key::XOnlyPublicKey};
+use bitcoin::{Address, Network, OutPoint};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -38,8 +38,8 @@ impl SavingsLock {
         let phone_vault_pubkey = config.phone_vault_pubkey.clone();
         let hww_vault_pubkey = config.hww_vault_pubkey.clone();
         let policy = SavingsPolicy::new_for_network(
-            XOnlyPublicKey::from_str(&phone_vault_pubkey)?,
-            XOnlyPublicKey::from_str(&hww_vault_pubkey)?,
+            crate::core::keys::VaultKey::from_str(&phone_vault_pubkey)?,
+            crate::core::keys::VaultKey::from_str(&hww_vault_pubkey)?,
             unlock,
             config.bitcoin_network()?,
         )?;
@@ -55,8 +55,8 @@ impl SavingsLock {
     /// Rebuild the policy and check it still produces the stored address.
     pub fn policy(&self, network: Network) -> Result<SavingsPolicy> {
         let policy = SavingsPolicy::new_for_network(
-            XOnlyPublicKey::from_str(&self.phone_vault_pubkey)?,
-            XOnlyPublicKey::from_str(&self.hww_vault_pubkey)?,
+            crate::core::keys::VaultKey::from_str(&self.phone_vault_pubkey)?,
+            crate::core::keys::VaultKey::from_str(&self.hww_vault_pubkey)?,
             self.unlock,
             network,
         )?;
@@ -228,12 +228,13 @@ pub fn coin_ages(
             .context("savings recovery date overflowed")?;
         // Savings recovery is dated, so HWW recovery (a month later) never comes first.
         const { assert!(SAVINGS_HWW_RECOVERY_SECS > SAVINGS_PHONE_RECOVERY_SECS) };
-        let status = if now < u64::from(lock.unlock) {
+        // A CLTV spend needs the median time past strictly beyond the date.
+        let status = if now <= u64::from(lock.unlock) {
             CoinStatus::Locked {
                 unlock: lock.unlock,
                 seconds_left: u64::from(lock.unlock) - now,
             }
-        } else if now < u64::from(phone_recovery_at) {
+        } else if now <= u64::from(phone_recovery_at) {
             CoinStatus::Unlocked { phone_recovery_at }
         } else {
             CoinStatus::SavingsRecoveryOpen { phone_recovery_at }
@@ -370,12 +371,21 @@ mod tests {
             .unwrap()[0]
                 .status
         };
+        // A CLTV path opens once the median time past is strictly beyond its date.
         assert!(matches!(
             status_at(u64::from(JAN_2030)),
+            CoinStatus::Locked { .. }
+        ));
+        assert!(matches!(
+            status_at(u64::from(JAN_2030) + 1),
             CoinStatus::Unlocked { .. }
         ));
         assert!(matches!(
             status_at(u64::from(JAN_2030 + SAVINGS_PHONE_RECOVERY_SECS)),
+            CoinStatus::Unlocked { .. }
+        ));
+        assert!(matches!(
+            status_at(u64::from(JAN_2030 + SAVINGS_PHONE_RECOVERY_SECS) + 1),
             CoinStatus::SavingsRecoveryOpen { .. }
         ));
     }

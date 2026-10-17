@@ -48,6 +48,13 @@ tr(
 )
 ```
 
+Every key is a BIP388 key expression, so a stock hardware wallet (tested with the Ledger Bitcoin app 2.5.1) can register and sign these policies as written:
+
+- `phone` and `hww` are each device's account xpub at `m/86'/coin'/100'/0/index`, with its `[fingerprint/path]` origin.
+- `NUMS` is BIP341's point H as an xpub with chain code `sha256(H)`. Every child of H is unspendable, and Ledger labels it "Dummy key".
+- The cooperative leaf and the connector policy use each key at `/<0;1>/*`; the single-key recovery leaves use `/<2;3>/*`. Ledger refuses a policy that reuses a key with the same derivation in two leaves.
+- Anzen uses the receive branch at index 0, so each policy still has one fixed address.
+
 This is Anzen's only principal-holding script. Monthly allowances and emergency access are implemented with presigned transaction chains using Bitcoin-enforced relative timelocks.
 
 Revocable authorization state lives in separate 1,000-sat connector outputs. They reuse the same device keys under a fixed 1-of-2 Taproot policy:
@@ -87,6 +94,8 @@ By default one HWW ceremony presigns two years (`phone set-policy --years 2`). T
 `anzen savings create --unlock 2030-01-01` creates a savings address that nothing can spend before 00:00 UTC on that date, not even both devices together. After the date phone and HWW spend it together; if one device is lost, the phone alone can recover it 425 days after the date and the HWW alone 455 days after. Every path is dated, so savings never need a ceremony or renewal and deposits can arrive at the same address forever. The first lock becomes the default deposit address (`anzen deposit-address`), which makes it the natural target for recurring income. Several locks with different dates can be held at once. Each lock records the keys it was created with, so a phone rotation (which cannot move locked coins) leaves its address unchanged.
 
 `anzen coins` lists every vault and savings coin with how long it stays protected, most urgent first: vault coins count down to their phone-only recovery height (and flag a ceremony when it is within about 60 days), savings coins count down to their unlock date. Amounts and coin IDs stay hidden unless `--reveal` is passed.
+
+Once the chain's median time passes the unlock date, `anzen phone savings-spend DEST --unlock YYYY-MM-DD --output spend.json` builds a spend of every coin in that lock at today's fee rate and adds the phone's signature; `anzen hww confirm-savings-spend spend.json --output approved.json` shows the destination, amount and fee before the HWW signs, and `anzen phone broadcast-savings-spend approved.json` sends it. `--unlock` can be left out when there is only one lock. If a device is lost, `anzen phone recover-savings DEST` works 425 days after the date and `anzen hww recover-savings DEST` 455 days after. After a phone-key rotation the phone finds the key that created the lock in its rotation history. Savings spends are built when they are used, not presigned, so they need no CPFP: the fee rate is fetched at that moment and capped at 1,000 sat/vB.
 
 ### Health checks and the recovery kit
 

@@ -254,7 +254,7 @@ pub fn render(input: &KitInput) -> String {
     let printed = date(input.generated_at);
     let network_note = match input.network {
         Network::Bitcoin => String::new(),
-        _ => r#"<div class="box warn"><strong>Test vault.</strong> This kit describes a regtest test vault that holds no real bitcoin.</div>"#.to_owned(),
+        _ => r#"<div class="box warn"><strong>Test vault.</strong> This kit describes a vault on a Bitcoin test network. It holds no real bitcoin.</div>"#.to_owned(),
     };
 
     let mut html = String::with_capacity(32_000);
@@ -392,7 +392,11 @@ pub fn render(input: &KitInput) -> String {
             ],
         ));
         if lock.uses_earlier_phone_key {
-            timelines.push_str(r#"<div class="box warn"><p><strong>This savings lock uses an earlier phone key.</strong> The phone was replaced after this lock was created. Opening it with the phone needs that earlier phone's secret words. The hardware wallet works as usual.</p></div>"#);
+            let _ = write!(
+                timelines,
+                r#"<div class="box warn"><p><strong>This savings lock was made with an earlier phone key.</strong> The phone was replaced after this lock was created. The current phone keeps a copy of the earlier key, so do not reset or replace it. If that phone is gone, the hardware wallet alone can still open this lock from {}.</p></div>"#,
+                esc(&date(unlock + i64::from(SAVINGS_HWW_RECOVERY_SECS)))
+            );
         }
     }
     let _ = write!(
@@ -587,7 +591,7 @@ mod tests {
             "0.1 BTC",
             "Savings lock opening January 1, 2030",
             "March 2, 2031",
-            "uses an earlier phone key",
+            "made with an earlier phone key",
             "Recovery friends set up: Alice.",
             "Not checked yet",
             "Test vault.",

@@ -12,6 +12,8 @@ use crate::core::{
         self, CooperativeSweepPackage, PhoneRecoveryPackage, PhoneRotationPackage, SweepPath,
         SweepResult,
     },
+    savings::SavingsLock,
+    savings_spend::{self, SavingsSpendPackage},
     social::{self, CloudRecoveryBackup, RecoveryPayload},
     storage::{
         DeviceFile, HWW_DEVICE_FILE, HWW_PUBLIC_FILE, InitializedDevice, PHONE_BACKUP_FILE,
@@ -102,12 +104,12 @@ pub fn create_cloud_recovery_backup(
     Ok(backup)
 }
 
-/// Answer a health-check challenge with the HWW vault key. A real device shows the vault it
+/// Answer a health-check challenge with the HWW cooperative and recovery keys. A real device shows the vault it
 /// belongs to and asks for confirmation before signing; the signature cannot move coins.
 pub fn sign_health_challenge(
     data_dir: &Path,
     challenge: &crate::core::health::Challenge,
-) -> Result<bitcoin::secp256k1::schnorr::Signature> {
+) -> Result<crate::core::health::HealthProof> {
     let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
     crate::core::health::sign_challenge(challenge, &hww.vault_keypair)
 }
@@ -138,10 +140,10 @@ fn approve_policy_for_config(
 ) -> Result<BatchManifest> {
     let mut manifest = ceremony::load_manifest(batch_dir)?;
     let policy = ceremony::validate_batch(config, &manifest, batch_dir)?;
-    let phone_pubkey = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.phone_vault_pubkey)?;
+    let phone_pubkey = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)?;
     let controller = ControllerPolicy::new_for_network(
         phone_pubkey,
-        bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.hww_vault_pubkey)?,
+        crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)?,
         config.bitcoin_network()?,
     )?;
     let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
@@ -174,7 +176,7 @@ fn approve_policy_for_config(
                 &psbt,
                 &controller,
                 ControllerPath::Phone,
-                phone_pubkey,
+                phone_pubkey.cooperative(),
                 &controller_indexes,
             )?;
         }
@@ -244,6 +246,39 @@ pub fn recover(
     recovery::sign_recovery_sweep(plan, SweepPath::HwwRecovery, &hww)
 }
 
+/// Validate a phone-built savings spend and add the HWW signature.
+pub fn approve_savings_spend(
+    data_dir: &Path,
+    package: &SavingsSpendPackage,
+) -> Result<SavingsSpendPackage> {
+    let config = load_config(data_dir)?;
+    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
+    savings_spend::approve_savings_spend(&config, package, &hww)
+}
+
+/// Move a savings lock's coins with the HWW alone, 455 days after its unlock date.
+pub fn recover_savings(
+    data_dir: &Path,
+    config: &VaultConfig,
+    lock: &SavingsLock,
+    utxos: &[VaultUtxo],
+    median_time: u64,
+    destination: &Address,
+    fee_rate_sat_vb: u64,
+) -> Result<(Transaction, SweepResult)> {
+    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
+    savings_spend::sign_savings_recovery(
+        config,
+        lock,
+        utxos,
+        median_time,
+        SpendPath::HwwRecovery,
+        destination,
+        fee_rate_sat_vb,
+        &hww,
+    )
+}
+
 /// Revoke every currently live policy state with the HWW controller path.
 ///
 /// The destination is explicit because the cold signer does not own a general-purpose wallet.
@@ -254,7 +289,7 @@ pub fn revoke_policy(
     controller_utxos: &[VaultUtxo],
     destination: &Address,
 ) -> Result<Transaction> {
-    let phone_pubkey = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.phone_vault_pubkey)?;
+    let phone_pubkey = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)?;
     let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
     if hww.vault_pubkey.to_string() != config.hww_vault_pubkey {
         anyhow::bail!("HWW key does not match the configured vault policy");
@@ -277,7 +312,7 @@ pub fn revoke_policy(
         &mut psbt,
         &controller,
         ControllerPath::Hww,
-        &hww.vault_keypair,
+        &hww.vault_keypair.cooperative,
         &indexes,
     )?;
     finalize_vault_psbt(psbt)
@@ -297,7 +332,7 @@ fn approve_cooperative_sweep_for_config(
     package: &CooperativeSweepPackage,
 ) -> Result<CooperativeSweepPackage> {
     let (policy, mut psbt) = recovery::validate_cooperative_sweep(config, package)?;
-    let phone_pubkey = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.phone_vault_pubkey)?;
+    let phone_pubkey = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)?;
     verify_vault_psbt_signature(&psbt, &policy, SpendPath::Cooperative, phone_pubkey)?;
     let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
     if hww.vault_pubkey.to_string() != config.hww_vault_pubkey {

@@ -1,6 +1,6 @@
 use super::{HWW_RECOVERY_BLOCKS, PHONE_RECOVERY_BLOCKS, keys::DeviceKeys, policy::VaultPolicy};
 use anyhow::{Context, Result, bail};
-use bitcoin::{Network, key::Secp256k1, secp256k1::XOnlyPublicKey};
+use bitcoin::{Network, key::Secp256k1};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     fs,
@@ -66,8 +66,9 @@ impl PublicDeviceFile {
         parse_network_name(&self.network)
     }
 
-    pub fn parsed_vault_pubkey(&self) -> Result<XOnlyPublicKey> {
-        XOnlyPublicKey::from_str(&self.vault_pubkey).context("invalid public device vault key")
+    pub fn parsed_vault_pubkey(&self) -> Result<crate::core::keys::VaultKey> {
+        crate::core::keys::VaultKey::from_str(&self.vault_pubkey)
+            .context("invalid public device vault key")
     }
 }
 
@@ -208,6 +209,7 @@ pub fn network_name(network: Network) -> &'static str {
     match network {
         Network::Bitcoin => "mainnet",
         Network::Regtest => "regtest",
+        Network::Signet => "signet",
         _ => "unsupported",
     }
 }
@@ -216,13 +218,14 @@ pub fn parse_network_name(name: &str) -> Result<Network> {
     match name {
         "mainnet" | "bitcoin" => Ok(Network::Bitcoin),
         "regtest" => Ok(Network::Regtest),
+        "signet" => Ok(Network::Signet),
         _ => bail!("unsupported vault network: {name}"),
     }
 }
 
 pub fn validate_supported_network(network: Network) -> Result<()> {
     match network {
-        Network::Bitcoin | Network::Regtest => Ok(()),
+        Network::Bitcoin | Network::Regtest | Network::Signet => Ok(()),
         other => bail!("unsupported vault network: {other}"),
     }
 }

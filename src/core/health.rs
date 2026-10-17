@@ -1,17 +1,22 @@
 //! Device health checks.
 //!
 //! Keys fail quietly: a phone gets wiped, a hardware wallet's flash degrades, a PIN is forgotten.
-//! A health check asks each device to sign a fresh challenge with its vault key and verifies the
-//! signature against the configured vault policy, which proves the private key still exists and
-//! still matches the vault. Results are kept as a dated history so the app can remind the owner
+//! A health check asks each device to sign a fresh challenge with both of its per-path vault keys
+//! (the cooperative key and its single-key recovery key) and verifies each signature against the
+//! keys the vault policy derives from the device's configured key expression. That proves the
+//! private keys still exist and still match every vault leaf the device signs. Results are kept as a dated history so the app can remind the owner
 //! when a check is due. A check never moves coins and costs nothing.
 
-use super::storage::{VaultConfig, read_json, write_json};
+use super::{
+    keys::{VaultKey, VaultKeypairs},
+    policy::SpendPath,
+    storage::{VaultConfig, read_json, write_json},
+};
 use anyhow::{Context, Result, bail};
 use bitcoin::{
     hashes::{Hash, sha256},
     key::{Keypair, Secp256k1},
-    secp256k1::{Message, XOnlyPublicKey, schnorr::Signature},
+    secp256k1::{Message, schnorr::Signature},
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -39,6 +44,14 @@ impl Device {
         }
     }
 
+    /// The recovery leaf this device signs alone.
+    fn recovery_path(self) -> SpendPath {
+        match self {
+            Self::Phone => SpendPath::PhoneRecovery,
+            Self::Hww => SpendPath::HwwRecovery,
+        }
+    }
+
     pub fn configured_pubkey(self, config: &VaultConfig) -> &str {
         match self {
             Self::Phone => &config.phone_vault_pubkey,
@@ -60,7 +73,7 @@ impl fmt::Display for Device {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Challenge {
     pub device: Device,
-    pub vault_pubkey: XOnlyPublicKey,
+    pub vault_key: VaultKey,
     pub issued_at: i64,
     pub nonce: [u8; 32],
 }
@@ -71,36 +84,55 @@ impl Challenge {
         rand::thread_rng().fill_bytes(&mut nonce);
         Ok(Self {
             device,
-            vault_pubkey: XOnlyPublicKey::from_str(device.configured_pubkey(config))
+            vault_key: VaultKey::from_str(device.configured_pubkey(config))
                 .context("configured vault key is invalid")?,
             issued_at: now,
             nonce,
         })
     }
 
-    /// The tagged digest a device signs. Binding the device role, key, and time keeps a signature
-    /// from one check from being replayed as another.
-    pub fn message(&self) -> Message {
-        let mut data = Vec::with_capacity(CHALLENGE_TAG.len() + 32 + 8 + 32 + 8);
+    /// The per-path keys a device must prove, in a fixed order: cooperative, then recovery.
+    pub fn paths(&self) -> [SpendPath; 2] {
+        [SpendPath::Cooperative, self.device.recovery_path()]
+    }
+
+    /// The tagged digest one per-path key signs. Binding the device role, the derived key, and
+    /// time keeps a signature from one check or path from being replayed as another.
+    pub fn message(&self, path: SpendPath) -> Message {
+        let mut data = Vec::with_capacity(CHALLENGE_TAG.len() + 8 + 32 + 8 + 32);
         data.extend_from_slice(CHALLENGE_TAG.as_bytes());
         data.extend_from_slice(self.device.to_string().as_bytes());
-        data.extend_from_slice(&self.vault_pubkey.serialize());
+        data.extend_from_slice(&self.vault_key.for_path(path).serialize());
         data.extend_from_slice(&self.issued_at.to_be_bytes());
         data.extend_from_slice(&self.nonce);
         Message::from_digest(sha256::Hash::hash(&data).to_byte_array())
     }
 }
 
-/// Device-side signing. Each device calls this with its own vault keypair; it refuses to sign a
+/// One signature per key in `Challenge::paths`, in the same order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthProof {
+    pub signatures: [Signature; 2],
+}
+
+/// Device-side signing. Each device calls this with its own vault keypairs; it refuses to sign a
 /// challenge addressed to a different key.
-pub fn sign_challenge(challenge: &Challenge, keypair: &Keypair) -> Result<Signature> {
-    if keypair.x_only_public_key().0 != challenge.vault_pubkey {
-        bail!(
-            "{} key does not match the vault; this device is not the one the vault expects",
-            challenge.device.label()
-        );
-    }
-    Ok(Secp256k1::new().sign_schnorr(&challenge.message(), keypair))
+pub fn sign_challenge(challenge: &Challenge, keypairs: &VaultKeypairs) -> Result<HealthProof> {
+    let secp = Secp256k1::new();
+    let sign = |path: SpendPath| -> Result<Signature> {
+        let keypair: &Keypair = keypairs.for_path(path);
+        if keypair.x_only_public_key().0 != challenge.vault_key.for_path(path) {
+            bail!(
+                "{} key does not match the vault; this device is not the one the vault expects",
+                challenge.device.label()
+            );
+        }
+        Ok(secp.sign_schnorr(&challenge.message(path), keypair))
+    };
+    let [first, second] = challenge.paths();
+    Ok(HealthProof {
+        signatures: [sign(first)?, sign(second)?],
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +141,8 @@ pub struct HealthRecord {
     pub vault_pubkey: String,
     pub checked_at: i64,
     pub nonce: String,
-    pub signature: String,
+    /// Cooperative-key signature, then recovery-key signature.
+    pub signatures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,21 +152,27 @@ pub struct HealthHistory {
 }
 
 /// Verify a device's answer and turn it into a history record.
-pub fn verify(challenge: &Challenge, signature: &Signature) -> Result<HealthRecord> {
-    Secp256k1::verification_only()
-        .verify_schnorr(signature, &challenge.message(), &challenge.vault_pubkey)
+pub fn verify(challenge: &Challenge, proof: &HealthProof) -> Result<HealthRecord> {
+    let secp = Secp256k1::verification_only();
+    for (path, signature) in challenge.paths().into_iter().zip(&proof.signatures) {
+        secp.verify_schnorr(
+            signature,
+            &challenge.message(path),
+            &challenge.vault_key.for_path(path),
+        )
         .with_context(|| {
             format!(
                 "{} failed its health check: the signature does not match the vault key",
                 challenge.device.label()
             )
         })?;
+    }
     Ok(HealthRecord {
         device: challenge.device,
-        vault_pubkey: challenge.vault_pubkey.to_string(),
+        vault_pubkey: challenge.vault_key.to_string(),
         checked_at: challenge.issued_at,
         nonce: bitcoin::hex::DisplayHex::to_lower_hex_string(&challenge.nonce[..]),
-        signature: signature.to_string(),
+        signatures: proof.signatures.iter().map(ToString::to_string).collect(),
     })
 }
 

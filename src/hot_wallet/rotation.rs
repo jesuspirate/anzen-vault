@@ -30,7 +30,7 @@ use crate::core::{
     types::VaultUtxo,
 };
 use anyhow::{Context, Result, bail, ensure};
-use bitcoin::{Psbt, key::Secp256k1, secp256k1::XOnlyPublicKey};
+use bitcoin::{Psbt, key::Secp256k1};
 use chrono::Utc;
 use std::{
     fs,
@@ -91,7 +91,7 @@ where
 {
     let context = load_rotation_context(data_dir, backend)?;
     let network = context.old_config.bitcoin_network()?;
-    let hww_pubkey = XOnlyPublicKey::from_str(&context.old_config.hww_vault_pubkey)?;
+    let hww_pubkey = crate::core::keys::VaultKey::from_str(&context.old_config.hww_vault_pubkey)?;
     let pending = load_pending_vanity_phone(data_dir, &context.old_config, hww_pubkey, suffix)?;
     let (new_phone, expected_address, attempts, actual_worker_count, resumed) = match pending {
         Some((phone, address)) => (phone, address, 0, 0, true),
@@ -136,7 +136,7 @@ fn load_rotation_context(
 fn load_pending_vanity_phone(
     data_dir: &Path,
     old_config: &VaultConfig,
-    hww_pubkey: XOnlyPublicKey,
+    hww_pubkey: crate::core::keys::VaultKey,
     suffix: &str,
 ) -> Result<Option<(DeviceKeys, String)>> {
     let pending_path = data_dir.join(recovery::PENDING_PHONE_ROTATION_FILE);
@@ -180,7 +180,7 @@ fn build_phone_rotation(
         old_phone,
     } = context;
     let network = old_config.bitcoin_network()?;
-    let hww_pubkey = XOnlyPublicKey::from_str(&old_config.hww_vault_pubkey)?;
+    let hww_pubkey = crate::core::keys::VaultKey::from_str(&old_config.hww_vault_pubkey)?;
     let new_policy = VaultPolicy::new_for_network(new_phone.vault_pubkey, hww_pubkey, network)?;
     let new_config = recovery::rotated_config(&old_config, &new_phone, &new_policy)?;
     write_json(
@@ -293,8 +293,8 @@ pub fn activate_phone_rotation(
         None
     } else {
         let destination = replacement_wallet.next_change_address()?;
-        let phone_pubkey = XOnlyPublicKey::from_str(&old_config.phone_vault_pubkey)?;
-        let hww_pubkey = XOnlyPublicKey::from_str(&old_config.hww_vault_pubkey)?;
+        let phone_pubkey = crate::core::keys::VaultKey::from_str(&old_config.phone_vault_pubkey)?;
+        let hww_pubkey = crate::core::keys::VaultKey::from_str(&old_config.hww_vault_pubkey)?;
         let controller = ControllerPolicy::new_for_network(
             phone_pubkey,
             hww_pubkey,
@@ -312,7 +312,7 @@ pub fn activate_phone_rotation(
             &mut psbt,
             &controller,
             ControllerPath::Phone,
-            &old_phone.vault_keypair,
+            &old_phone.vault_keypair.cooperative,
             &indexes,
         )?;
         let transaction = finalize_vault_psbt(psbt)?;

@@ -59,8 +59,10 @@ use crate::core::{
         PolicyPackage, SCHEDULE_FILE, Schedule, ScheduleEntry, TransactionKind,
     },
     chain::{BitcoinCoreBackend, Blockchain, ElectrumBackend},
-    policy::{ControllerPath, ControllerPolicy, VaultAddressTemplate},
+    policy::{ControllerPath, ControllerPolicy, SpendPath, VaultAddressTemplate},
     recovery::{self, CooperativeSweepPackage, PhoneRecoveryPackage, SweepPath, SweepResult},
+    savings::SavingsLock,
+    savings_spend::{self, SavingsSpendPackage},
 };
 use anyhow::{Context, Result, bail};
 use bitcoin::{Address, Amount, Network, OutPoint, Psbt, Transaction, TxOut, Txid, key::Secp256k1};
@@ -135,11 +137,11 @@ where
     )
 }
 
-/// Answer a health-check challenge with the phone vault key.
+/// Answer a health-check challenge with the phone cooperative and recovery keys.
 pub fn sign_health_challenge(
     data_dir: &Path,
     challenge: &crate::core::health::Challenge,
-) -> Result<bitcoin::secp256k1::schnorr::Signature> {
+) -> Result<crate::core::health::HealthProof> {
     let phone = load_device_keys(data_dir, PHONE_DEVICE_FILE)?;
     crate::core::health::sign_challenge(challenge, &phone.vault_keypair)
 }
@@ -198,7 +200,7 @@ fn available_worker_count() -> usize {
 
 fn grind_vanity_phone_key<F>(
     network: Network,
-    hww_pubkey: bitcoin::secp256k1::XOnlyPublicKey,
+    hww_pubkey: crate::core::keys::VaultKey,
     suffix: &str,
     worker_count: usize,
     report_progress: F,
@@ -212,8 +214,9 @@ where
     }
     let target = VanityTarget::new(suffix)?;
     let base_phone = DeviceKeys::generate_for_network(&Secp256k1::new(), network)?;
-    let parent = base_phone.vault_parent_xpriv(&Secp256k1::new())?;
-    let template = Arc::new(VaultAddressTemplate::new(hww_pubkey)?);
+    // Public derivation is enough to test candidates; the winner is re-derived privately below.
+    let parent = base_phone.vault_parent(&Secp256k1::new())?;
+    let template = Arc::new(VaultAddressTemplate::new(hww_pubkey, network)?);
     let stopped = Arc::new(AtomicBool::new(false));
     let attempts = Arc::new(AtomicU64::new(0));
     let last_report = Arc::new(AtomicU64::new(0));
@@ -227,6 +230,7 @@ where
             let attempts = Arc::clone(&attempts);
             let last_report = Arc::clone(&last_report);
             let report_progress = &report_progress;
+            let parent = &parent;
             scope.spawn(move || {
                 let result = (|| -> Result<()> {
                     let secp = Secp256k1::new();
@@ -234,8 +238,7 @@ where
                     let stride = worker_count as u64;
                     let mut pending_attempts = 0_u64;
                     while index < (1_u64 << 31) && !stopped.load(Ordering::Relaxed) {
-                        let (_, _, phone_pubkey) =
-                            DeviceKeys::derive_vault_key_from_parent(&secp, &parent, index as u32)?;
+                        let phone_pubkey = parent.vault_key(&secp, index as u32)?;
                         pending_attempts += 1;
                         let output_key = template.output_key(&secp, phone_pubkey);
                         if target.matches(&output_key.to_x_only_public_key().serialize()) {
@@ -277,6 +280,7 @@ where
     let expected_prefix = match network {
         Network::Bitcoin => format!("bc1p{suffix}"),
         Network::Regtest => format!("bcrt1p{suffix}"),
+        Network::Signet => format!("tb1p{suffix}"),
         other => bail!("vanity initialization is unsupported on {other}"),
     };
     if !vault_address.to_string().starts_with(&expected_prefix) {
@@ -688,7 +692,7 @@ fn broadcast_emergency_transaction(
         &mut psbt,
         &controller,
         ControllerPath::Phone,
-        &phone.vault_keypair,
+        &phone.vault_keypair.cooperative,
         &[1],
     )?;
     let parent_fee = psbt_fee(&psbt)?;
@@ -779,7 +783,7 @@ fn broadcast_monthly_entry(
         &mut psbt,
         &controller,
         ControllerPath::Phone,
-        &phone.vault_keypair,
+        &phone.vault_keypair.cooperative,
         &[1],
     )?;
     let parent_fee = psbt_fee(&psbt)?;
@@ -939,7 +943,7 @@ fn revoke_connector_to_phone(
         &mut psbt,
         &controller,
         ControllerPath::Phone,
-        &phone.vault_keypair,
+        &phone.vault_keypair.cooperative,
         &[0],
     )?;
     let transaction = finalize_vault_psbt(psbt)?;
@@ -973,9 +977,9 @@ fn ensure_connector_input(psbt: &Psbt, connector: &ceremony::ConnectorState) -> 
 }
 
 fn controller_policy(config: &VaultConfig) -> Result<ControllerPolicy> {
-    let phone = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.phone_vault_pubkey)
+    let phone = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)
         .context("invalid configured phone vault key")?;
-    let hww = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.hww_vault_pubkey)
+    let hww = crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)
         .context("invalid configured HWW vault key")?;
     ControllerPolicy::new_for_network(phone, hww, config.bitcoin_network()?)
 }
@@ -1123,6 +1127,113 @@ fn broadcast_cooperative_sweep_for_config(
         .context("failed to broadcast cooperative vault sweep")?;
     if txid != result.txid {
         bail!("chain backend returned an unexpected cooperative sweep transaction ID");
+    }
+    Ok(result)
+}
+
+/// The phone key that created `lock`. A savings lock keeps the keys it was created with, so after
+/// a phone-key rotation the earlier key is read back from the rotation archive.
+pub fn phone_keys_for_lock(data_dir: &Path, lock: &SavingsLock) -> Result<DeviceKeys> {
+    let current = load_device_keys(data_dir, PHONE_DEVICE_FILE)?;
+    if current.vault_pubkey.to_string() == lock.phone_vault_pubkey {
+        return Ok(current);
+    }
+    let history = data_dir.join("history");
+    if history.is_dir() {
+        for entry in std::fs::read_dir(&history)? {
+            let archive = entry?.path();
+            if !archive.join(PHONE_DEVICE_FILE).is_file() {
+                continue;
+            }
+            let keys = load_device_keys(&archive, PHONE_DEVICE_FILE)?;
+            if keys.vault_pubkey.to_string() == lock.phone_vault_pubkey {
+                return Ok(keys);
+            }
+        }
+    }
+    bail!(
+        "this phone does not hold the key that created the savings lock; restore it from the HWW backup"
+    )
+}
+
+fn savings_lock_coins(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+    unlock: Option<u32>,
+) -> Result<(VaultConfig, SavingsLock, Vec<crate::core::types::VaultUtxo>)> {
+    let config = load_config(data_dir)?;
+    ensure_backend_network(backend, &config)?;
+    let lock = savings_spend::find_lock(&config, unlock)?.clone();
+    let utxos = backend.scan_savings(&lock.address(config.bitcoin_network()?)?)?;
+    Ok((config, lock, utxos))
+}
+
+/// Build the cooperative spend of one savings lock at today's fee rate and add the phone's
+/// signature. The HWW signs it next with `cold_wallet::approve_savings_spend`.
+pub fn create_savings_spend(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+    unlock: Option<u32>,
+    destination: &Address,
+) -> Result<SavingsSpendPackage> {
+    let (config, lock, utxos) = savings_lock_coins(data_dir, backend, unlock)?;
+    let phone = phone_keys_for_lock(data_dir, &lock)?;
+    let tip = backend.chain_tip()?;
+    let fee_rate = savings_spend::current_fee_rate(backend)?;
+    savings_spend::create_savings_spend(
+        &config,
+        &lock,
+        &utxos,
+        tip.median_time,
+        destination,
+        fee_rate,
+        &phone,
+    )
+}
+
+pub fn broadcast_savings_spend(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+    package: &SavingsSpendPackage,
+) -> Result<SweepResult> {
+    let config = load_config(data_dir)?;
+    ensure_backend_network(backend, &config)?;
+    let (transaction, result) = savings_spend::finalize_savings_spend(&config, package)?;
+    let txid = backend
+        .broadcast(&transaction)
+        .context("failed to broadcast savings spend")?;
+    if txid != result.txid {
+        bail!("chain backend returned an unexpected savings spend transaction ID");
+    }
+    Ok(result)
+}
+
+/// Move a savings lock's coins with the phone alone, 425 days after its unlock date.
+pub fn recover_savings(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+    unlock: Option<u32>,
+    destination: &Address,
+) -> Result<SweepResult> {
+    let (config, lock, utxos) = savings_lock_coins(data_dir, backend, unlock)?;
+    let phone = phone_keys_for_lock(data_dir, &lock)?;
+    let tip = backend.chain_tip()?;
+    let fee_rate = savings_spend::current_fee_rate(backend)?;
+    let (transaction, result) = savings_spend::sign_savings_recovery(
+        &config,
+        &lock,
+        &utxos,
+        tip.median_time,
+        SpendPath::PhoneRecovery,
+        destination,
+        fee_rate,
+        &phone,
+    )?;
+    let txid = backend
+        .broadcast(&transaction)
+        .context("failed to broadcast savings recovery")?;
+    if txid != result.txid {
+        bail!("chain backend returned an unexpected savings recovery transaction ID");
     }
     Ok(result)
 }
