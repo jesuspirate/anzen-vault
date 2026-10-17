@@ -48,6 +48,13 @@ tr(
 )
 ```
 
+Every key is a BIP388 key expression, so a stock hardware wallet (tested with the Ledger Bitcoin app 2.5.1) can register and sign these policies as written:
+
+- `phone` and `hww` are each device's account xpub at `m/86'/coin'/100'/0/index`, with its `[fingerprint/path]` origin.
+- `NUMS` is BIP341's point H as an xpub with chain code `sha256(H)`. Every child of H is unspendable, and Ledger labels it "Dummy key".
+- The cooperative leaf and the connector policy use each key at `/<0;1>/*`; the single-key recovery leaves use `/<2;3>/*`. Ledger refuses a policy that reuses a key with the same derivation in two leaves.
+- Anzen uses the receive branch at index 0, so each policy still has one fixed address.
+
 This is Anzen's only principal-holding script. Monthly allowances and emergency access are implemented with presigned transaction chains using Bitcoin-enforced relative timelocks.
 
 Revocable authorization state lives in separate 1,000-sat connector outputs. They reuse the same device keys under a fixed 1-of-2 Taproot policy:

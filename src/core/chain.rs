@@ -432,9 +432,9 @@ impl BitcoinCoreBackend {
 }
 
 fn controller_policy(config: &VaultConfig) -> Result<ControllerPolicy> {
-    let phone = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.phone_vault_pubkey)
+    let phone = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)
         .context("invalid configured phone vault key")?;
-    let hww = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.hww_vault_pubkey)
+    let hww = crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)
         .context("invalid configured HWW vault key")?;
     ControllerPolicy::new_for_network(phone, hww, config.bitcoin_network()?)
 }

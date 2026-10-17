@@ -191,7 +191,7 @@ fn available_worker_count() -> usize {
 
 fn grind_vanity_phone_key<F>(
     network: Network,
-    hww_pubkey: bitcoin::secp256k1::XOnlyPublicKey,
+    hww_pubkey: crate::core::keys::VaultKey,
     suffix: &str,
     worker_count: usize,
     report_progress: F,
@@ -205,8 +205,9 @@ where
     }
     let target = VanityTarget::new(suffix)?;
     let base_phone = DeviceKeys::generate_for_network(&Secp256k1::new(), network)?;
-    let parent = base_phone.vault_parent_xpriv(&Secp256k1::new())?;
-    let template = Arc::new(VaultAddressTemplate::new(hww_pubkey)?);
+    // Public derivation is enough to test candidates; the winner is re-derived privately below.
+    let parent = base_phone.vault_parent(&Secp256k1::new())?;
+    let template = Arc::new(VaultAddressTemplate::new(hww_pubkey, network)?);
     let stopped = Arc::new(AtomicBool::new(false));
     let attempts = Arc::new(AtomicU64::new(0));
     let last_report = Arc::new(AtomicU64::new(0));
@@ -220,6 +221,7 @@ where
             let attempts = Arc::clone(&attempts);
             let last_report = Arc::clone(&last_report);
             let report_progress = &report_progress;
+            let parent = &parent;
             scope.spawn(move || {
                 let result = (|| -> Result<()> {
                     let secp = Secp256k1::new();
@@ -227,8 +229,7 @@ where
                     let stride = worker_count as u64;
                     let mut pending_attempts = 0_u64;
                     while index < (1_u64 << 31) && !stopped.load(Ordering::Relaxed) {
-                        let (_, _, phone_pubkey) =
-                            DeviceKeys::derive_vault_key_from_parent(&secp, &parent, index as u32)?;
+                        let phone_pubkey = parent.vault_key(&secp, index as u32)?;
                         pending_attempts += 1;
                         let output_key = template.output_key(&secp, phone_pubkey);
                         if target.matches(&output_key.to_x_only_public_key().serialize()) {
@@ -270,6 +271,7 @@ where
     let expected_prefix = match network {
         Network::Bitcoin => format!("bc1p{suffix}"),
         Network::Regtest => format!("bcrt1p{suffix}"),
+        Network::Signet => format!("tb1p{suffix}"),
         other => bail!("vanity initialization is unsupported on {other}"),
     };
     if !vault_address.to_string().starts_with(&expected_prefix) {
@@ -681,7 +683,7 @@ fn broadcast_emergency_transaction(
         &mut psbt,
         &controller,
         ControllerPath::Phone,
-        &phone.vault_keypair,
+        &phone.vault_keypair.cooperative,
         &[1],
     )?;
     let parent_fee = psbt_fee(&psbt)?;
@@ -772,7 +774,7 @@ fn broadcast_monthly_entry(
         &mut psbt,
         &controller,
         ControllerPath::Phone,
-        &phone.vault_keypair,
+        &phone.vault_keypair.cooperative,
         &[1],
     )?;
     let parent_fee = psbt_fee(&psbt)?;
@@ -932,7 +934,7 @@ fn revoke_connector_to_phone(
         &mut psbt,
         &controller,
         ControllerPath::Phone,
-        &phone.vault_keypair,
+        &phone.vault_keypair.cooperative,
         &[0],
     )?;
     let transaction = finalize_vault_psbt(psbt)?;
@@ -966,9 +968,9 @@ fn ensure_connector_input(psbt: &Psbt, connector: &ceremony::ConnectorState) -> 
 }
 
 fn controller_policy(config: &VaultConfig) -> Result<ControllerPolicy> {
-    let phone = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.phone_vault_pubkey)
+    let phone = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)
         .context("invalid configured phone vault key")?;
-    let hww = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.hww_vault_pubkey)
+    let hww = crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)
         .context("invalid configured HWW vault key")?;
     ControllerPolicy::new_for_network(phone, hww, config.bitcoin_network()?)
 }

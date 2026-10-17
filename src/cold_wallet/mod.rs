@@ -130,10 +130,10 @@ fn approve_policy_for_config(
 ) -> Result<BatchManifest> {
     let mut manifest = ceremony::load_manifest(batch_dir)?;
     let policy = ceremony::validate_batch(config, &manifest, batch_dir)?;
-    let phone_pubkey = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.phone_vault_pubkey)?;
+    let phone_pubkey = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)?;
     let controller = ControllerPolicy::new_for_network(
         phone_pubkey,
-        bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.hww_vault_pubkey)?,
+        crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)?,
         config.bitcoin_network()?,
     )?;
     let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
@@ -166,7 +166,7 @@ fn approve_policy_for_config(
                 &psbt,
                 &controller,
                 ControllerPath::Phone,
-                phone_pubkey,
+                phone_pubkey.cooperative(),
                 &controller_indexes,
             )?;
         }
@@ -279,7 +279,7 @@ pub fn revoke_policy(
     controller_utxos: &[VaultUtxo],
     destination: &Address,
 ) -> Result<Transaction> {
-    let phone_pubkey = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.phone_vault_pubkey)?;
+    let phone_pubkey = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)?;
     let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
     if hww.vault_pubkey.to_string() != config.hww_vault_pubkey {
         anyhow::bail!("HWW key does not match the configured vault policy");
@@ -302,7 +302,7 @@ pub fn revoke_policy(
         &mut psbt,
         &controller,
         ControllerPath::Hww,
-        &hww.vault_keypair,
+        &hww.vault_keypair.cooperative,
         &indexes,
     )?;
     finalize_vault_psbt(psbt)
@@ -322,7 +322,7 @@ fn approve_cooperative_sweep_for_config(
     package: &CooperativeSweepPackage,
 ) -> Result<CooperativeSweepPackage> {
     let (policy, mut psbt) = recovery::validate_cooperative_sweep(config, package)?;
-    let phone_pubkey = bitcoin::secp256k1::XOnlyPublicKey::from_str(&config.phone_vault_pubkey)?;
+    let phone_pubkey = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)?;
     verify_vault_psbt_signature(&psbt, &policy, SpendPath::Cooperative, phone_pubkey)?;
     let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
     if hww.vault_pubkey.to_string() != config.hww_vault_pubkey {

@@ -14,7 +14,7 @@ use super::{
 use anyhow::{Context, Result, bail};
 use bitcoin::{
     Address, Amount, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
-    key::Secp256k1, secp256k1::XOnlyPublicKey, transaction::Version,
+    key::Secp256k1, transaction::Version,
 };
 use serde::{Deserialize, Serialize};
 use std::{path::Path, str::FromStr};
@@ -230,13 +230,13 @@ pub fn finalize_cooperative_sweep(
         &psbt,
         &policy,
         SpendPath::Cooperative,
-        XOnlyPublicKey::from_str(&config.phone_vault_pubkey)?,
+        crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)?,
     )?;
     verify_vault_psbt_signature(
         &psbt,
         &policy,
         SpendPath::Cooperative,
-        XOnlyPublicKey::from_str(&config.hww_vault_pubkey)?,
+        crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)?,
     )?;
     let transaction = finalize_vault_psbt(psbt)?;
     let result = SweepResult {
@@ -332,8 +332,8 @@ pub fn validate_phone_rotation(
     if new_phone.vault_pubkey.to_string() != package.new_phone_vault_pubkey {
         bail!("pending phone key does not match the rotation proposal");
     }
-    let hww_pubkey = XOnlyPublicKey::from_str(&old_config.hww_vault_pubkey)?;
-    let phone_pubkey = XOnlyPublicKey::from_str(&package.new_phone_vault_pubkey)?;
+    let hww_pubkey = crate::core::keys::VaultKey::from_str(&old_config.hww_vault_pubkey)?;
+    let phone_pubkey = crate::core::keys::VaultKey::from_str(&package.new_phone_vault_pubkey)?;
     let policy =
         VaultPolicy::new_for_network(phone_pubkey, hww_pubkey, old_config.bitcoin_network()?)?;
     if policy.descriptor_string() != package.new_vault_descriptor

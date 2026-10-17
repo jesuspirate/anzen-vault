@@ -11,7 +11,7 @@ use super::{
     types::VaultUtxo,
 };
 use anyhow::{Context, Result, bail};
-use bitcoin::{Address, Network, OutPoint, key::XOnlyPublicKey};
+use bitcoin::{Address, Network, OutPoint};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -38,8 +38,8 @@ impl SavingsLock {
         let phone_vault_pubkey = config.phone_vault_pubkey.clone();
         let hww_vault_pubkey = config.hww_vault_pubkey.clone();
         let policy = SavingsPolicy::new_for_network(
-            XOnlyPublicKey::from_str(&phone_vault_pubkey)?,
-            XOnlyPublicKey::from_str(&hww_vault_pubkey)?,
+            crate::core::keys::VaultKey::from_str(&phone_vault_pubkey)?,
+            crate::core::keys::VaultKey::from_str(&hww_vault_pubkey)?,
             unlock,
             config.bitcoin_network()?,
         )?;
@@ -55,8 +55,8 @@ impl SavingsLock {
     /// Rebuild the policy and check it still produces the stored address.
     pub fn policy(&self, network: Network) -> Result<SavingsPolicy> {
         let policy = SavingsPolicy::new_for_network(
-            XOnlyPublicKey::from_str(&self.phone_vault_pubkey)?,
-            XOnlyPublicKey::from_str(&self.hww_vault_pubkey)?,
+            crate::core::keys::VaultKey::from_str(&self.phone_vault_pubkey)?,
+            crate::core::keys::VaultKey::from_str(&self.hww_vault_pubkey)?,
             self.unlock,
             network,
         )?;
