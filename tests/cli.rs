@@ -497,3 +497,136 @@ fn health_checks_and_recovery_kit_work_without_a_chain_backend() {
         .failure()
         .stdout(predicate::str::contains("Hardware wallet: FAILED"));
 }
+
+fn anzen_ok(data_dir: &str, args: &[&str]) -> String {
+    let output = Command::cargo_bin("anzen")
+        .unwrap()
+        .arg("--data-dir")
+        .arg(data_dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "anzen {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn an_heir_is_named_before_the_vault_and_can_rebuild_it_from_the_kit() {
+    let heir_home = tempfile::tempdir().unwrap();
+    let owner_home = tempfile::tempdir().unwrap();
+    let heir_dir = heir_home.path().to_str().unwrap();
+    let owner_dir = owner_home.path().to_str().unwrap();
+
+    // The heir makes a key on their own device and hands the owner its public half.
+    let created = anzen_ok(heir_dir, &["heir", "init", "--name", "Maya"]);
+    let heir_key = created
+        .lines()
+        .find_map(|line| line.strip_prefix("Heir key: "))
+        .unwrap()
+        .to_owned();
+    assert!(created.contains("Heir's secret words"));
+
+    anzen_ok(
+        owner_dir,
+        &["heir", "import", "--name", "Maya", "--key", &heir_key],
+    );
+    anzen_ok(owner_dir, &["phone", "init"]);
+    anzen_ok(owner_dir, &["hww", "init"]);
+    let init = anzen_ok(owner_dir, &["init"]);
+    assert!(init.contains("Heir recovery:  65,535 blocks (~15 months) with Maya's own key"));
+    assert!(init.contains(&heir_key));
+    anzen_ok(owner_dir, &["savings", "create", "--unlock", "2031-01-01"]);
+
+    // Once the vault exists, its heir cannot be changed or added.
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["--data-dir", owner_dir, "heir", "init", "--name", "Other"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "must be named before `anzen init`",
+        ));
+
+    let kit = owner_home.path().join("kit.html");
+    anzen_ok(
+        owner_dir,
+        &[
+            "recovery-kit",
+            "--output",
+            kit.to_str().unwrap(),
+            "--owner",
+            "Jet",
+        ],
+    );
+    let html = std::fs::read_to_string(&kit).unwrap();
+    assert!(html.contains("Maya's own door"));
+    assert!(html.contains("You are Maya, the named heir"));
+    assert!(html.contains("anzen heir restore"));
+
+    // The heir rebuilds the vault from the descriptors printed in the kit.
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(owner_home.path().join("anzen.json")).unwrap(),
+    )
+    .unwrap();
+    let vault_descriptor = config["vault_descriptor"].as_str().unwrap();
+    let savings_address = config["savings_locks"][0]["address"].as_str().unwrap();
+    let savings_descriptor = html
+        .split(r#"<p class="label">Descriptor</p><span class="mono">"#)
+        .nth(2)
+        .and_then(|rest| rest.split("</span>").next())
+        .unwrap()
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">");
+    assert!(savings_descriptor.contains("after("));
+    let restored = anzen_ok(
+        heir_dir,
+        &[
+            "heir",
+            "restore",
+            "--vault-descriptor",
+            vault_descriptor,
+            "--savings-descriptor",
+            &savings_descriptor,
+        ],
+    );
+    assert!(restored.contains(config["vault_address"].as_str().unwrap()));
+    let heir_config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(heir_home.path().join("anzen.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(heir_config["vault_address"], config["vault_address"]);
+    assert_eq!(heir_config["savings_locks"][0]["address"], savings_address);
+    assert_eq!(heir_config["heir"]["name"], "Maya");
+
+    // A vault that does not name this heir is refused.
+    let stranger_home = tempfile::tempdir().unwrap();
+    let stranger_dir = stranger_home.path().to_str().unwrap();
+    anzen_ok(stranger_dir, &["phone", "init"]);
+    anzen_ok(stranger_dir, &["hww", "init"]);
+    anzen_ok(stranger_dir, &["init"]);
+    let stranger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(stranger_home.path().join("anzen.json")).unwrap(),
+    )
+    .unwrap();
+    let other_heir_home = tempfile::tempdir().unwrap();
+    let other_heir_dir = other_heir_home.path().to_str().unwrap();
+    anzen_ok(other_heir_dir, &["heir", "init", "--name", "Maya"]);
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args([
+            "--data-dir",
+            other_heir_dir,
+            "heir",
+            "restore",
+            "--vault-descriptor",
+            stranger["vault_descriptor"].as_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not name this heir's key"));
+}

@@ -92,6 +92,7 @@ where
     let context = load_rotation_context(data_dir, backend)?;
     let network = context.old_config.bitcoin_network()?;
     let hww_pubkey = crate::core::keys::VaultKey::from_str(&context.old_config.hww_vault_pubkey)?;
+    let heir = context.old_config.heir_key()?;
     let pending = load_pending_vanity_phone(data_dir, &context.old_config, hww_pubkey, suffix)?;
     let (new_phone, expected_address, attempts, actual_worker_count, resumed) = match pending {
         Some((phone, address)) => (phone, address, 0, 0, true),
@@ -101,7 +102,14 @@ where
                 vault_address,
                 attempts,
                 worker_count,
-            } = grind_vanity_phone_key(network, hww_pubkey, suffix, worker_count, report_progress)?;
+            } = grind_vanity_phone_key(
+                network,
+                hww_pubkey,
+                heir,
+                suffix,
+                worker_count,
+                report_progress,
+            )?;
             (phone, vault_address, attempts, worker_count, false)
         }
     };
@@ -154,7 +162,12 @@ fn load_pending_vanity_phone(
         network,
         pending.vault_key_index,
     )?;
-    let policy = VaultPolicy::new_for_network(phone.vault_pubkey, hww_pubkey, network)?;
+    let policy = VaultPolicy::with_heir(
+        phone.vault_pubkey,
+        hww_pubkey,
+        old_config.heir_key()?,
+        network,
+    )?;
     let expected_prefix = match network {
         bitcoin::Network::Bitcoin => format!("bc1p{suffix}"),
         bitcoin::Network::Regtest => format!("bcrt1p{suffix}"),
@@ -181,7 +194,12 @@ fn build_phone_rotation(
     } = context;
     let network = old_config.bitcoin_network()?;
     let hww_pubkey = crate::core::keys::VaultKey::from_str(&old_config.hww_vault_pubkey)?;
-    let new_policy = VaultPolicy::new_for_network(new_phone.vault_pubkey, hww_pubkey, network)?;
+    let new_policy = VaultPolicy::with_heir(
+        new_phone.vault_pubkey,
+        hww_pubkey,
+        old_config.heir_key()?,
+        network,
+    )?;
     let new_config = recovery::rotated_config(&old_config, &new_phone, &new_policy)?;
     write_json(
         &data_dir.join(recovery::PENDING_PHONE_ROTATION_FILE),

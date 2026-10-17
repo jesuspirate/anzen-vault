@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use anzen::{cold_wallet, core, hot_wallet};
+use anzen::{cold_wallet, core, heir_wallet, hot_wallet};
 use bitcoin::Network;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Serialize, de::DeserializeOwned};
@@ -73,6 +73,11 @@ enum Command {
         #[command(subcommand)]
         command: HealthCommand,
     },
+    /// Name an heir before creating the vault, see when their key opens, and claim with it.
+    Heir {
+        #[command(subcommand)]
+        command: HeirCommand,
+    },
     /// Write a printable, plain-language recovery kit for heirs and recovery friends.
     RecoveryKit {
         /// Where to write the kit (an HTML file; print it or save it as PDF from any browser).
@@ -99,6 +104,36 @@ enum HealthCommand {
     },
     /// Show when each device was last checked and when the next check is due.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum HeirCommand {
+    /// Create a key for the heir with the simulated key store. Run before `anzen init`.
+    Init {
+        /// The heir's name, printed in the recovery kit.
+        #[arg(long)]
+        name: String,
+    },
+    /// Name an heir by the key their own wallet exported, as [fingerprint/path]xpub. Run before
+    /// `anzen init`.
+    Import {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        key: String,
+    },
+    /// On the heir's own device: rebuild the vault from the descriptors in the recovery kit.
+    Restore {
+        #[arg(long)]
+        vault_descriptor: String,
+        /// One per savings lock that names the heir.
+        #[arg(long = "savings-descriptor")]
+        savings_descriptors: Vec<String>,
+    },
+    /// Show who the heir is and when their key opens for the vault and each savings lock.
+    Status,
+    /// With the heir's key: move every vault and savings coin it can already open.
+    Claim { destination: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -444,6 +479,7 @@ fn main() -> Result<()> {
         Command::Hww { command } => run_hww(command, &cli.data_dir, &cli.chain, network),
         Command::Social { command } => run_social(command, &cli.data_dir, &cli.chain),
         Command::Health { command } => run_health(&cli.data_dir, command),
+        Command::Heir { command } => run_heir(command, &cli.data_dir, &cli.chain, network),
         Command::RecoveryKit { output, owner } => write_recovery_kit(&cli.data_dir, &output, owner),
         Command::Node { command } => run_node(command, &cli.chain, network),
     }
@@ -466,6 +502,13 @@ fn initialize_vault(data_dir: &Path, network: Network) -> Result<()> {
         "HWW recovery:   {} blocks (~15 months)",
         format_number(u64::from(config.hww_recovery_blocks))
     );
+    if let Some(heir) = &config.heir {
+        println!(
+            "Heir recovery:  {} blocks (~15 months) with {}'s own key",
+            format_number(u64::from(core::HEIR_RECOVERY_BLOCKS)),
+            heir.name
+        );
+    }
     println!("Monthly spending: disabled");
     println!("Emergency access: disabled");
     println!(
@@ -1200,6 +1243,151 @@ fn print_active_policy(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn run_heir(
+    command: HeirCommand,
+    data_dir: &Path,
+    rpc_args: &ChainArgs,
+    network: Network,
+) -> Result<()> {
+    match command {
+        HeirCommand::Init { name } => {
+            let heir = heir_wallet::initialize(data_dir, network, &name)?;
+            println!("Heir named: {}", heir.name);
+            println!("Heir key: {}", heir.vault_pubkey);
+            if let Some(words) = heir.mnemonic {
+                println!(
+                    "Heir's secret words (give these to {} only): {words}",
+                    heir.name
+                );
+            }
+            println!("Their key will be in the vault created by `anzen init`.");
+        }
+        HeirCommand::Import { name, key } => {
+            let heir = heir_wallet::import(data_dir, network, &name, &key)?;
+            println!("Heir named: {}", heir.name);
+            println!("Heir key: {}", heir.vault_pubkey);
+            println!("Their key will be in the vault created by `anzen init`.");
+        }
+        HeirCommand::Restore {
+            vault_descriptor,
+            savings_descriptors,
+        } => {
+            let config =
+                heir_wallet::restore(data_dir, network, &vault_descriptor, &savings_descriptors)?;
+            println!(
+                "Vault rebuilt from the recovery kit: {}",
+                config.vault_address
+            );
+            println!("Savings locks: {}", config.savings_locks.len());
+            println!("Next: anzen heir status, then anzen heir claim <address> when it opens");
+        }
+        HeirCommand::Status => {
+            let config = core::storage::load_config(data_dir)?;
+            let Some(heir) = &config.heir else {
+                println!("No heir is named for this vault.");
+                println!(
+                    "An heir is named before the vault is created: anzen heir init --name NAME"
+                );
+                return Ok(());
+            };
+            println!("Heir: {}", heir.name);
+            println!("Heir key: {}", heir.vault_pubkey);
+            let backend = rpc_args.connect_chain(data_dir)?;
+            let tip = backend.chain_tip()?;
+            let utxos = backend.scan_vault(&config)?;
+            match utxos.first() {
+                Some(oldest) => print_recovery_activation(
+                    "Heir (vault coins that stop moving)",
+                    oldest.confirmation_height + u64::from(core::HEIR_RECOVERY_BLOCKS),
+                    tip.height + 1,
+                    tip.median_time,
+                ),
+                None => println!("Vault: no coins"),
+            }
+            println!(
+                "Every time the owner's vault coins move, the heir's wait starts again from that day."
+            );
+            for lock in &config.savings_locks {
+                let opens = match &lock.heir_vault_pubkey {
+                    Some(key) if *key == heir.vault_pubkey => format_unix_date(
+                        lock.policy(config.bitcoin_network()?)?
+                            .earliest_lock_time(core::policy::SpendPath::Heir),
+                    ),
+                    _ => "never (created without this heir)".to_owned(),
+                };
+                println!(
+                    "Savings until {}: heir's key opens {opens}",
+                    format_unix_date(lock.unlock)
+                );
+            }
+        }
+        HeirCommand::Claim { destination } => {
+            let destination = configured_address(data_dir, &destination)?;
+            let config = core::storage::load_config(data_dir)?;
+            let network = config.bitcoin_network()?;
+            let backend = rpc_args.connect_chain(data_dir)?;
+            let tip = backend.chain_tip()?;
+            let mut claimed = 0;
+            let utxos = backend.scan_vault(&config)?;
+            if utxos.is_empty() {
+                println!("Vault: no coins");
+            } else {
+                match heir_wallet::claim_vault(data_dir, &config, &utxos, tip.height, &destination)
+                {
+                    Ok((transaction, result)) => {
+                        let txid = backend.broadcast(&transaction)?;
+                        if txid != result.txid {
+                            bail!("chain backend returned an unexpected heir claim transaction ID");
+                        }
+                        print_sweep_result_line("Heir vault claim broadcast", &result);
+                        claimed += 1;
+                    }
+                    Err(error) => println!("Vault: not yet. {error:#}"),
+                }
+            }
+            for lock in &config.savings_locks {
+                let label = format!("Savings until {}", format_unix_date(lock.unlock));
+                if lock.heir_vault_pubkey.is_none() {
+                    println!("{label}: created without an heir");
+                    continue;
+                }
+                let utxos = backend.scan_savings(&lock.address(network)?)?;
+                if utxos.is_empty() {
+                    println!("{label}: no coins");
+                    continue;
+                }
+                let fee_rate = core::savings_spend::current_fee_rate(backend.as_ref())?;
+                match heir_wallet::claim_savings(
+                    data_dir,
+                    &config,
+                    lock,
+                    &utxos,
+                    tip.median_time,
+                    &destination,
+                    fee_rate,
+                ) {
+                    Ok((transaction, result)) => {
+                        let txid = backend.broadcast(&transaction)?;
+                        if txid != result.txid {
+                            bail!("chain backend returned an unexpected heir claim transaction ID");
+                        }
+                        print_sweep_result_line(
+                            &format!("Heir claim of {label} broadcast"),
+                            &result,
+                        );
+                        claimed += 1;
+                    }
+                    Err(error) => println!("{label}: not yet. {error:#}"),
+                }
+            }
+            if claimed == 0 {
+                bail!("the heir's key cannot move any coins yet");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_health(data_dir: &Path, command: HealthCommand) -> Result<()> {
     use core::health::{self, Device};
     let config = core::storage::load_config(data_dir)?;
@@ -1278,6 +1466,10 @@ fn write_recovery_kit(data_dir: &Path, output: &Path, owner: Option<String>) -> 
             descriptor: lock.policy(network)?.descriptor.to_string(),
             default_deposit: lock.default_deposit,
             uses_earlier_phone_key: lock.phone_vault_pubkey != config.phone_vault_pubkey,
+            heir: config
+                .heir
+                .as_ref()
+                .is_some_and(|heir| lock.heir_vault_pubkey.as_ref() == Some(&heir.vault_pubkey)),
         });
     }
     let backup_path = data_dir.join(core::storage::PHONE_BACKUP_FILE);
@@ -1318,6 +1510,11 @@ fn write_recovery_kit(data_dir: &Path, output: &Path, owner: Option<String>) -> 
         savings,
         friends,
         health,
+        heir: config.heir.as_ref().map(|heir| kit::KitHeir {
+            name: heir.name.clone(),
+            key: heir.vault_pubkey.clone(),
+            recovery_blocks: core::HEIR_RECOVERY_BLOCKS,
+        }),
     });
     fs::write(output, html).with_context(|| format!("failed to write {}", output.display()))?;
     println!("Recovery kit written: {}", output.display());
@@ -1348,7 +1545,7 @@ fn run_savings(data_dir: &Path, command: SavingsCommand) -> Result<()> {
             )?;
             core::storage::save_config(data_dir, &config)?;
             println!("Savings lock created");
-            print_savings_lock(&lock)?;
+            print_savings_lock(&lock, &config)?;
         }
         SavingsCommand::List => {
             if config.savings_locks.is_empty() {
@@ -1357,8 +1554,7 @@ fn run_savings(data_dir: &Path, command: SavingsCommand) -> Result<()> {
                 );
             }
             for lock in &config.savings_locks {
-                lock.policy(config.bitcoin_network()?)?;
-                print_savings_lock(lock)?;
+                print_savings_lock(lock, &config)?;
             }
         }
     }
@@ -1384,9 +1580,14 @@ fn format_unix_date(timestamp: u32) -> String {
     )
 }
 
-fn print_savings_lock(lock: &core::savings::SavingsLock) -> Result<()> {
+fn print_savings_lock(
+    lock: &core::savings::SavingsLock,
+    config: &core::storage::VaultConfig,
+) -> Result<()> {
+    let policy = lock.policy(config.bitcoin_network()?)?;
     println!("Unlocks: {}", format_unix_date(lock.unlock));
     println!("Address: {}", lock.address);
+    println!("Descriptor: {}", policy.descriptor_string());
     println!(
         "Phone-only recovery from: {}",
         format_unix_date(lock.unlock + core::policy::SAVINGS_PHONE_RECOVERY_SECS)
@@ -1395,6 +1596,20 @@ fn print_savings_lock(lock: &core::savings::SavingsLock) -> Result<()> {
         "HWW-only recovery from: {}",
         format_unix_date(lock.unlock + core::policy::SAVINGS_HWW_RECOVERY_SECS)
     );
+    if let Some(heir) = &config.heir {
+        if lock.heir_vault_pubkey.as_ref() == Some(&heir.vault_pubkey) {
+            println!(
+                "{}'s key from: {}",
+                heir.name,
+                format_unix_date(lock.unlock + core::policy::SAVINGS_HEIR_RECOVERY_SECS)
+            );
+        } else {
+            println!(
+                "{}'s key: none (created before the heir was named)",
+                heir.name
+            );
+        }
+    }
     if lock.default_deposit {
         println!("Default deposit address: yes");
     }
@@ -1530,6 +1745,14 @@ fn print_status(data_dir: &Path, rpc_args: &ChainArgs) -> Result<()> {
             tip.height + 1,
             tip.median_time,
         );
+        if config.heir.is_some() {
+            print_recovery_activation(
+                "Heir",
+                oldest.confirmation_height + u64::from(core::HEIR_RECOVERY_BLOCKS),
+                tip.height + 1,
+                tip.median_time,
+            );
+        }
     }
     Ok(())
 }
@@ -1874,6 +2097,10 @@ fn command_network(
             core::storage::load_public_device(data_dir, core::storage::HWW_PUBLIC_FILE)?
                 .bitcoin_network()?,
         )
+    } else if data_dir.join(core::storage::HEIR_PUBLIC_FILE).exists() {
+        let heir: core::storage::HeirPublicFile =
+            core::storage::read_json(&data_dir.join(core::storage::HEIR_PUBLIC_FILE))?;
+        Some(core::storage::parse_network_name(&heir.network)?)
     } else {
         None
     };

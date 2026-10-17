@@ -267,6 +267,7 @@ mod tests {
             monthly_limit_sats: 0,
             emergency_access_limit_sats: 0,
             savings_locks: Vec::new(),
+            heir: None,
         }
     }
 

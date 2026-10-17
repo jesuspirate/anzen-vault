@@ -6,6 +6,8 @@ readonly DEFAULT_MONTHLY_LIMIT_SATS=10000000
 readonly DEFAULT_FUNDING_SATS=200000000
 readonly PHONE_RECOVERY_BLOCKS=61200
 readonly HWW_RECOVERY_BLOCKS=65535
+readonly HEIR_RECOVERY_BLOCKS=65535
+readonly SAVINGS_HEIR_RECOVERY_SECONDS=$((485 * 24 * 60 * 60))
 readonly BLOCKS_PER_YEAR=52560
 readonly MONTHLY_ALLOWANCE_DELAY_SECONDS=2592256
 readonly EMERGENCY_ACCESS_DELAY_SECONDS=605184
@@ -40,6 +42,7 @@ readonly TESTS=(
     savings-lock
     savings-spend
     presigned-renewal
+    heir-claim
 )
 
 list_tests() {
@@ -1160,6 +1163,80 @@ test_rollover_forgotten() {
     success "Late rollover renewed both recovery timers."
 }
 
+test_heir_claim() {
+    local heir_dir="$DEMO_ROOT/heir"
+    local heir_output heir_key heir_address savings_date savings_unlock savings_address
+    local savings_output savings_descriptor vault_descriptor rollover_height status_output
+
+    step "Maya, the heir, makes a key on her own device"
+    anzen_capture heir_output "$heir_dir" heir init --name Maya
+    heir_key=$(printf '%s\n' "$heir_output" | awk '/^Heir key:/ {print $3}')
+    anzen "$MAIN" heir import --name Maya --key "$heir_key"
+    success "The owner recorded Maya's public key before creating the vault."
+
+    setup_vault
+    make_receiver heir_address "Maya"
+
+    step "Save into a lock that also names Maya"
+    savings_date=$(date -u -d "@$((NOW + 2 * 24 * 60 * 60))" +%Y-%m-%d)
+    savings_unlock=$(date -u -d "$savings_date" +%s)
+    anzen_capture savings_output "$MAIN" savings create --unlock "$savings_date"
+    savings_descriptor=$(printf '%s\n' "$savings_output" | awk '/^Descriptor:/ {print $2}')
+    savings_address=$(jq -r '.savings_locks[0].address' "$MAIN/anzen.json")
+    anzen "$MAIN" phone send "$savings_address" 30000000
+    confirm_transaction "Confirming the savings deposit"
+    success "Vault and savings both name Maya's key."
+
+    step "The owner's yearly ceremony moves the vault coins"
+    ceremony "$NOW"
+    confirm_transaction "Confirming the annual rollover"
+    rollover_height=$(node_height)
+    success "The move started the heir's clock again."
+
+    step "The owner disappears with both devices"
+    show_file_command rm -- "$MAIN/phone/device.json" "$MAIN/hww/device.json"
+    rm -- "$MAIN/phone/device.json" "$MAIN/hww/device.json"
+    anzen "$MAIN" recovery-kit --output "$DEMO_ROOT/${E2E_TEST}-kit.html" --owner Jet
+    success "Only the printed recovery kit is left."
+
+    step "Maya rebuilds the vault on her own device from the kit"
+    vault_descriptor=$(jq -r .vault_descriptor "$MAIN/anzen.json")
+    anzen "$heir_dir" heir restore --vault-descriptor "$vault_descriptor" \
+        --savings-descriptor "$savings_descriptor"
+    anzen "$heir_dir" heir status
+    expect_failure "Maya's key opens only after the vault coins sit still for 65,535 blocks" \
+        "$heir_dir" heir claim "$heir_address"
+    success "Nothing opens early, not even for the heir."
+
+    step "Wait out the heir's delay, counted from the rollover"
+    mine_to_next_height "$((rollover_height + HEIR_RECOVERY_BLOCKS))" \
+        "Mining the real 65,535-block heir delay"
+    anzen_capture status_output "$heir_dir" heir claim "$heir_address"
+    if ! grep -q "Heir vault claim broadcast" <<<"$status_output" ||
+        ! grep -q "not yet" <<<"$status_output"; then
+        printf 'ERROR: the heir claim did not take the vault and leave the savings lock\n' >&2
+        exit 1
+    fi
+    confirm_transaction "Confirming the heir's vault claim"
+    if [[ $(vault_balance_sats) != 0 ]]; then
+        printf 'ERROR: vault coins remain after the heir claim\n' >&2
+        exit 1
+    fi
+    success "Maya moved every vault coin with her own key."
+
+    advance_mtp_to "$((savings_unlock + SAVINGS_HEIR_RECOVERY_SECONDS))" \
+        "Advance time 485 days past the savings unlock date"
+
+    step "Maya claims the savings lock on its heir date"
+    anzen_capture status_output "$heir_dir" heir claim "$heir_address"
+    if ! grep -q "Heir claim of Savings until $savings_date broadcast" <<<"$status_output"; then
+        printf 'ERROR: the heir did not claim the savings lock\n' >&2
+        exit 1
+    fi
+    confirm_transaction "Confirming the heir's savings claim"
+    success "Maya received the vault and the savings with no device of the owner's."
+}
+
 if (( $(node_height) != 0 )); then
     printf 'ERROR: test %s requires a fresh height-zero regtest node.\n' "$E2E_TEST" >&2
     printf 'Run it through ./scripts/run-e2e.sh so the node is reset first.\n' >&2
@@ -1191,6 +1268,7 @@ case "$E2E_TEST" in
     savings-lock) test_savings_lock ;;
     savings-spend) test_savings_spend ;;
     presigned-renewal) test_presigned_renewal ;;
+    heir-claim) test_heir_claim ;;
     *)
         printf 'ERROR: test %s is listed but has no case here\n' "$E2E_TEST" >&2
         exit 1

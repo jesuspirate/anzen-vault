@@ -64,6 +64,36 @@ fn hot_and_cold_wallets_are_independent() {
 }
 
 #[test]
+fn the_heir_wallet_signs_only_and_depends_only_on_core() {
+    for path in rust_files("src/heir_wallet") {
+        let source = production_source(&path);
+        assert!(
+            !source.contains("crate::hot_wallet") && !source.contains("crate::cold_wallet"),
+            "{} imports another device library",
+            path.display()
+        );
+        assert!(
+            !source.contains("chain::")
+                && !source.contains("ElectrumBackend")
+                && !source.contains("BitcoinCoreBackend"),
+            "{} gives the heir's signer a network client",
+            path.display()
+        );
+    }
+    for path in rust_files("src/core")
+        .into_iter()
+        .chain(rust_files("src/hot_wallet"))
+        .chain(rust_files("src/cold_wallet"))
+    {
+        assert!(
+            !production_source(&path).contains("crate::heir_wallet"),
+            "{} depends on the heir wallet",
+            path.display()
+        );
+    }
+}
+
+#[test]
 fn cli_device_dispatch_uses_only_its_device_library_and_core() {
     let main = source("src/main.rs");
     let phone = main
