@@ -233,8 +233,8 @@ impl VaultSigner for LedgerHww {
         input_indexes: &[usize],
     ) -> Result<()> {
         ensure!(
-            path != SpendPath::PhoneRecovery,
-            "the HWW cannot sign the phone's recovery path"
+            !matches!(path, SpendPath::PhoneRecovery | SpendPath::Heir),
+            "the HWW cannot sign the phone's or the heir's recovery path"
         );
         let (wallet, hmac) =
             self.registered(policy.wallet_name(), policy.descriptor(), policy.address())?;
@@ -485,5 +485,30 @@ impl Transport for LedgerTransport {
         let status = StatusWord::try_from(code)
             .map_err(|_| anyhow!("the Ledger replied with unknown status {code:#06x}"))?;
         Ok((status, answer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{keys::DeviceKeys, policy::VaultPolicy};
+
+    #[test]
+    fn an_heir_vault_is_a_four_key_wallet_policy() {
+        let secp = bitcoin::key::Secp256k1::new();
+        let [phone, hww, heir] = [0; 3].map(|_| DeviceKeys::generate(&secp).unwrap());
+        let vault = VaultPolicy::with_heir(
+            phone.vault_pubkey,
+            hww.vault_pubkey,
+            Some(heir.vault_pubkey),
+            Network::Regtest,
+        )
+        .unwrap();
+        let policy = wallet_policy("Anzen vault".to_owned(), &vault.descriptor).unwrap();
+        assert_eq!(policy.keys.len(), 4);
+        assert_eq!(
+            policy.descriptor_template,
+            "tr(@3/**,{multi_a(2,@0/**,@1/**),{{and_v(v:older(61200),pk(@0/<2;3>/*)),and_v(v:older(65535),pk(@1/<2;3>/*))},and_v(v:older(65535),pk(@2/<2;3>/*))}})"
+        );
     }
 }

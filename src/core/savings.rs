@@ -27,6 +27,10 @@ pub struct SavingsLock {
     pub unlock: u32,
     pub phone_vault_pubkey: String,
     pub hww_vault_pubkey: String,
+    /// The heir named when the lock was created, if any. Like the device keys, it is fixed for
+    /// the life of the lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heir_vault_pubkey: Option<String>,
     pub address: String,
     /// Recurring deposits go here by default.
     #[serde(default)]
@@ -35,31 +39,37 @@ pub struct SavingsLock {
 
 impl SavingsLock {
     pub fn new(config: &VaultConfig, unlock: u32) -> Result<Self> {
-        let phone_vault_pubkey = config.phone_vault_pubkey.clone();
-        let hww_vault_pubkey = config.hww_vault_pubkey.clone();
-        let policy = SavingsPolicy::new_for_network(
-            crate::core::keys::VaultKey::from_str(&phone_vault_pubkey)?,
-            crate::core::keys::VaultKey::from_str(&hww_vault_pubkey)?,
+        let mut lock = Self {
             unlock,
-            config.bitcoin_network()?,
-        )?;
-        Ok(Self {
-            unlock,
-            phone_vault_pubkey,
-            hww_vault_pubkey,
-            address: policy.address.to_string(),
+            phone_vault_pubkey: config.phone_vault_pubkey.clone(),
+            hww_vault_pubkey: config.hww_vault_pubkey.clone(),
+            heir_vault_pubkey: config.heir.as_ref().map(|heir| heir.vault_pubkey.clone()),
+            address: String::new(),
             default_deposit: false,
-        })
+        };
+        lock.address = lock
+            .build_policy(config.bitcoin_network()?)?
+            .address
+            .to_string();
+        Ok(lock)
+    }
+
+    fn build_policy(&self, network: Network) -> Result<SavingsPolicy> {
+        SavingsPolicy::with_heir(
+            crate::core::keys::VaultKey::from_str(&self.phone_vault_pubkey)?,
+            crate::core::keys::VaultKey::from_str(&self.hww_vault_pubkey)?,
+            self.heir_vault_pubkey
+                .as_deref()
+                .map(crate::core::keys::VaultKey::from_str)
+                .transpose()?,
+            self.unlock,
+            network,
+        )
     }
 
     /// Rebuild the policy and check it still produces the stored address.
     pub fn policy(&self, network: Network) -> Result<SavingsPolicy> {
-        let policy = SavingsPolicy::new_for_network(
-            crate::core::keys::VaultKey::from_str(&self.phone_vault_pubkey)?,
-            crate::core::keys::VaultKey::from_str(&self.hww_vault_pubkey)?,
-            self.unlock,
-            network,
-        )?;
+        let policy = self.build_policy(network)?;
         if policy.address.to_string() != self.address {
             bail!("savings lock {} does not match its keys", self.address);
         }

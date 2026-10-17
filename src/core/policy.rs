@@ -1,5 +1,5 @@
 use super::{
-    HWW_RECOVERY_BLOCKS, PHONE_RECOVERY_BLOCKS,
+    HEIR_RECOVERY_BLOCKS, HWW_RECOVERY_BLOCKS, PHONE_RECOVERY_BLOCKS,
     keys::{COOPERATIVE_BRANCH, RECOVERY_BRANCH, VaultKey},
 };
 use anyhow::{Context, Result, bail};
@@ -78,8 +78,8 @@ fn policy_address(
 }
 
 /// A Taproot script policy whose leaves are selected by [`SpendPath`]. Both the vault and the
-/// hard-locked savings policies have one cooperative leaf and two single-key recovery leaves, so
-/// PSBT construction, signing and verification are shared between them.
+/// hard-locked savings policies have one cooperative leaf, two single-key recovery leaves and an
+/// optional heir leaf, so PSBT construction, signing and verification are shared between them.
 pub trait TaprootPolicy {
     fn leaf(&self, path: SpendPath) -> Result<VaultLeaf>;
     fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>>;
@@ -155,6 +155,8 @@ pub enum SpendPath {
     Cooperative,
     PhoneRecovery,
     HwwRecovery,
+    /// The heir's own key, after the longest delay. Only present when the owner named an heir.
+    Heir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,10 +206,15 @@ pub struct VaultAddressTemplate {
     internal_key: XOnlyPublicKey,
     hww_cooperative: XOnlyPublicKey,
     hww_recovery_node: TapNodeHash,
+    heir_node: Option<TapNodeHash>,
 }
 
 impl VaultAddressTemplate {
     pub fn new(hww: VaultKey, network: Network) -> Result<Self> {
+        Self::with_heir(hww, None, network)
+    }
+
+    pub fn with_heir(hww: VaultKey, heir: Option<VaultKey>, network: Network) -> Result<Self> {
         let secp = Secp256k1::verification_only();
         let internal_key = nums_xpub(network)
             .derive_pub(
@@ -224,10 +231,17 @@ impl VaultAddressTemplate {
             &recovery_script(hww.child(&secp, RECOVERY_BRANCH), HWW_RECOVERY_BLOCKS),
             LeafVersion::TapScript,
         );
+        let heir_node = heir.map(|heir| {
+            TapNodeHash::from_script(
+                &recovery_script(heir.child(&secp, RECOVERY_BRANCH), HEIR_RECOVERY_BLOCKS),
+                LeafVersion::TapScript,
+            )
+        });
         Ok(Self {
             internal_key,
             hww_cooperative: hww.child(&secp, COOPERATIVE_BRANCH),
             hww_recovery_node,
+            heir_node,
         })
     }
 
@@ -244,8 +258,11 @@ impl VaultAddressTemplate {
             &recovery_script(phone.child(secp, RECOVERY_BRANCH), PHONE_RECOVERY_BLOCKS),
             LeafVersion::TapScript,
         );
-        let recovery_node =
+        let mut recovery_node =
             TapNodeHash::from_node_hashes(phone_recovery_node, self.hww_recovery_node);
+        if let Some(heir_node) = self.heir_node {
+            recovery_node = TapNodeHash::from_node_hashes(recovery_node, heir_node);
+        }
         let merkle_root = TapNodeHash::from_node_hashes(cooperative_node, recovery_node);
         self.internal_key.tap_tweak(secp, Some(merkle_root)).0
     }
@@ -258,6 +275,57 @@ impl VaultAddressTemplate {
     ) -> Address {
         Address::p2tr_tweaked(self.output_key(secp, phone), network)
     }
+}
+
+/// A descriptor key without its `/<a;b>/*` branch suffix: the account key expression.
+fn account_expression(key: &DescriptorPublicKey) -> String {
+    let text = key.to_string();
+    text.split_once("/<")
+        .map_or(text.clone(), |(base, _)| base.to_owned())
+}
+
+/// The phone and HWW account keys of the two-key leaf, in that order.
+fn cooperative_accounts(
+    tr: &miniscript::descriptor::Tr<DescriptorPublicKey>,
+) -> Result<Vec<String>> {
+    Ok(tr
+        .iter_scripts()
+        .map(|(_, miniscript)| miniscript.iter_pk().collect::<Vec<_>>())
+        .find(|keys| keys.len() == 2)
+        .context("descriptor has no two-key leaf")?
+        .iter()
+        .map(account_expression)
+        .collect())
+}
+
+/// Read the phone, HWW and heir account keys back out of an Anzen policy descriptor. The
+/// caller rebuilds the policy from them and compares, so a descriptor of any other shape is
+/// rejected there.
+fn policy_keys(
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) -> Result<(VaultKey, VaultKey, Option<VaultKey>)> {
+    let Descriptor::Tr(tr) = descriptor else {
+        bail!("descriptor is not Taproot");
+    };
+    let cooperative = cooperative_accounts(tr)?;
+    let mut heir = None;
+    for (_, miniscript) in tr.iter_scripts() {
+        let keys: Vec<_> = miniscript.iter_pk().collect();
+        if let [key] = keys.as_slice() {
+            let account = account_expression(key);
+            if !cooperative.contains(&account) {
+                if heir.is_some_and(|existing: String| existing != account) {
+                    bail!("descriptor names more than one heir");
+                }
+                heir = Some(account);
+            }
+        }
+    }
+    Ok((
+        VaultKey::from_str(&cooperative[0])?,
+        VaultKey::from_str(&cooperative[1])?,
+        heir.as_deref().map(VaultKey::from_str).transpose()?,
+    ))
 }
 
 fn cooperative_script(phone: XOnlyPublicKey, hww: XOnlyPublicKey) -> ScriptBuf {
@@ -293,6 +361,26 @@ impl VaultPolicy {
     /// ```
     /// used at address index 0 of the receive branch.
     pub fn new_for_network(phone: VaultKey, hww: VaultKey, network: Network) -> Result<Self> {
+        Self::with_heir(phone, hww, None, network)
+    }
+
+    /// The vault policy, with an heir leaf when the owner named an heir:
+    ///
+    /// ```text
+    /// tr(NUMS/<0;1>/*, { multi_a(2, phone/<0;1>/*, hww/<0;1>/*),
+    ///                    { { and_v(v:older(61200), pk(phone/<2;3>/*)),
+    ///                        and_v(v:older(65535), pk(hww/<2;3>/*)) },
+    ///                      and_v(v:older(65535), pk(heir/<2;3>/*)) } })
+    /// ```
+    ///
+    /// The heir's clock is the coin's age, like the recovery leaves: it restarts whenever the
+    /// coins move, which only happens through the owner's signed transactions.
+    pub fn with_heir(
+        phone: VaultKey,
+        hww: VaultKey,
+        heir: Option<VaultKey>,
+        network: Network,
+    ) -> Result<Self> {
         let nums = nums_expression(network);
         let (phone_c, hww_c) = (
             phone.branch_expression(COOPERATIVE_BRANCH),
@@ -302,9 +390,15 @@ impl VaultPolicy {
             phone.branch_expression(RECOVERY_BRANCH),
             hww.branch_expression(RECOVERY_BRANCH),
         );
-        let descriptor_text = format!(
-            "tr({nums},{{multi_a(2,{phone_c},{hww_c}),{{and_v(v:older({PHONE_RECOVERY_BLOCKS}),pk({phone_r})),and_v(v:older({HWW_RECOVERY_BLOCKS}),pk({hww_r}))}}}})"
+        let mut recovery = format!(
+            "{{and_v(v:older({PHONE_RECOVERY_BLOCKS}),pk({phone_r})),and_v(v:older({HWW_RECOVERY_BLOCKS}),pk({hww_r}))}}"
         );
+        if let Some(heir) = heir {
+            let heir_r = heir.branch_expression(RECOVERY_BRANCH);
+            recovery =
+                format!("{{{recovery},and_v(v:older({HEIR_RECOVERY_BLOCKS}),pk({heir_r}))}}");
+        }
+        let descriptor_text = format!("tr({nums},{{multi_a(2,{phone_c},{hww_c}),{recovery}}})");
         let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&descriptor_text)
             .with_context(|| format!("invalid vault descriptor: {descriptor_text}"))?;
         let address = policy_address(&descriptor, network)?;
@@ -332,35 +426,50 @@ impl VaultPolicy {
         receive_descriptor(&self.descriptor)
     }
 
+    /// Find the leaf for `path`. Leaves are told apart by their keys, not their position: the
+    /// cooperative leaf holds the phone and HWW keys, a recovery leaf reuses one of those
+    /// account keys on its recovery branch, and the heir leaf is the only one with a key that is
+    /// not in the cooperative leaf. Each leaf must also be exactly the script Anzen writes.
     pub fn leaf(&self, path: SpendPath) -> Result<VaultLeaf> {
+        let Descriptor::Tr(multipath) = &self.descriptor else {
+            bail!("vault descriptor is not Taproot");
+        };
         let tr = taproot_spend(&self.descriptor)?;
         let spend_info = tr.spend_info();
-        let target_depth = match path {
-            SpendPath::Cooperative => 1,
-            SpendPath::PhoneRecovery | SpendPath::HwwRecovery => 2,
-        };
-        let target_delay = match path {
-            SpendPath::Cooperative => None,
-            SpendPath::PhoneRecovery => Some(PHONE_RECOVERY_BLOCKS),
-            SpendPath::HwwRecovery => Some(HWW_RECOVERY_BLOCKS),
-        };
+        let cooperative_accounts = cooperative_accounts(multipath)?;
 
-        for (depth, miniscript) in tr.iter_scripts() {
-            if depth != target_depth {
+        for ((_, multipath_leaf), (depth, miniscript)) in
+            multipath.iter_scripts().zip(tr.iter_scripts())
+        {
+            let accounts: Vec<String> = multipath_leaf
+                .iter_pk()
+                .map(|key| account_expression(&key))
+                .collect();
+            let keys: Vec<XOnlyPublicKey> = miniscript
+                .iter_pk()
+                .map(|key| key.inner.x_only_public_key().0)
+                .collect();
+            let (leaf_path, expected) = match (accounts.as_slice(), keys.as_slice()) {
+                ([_, _], [phone, hww]) => {
+                    (SpendPath::Cooperative, cooperative_script(*phone, *hww))
+                }
+                ([account], [key]) if *account == cooperative_accounts[0] => (
+                    SpendPath::PhoneRecovery,
+                    recovery_script(*key, PHONE_RECOVERY_BLOCKS),
+                ),
+                ([account], [key]) if *account == cooperative_accounts[1] => (
+                    SpendPath::HwwRecovery,
+                    recovery_script(*key, HWW_RECOVERY_BLOCKS),
+                ),
+                ([_], [key]) => (SpendPath::Heir, recovery_script(*key, HEIR_RECOVERY_BLOCKS)),
+                _ => bail!("vault descriptor has an unexpected leaf"),
+            };
+            if leaf_path != path {
                 continue;
             }
             let script = miniscript.encode();
-            if let Some(delay) = target_delay {
-                let delay_script_num = bitcoin::script::Builder::new()
-                    .push_int(i64::from(delay))
-                    .into_script();
-                if !script
-                    .as_bytes()
-                    .windows(delay_script_num.len())
-                    .any(|window| window == delay_script_num.as_bytes())
-                {
-                    continue;
-                }
+            if script != expected {
+                bail!("the vault's {path:?} leaf is not the script Anzen expects");
             }
             let leaf_version = LeafVersion::TapScript;
             let leaf_hash = TapLeafHash::from_script(&script, leaf_version);
@@ -378,6 +487,21 @@ impl VaultPolicy {
         bail!("vault descriptor does not contain the requested {path:?} leaf")
     }
 
+    /// The phone, HWW and heir keys of an Anzen vault descriptor, checked by rebuilding it.
+    pub fn keys(&self, network: Network) -> Result<(VaultKey, VaultKey, Option<VaultKey>)> {
+        let (phone, hww, heir) = policy_keys(&self.descriptor)?;
+        let rebuilt = Self::with_heir(phone, hww, heir, network)?;
+        if rebuilt.descriptor != self.descriptor {
+            bail!("this is not an Anzen vault descriptor");
+        }
+        Ok((phone, hww, heir))
+    }
+
+    /// Whether this vault has an heir leaf.
+    pub fn has_heir(&self) -> bool {
+        self.leaf(SpendPath::Heir).is_ok()
+    }
+
     pub fn descriptor_string(&self) -> String {
         self.descriptor.to_string()
     }
@@ -388,6 +512,9 @@ impl VaultPolicy {
 pub const SAVINGS_PHONE_RECOVERY_SECS: u32 = 425 * 86_400;
 /// Seconds after the savings unlock date before the HWW alone can recover (455 days).
 pub const SAVINGS_HWW_RECOVERY_SECS: u32 = 455 * 86_400;
+/// Seconds after the savings unlock date before the heir's own key can claim (485 days), a month
+/// after both of the owner's devices.
+pub const SAVINGS_HEIR_RECOVERY_SECS: u32 = 485 * 86_400;
 
 /// A hard-locked savings output. Nothing can spend it before `unlock`, not even both devices
 /// together. Every path uses an absolute calendar time (CLTV), so these outputs never need the
@@ -398,6 +525,9 @@ pub const SAVINGS_HWW_RECOVERY_SECS: u32 = 455 * 86_400;
 ///            { and_v(v:pk(phone), after(unlock + 425d)),
 ///              and_v(v:pk(hww),   after(unlock + 455d)) } })
 /// ```
+///
+/// With an heir, the recovery branch becomes
+/// `{ { phone leaf, hww leaf }, and_v(v:pk(heir), after(unlock + 485d)) }`.
 #[derive(Debug, Clone)]
 pub struct SavingsPolicy {
     pub descriptor: Descriptor<DescriptorPublicKey>,
@@ -405,12 +535,23 @@ pub struct SavingsPolicy {
     pub unlock: u32,
     phone: VaultKey,
     hww: VaultKey,
+    heir: Option<VaultKey>,
 }
 
 impl SavingsPolicy {
     pub fn new_for_network(
         phone: VaultKey,
         hww: VaultKey,
+        unlock: u32,
+        network: Network,
+    ) -> Result<Self> {
+        Self::with_heir(phone, hww, None, unlock, network)
+    }
+
+    pub fn with_heir(
+        phone: VaultKey,
+        hww: VaultKey,
+        heir: Option<VaultKey>,
         unlock: u32,
         network: Network,
     ) -> Result<Self> {
@@ -423,6 +564,9 @@ impl SavingsPolicy {
         let hww_after = unlock
             .checked_add(SAVINGS_HWW_RECOVERY_SECS)
             .context("savings unlock too far in the future")?;
+        let heir_after = unlock
+            .checked_add(SAVINGS_HEIR_RECOVERY_SECS)
+            .context("savings unlock too far in the future")?;
         let nums = nums_expression(network);
         let (phone_c, hww_c) = (
             phone.branch_expression(COOPERATIVE_BRANCH),
@@ -432,8 +576,15 @@ impl SavingsPolicy {
             phone.branch_expression(RECOVERY_BRANCH),
             hww.branch_expression(RECOVERY_BRANCH),
         );
+        let mut recovery = format!(
+            "{{and_v(v:pk({phone_r}),after({phone_after})),and_v(v:pk({hww_r}),after({hww_after}))}}"
+        );
+        if let Some(heir) = heir {
+            let heir_r = heir.branch_expression(RECOVERY_BRANCH);
+            recovery = format!("{{{recovery},and_v(v:pk({heir_r}),after({heir_after}))}}");
+        }
         let descriptor_text = format!(
-            "tr({nums},{{and_v(v:multi_a(2,{phone_c},{hww_c}),after({unlock})),{{and_v(v:pk({phone_r}),after({phone_after})),and_v(v:pk({hww_r}),after({hww_after}))}}}})"
+            "tr({nums},{{and_v(v:multi_a(2,{phone_c},{hww_c}),after({unlock})),{recovery}}})"
         );
         let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&descriptor_text)
             .with_context(|| format!("invalid savings descriptor: {descriptor_text}"))?;
@@ -444,7 +595,30 @@ impl SavingsPolicy {
             unlock,
             phone,
             hww,
+            heir,
         })
+    }
+
+    /// Rebuild a savings policy from its descriptor, as printed in the recovery kit.
+    pub fn from_descriptor_for_network(descriptor_text: &str, network: Network) -> Result<Self> {
+        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(descriptor_text)
+            .with_context(|| format!("invalid savings descriptor: {descriptor_text}"))?;
+        let (phone, hww, heir) = policy_keys(&descriptor)?;
+        let text = descriptor.to_string();
+        let unlock = text
+            .split_once("after(")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .and_then(|(number, _)| number.parse::<u32>().ok())
+            .context("savings descriptor has no unlock date")?;
+        let policy = Self::with_heir(phone, hww, heir, unlock, network)?;
+        if policy.descriptor != descriptor {
+            bail!("this is not an Anzen savings descriptor");
+        }
+        Ok(policy)
+    }
+
+    pub fn keys(&self) -> (VaultKey, VaultKey, Option<VaultKey>) {
+        (self.phone, self.hww, self.heir)
     }
 
     pub fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>> {
@@ -457,6 +631,7 @@ impl SavingsPolicy {
             SpendPath::Cooperative => self.unlock,
             SpendPath::PhoneRecovery => self.unlock + SAVINGS_PHONE_RECOVERY_SECS,
             SpendPath::HwwRecovery => self.unlock + SAVINGS_HWW_RECOVERY_SECS,
+            SpendPath::Heir => self.unlock + SAVINGS_HEIR_RECOVERY_SECS,
         }
     }
 
@@ -467,6 +642,11 @@ impl SavingsPolicy {
             SpendPath::Cooperative => None,
             SpendPath::PhoneRecovery => Some(self.phone.recovery()),
             SpendPath::HwwRecovery => Some(self.hww.recovery()),
+            SpendPath::Heir => Some(
+                self.heir
+                    .context("this savings lock has no heir")?
+                    .recovery(),
+            ),
         };
         for (depth, miniscript) in tr.iter_scripts() {
             let script = miniscript.encode();
@@ -633,6 +813,59 @@ mod tests {
             "tr(@2/<0;1>/*,{pk(@1/<0;1>/*),pk(@0/<0;1>/*)})"
         );
         assert!(p.to_string().contains("/86'/1'/100'/0/0]tpub"));
+    }
+
+    /// An heir adds one leaf beside the two recovery leaves and leaves every other leaf as is.
+    #[test]
+    fn heir_policies_are_ledger_wallet_policies() {
+        let secp = Secp256k1::new();
+        let [phone, hww, heir] = [0; 3].map(|_| DeviceKeys::generate(&secp).unwrap());
+        let (p, h, e) = (phone.vault_pubkey, hww.vault_pubkey, heir.vault_pubkey);
+        let template = |text: &str| {
+            text.split('#')
+                .next()
+                .unwrap()
+                .replace(&nums_xpub(Network::Regtest).to_string(), "@2")
+                .replace(&p.to_string(), "@1")
+                .replace(&h.to_string(), "@0")
+                .replace(&e.to_string(), "@3")
+        };
+        let vault = VaultPolicy::with_heir(p, h, Some(e), Network::Regtest).unwrap();
+        assert_eq!(
+            template(&vault.descriptor_string()),
+            "tr(@2/<0;1>/*,{multi_a(2,@1/<0;1>/*,@0/<0;1>/*),{{and_v(v:older(61200),pk(@1/<2;3>/*)),and_v(v:older(65535),pk(@0/<2;3>/*))},and_v(v:older(65535),pk(@3/<2;3>/*))}})"
+        );
+        let savings =
+            SavingsPolicy::with_heir(p, h, Some(e), 1_924_992_000, Network::Regtest).unwrap();
+        assert_eq!(
+            template(&savings.descriptor_string()),
+            "tr(@2/<0;1>/*,{and_v(v:multi_a(2,@1/<0;1>/*,@0/<0;1>/*),after(1924992000)),{{and_v(v:pk(@1/<2;3>/*),after(1961712000)),and_v(v:pk(@0/<2;3>/*),after(1964304000))},and_v(v:pk(@3/<2;3>/*),after(1966896000))}})"
+        );
+        // Every path resolves to its own leaf, and the heir's leaf holds the heir's key.
+        let paths = [
+            SpendPath::Cooperative,
+            SpendPath::PhoneRecovery,
+            SpendPath::HwwRecovery,
+            SpendPath::Heir,
+        ];
+        let hashes: std::collections::BTreeSet<_> = paths
+            .iter()
+            .map(|path| vault.leaf(*path).unwrap().leaf_hash)
+            .collect();
+        assert_eq!(hashes.len(), 4);
+        assert_eq!(
+            vault.leaf(SpendPath::Heir).unwrap().script,
+            recovery_script(e.recovery(), HEIR_RECOVERY_BLOCKS)
+        );
+        assert_eq!(
+            vault.leaf(SpendPath::HwwRecovery).unwrap().script,
+            recovery_script(h.recovery(), HWW_RECOVERY_BLOCKS)
+        );
+        let savings_hashes: std::collections::BTreeSet<_> = paths
+            .iter()
+            .map(|path| savings.leaf(*path).unwrap().leaf_hash)
+            .collect();
+        assert_eq!(savings_hashes.len(), 4);
     }
 
     #[test]

@@ -82,7 +82,7 @@ impl VaultKey {
     pub fn for_path(&self, path: SpendPath) -> XOnlyPublicKey {
         match path {
             SpendPath::Cooperative => self.cooperative(),
-            SpendPath::PhoneRecovery | SpendPath::HwwRecovery => self.recovery(),
+            SpendPath::PhoneRecovery | SpendPath::HwwRecovery | SpendPath::Heir => self.recovery(),
         }
     }
 
@@ -164,7 +164,7 @@ impl VaultKeypairs {
     pub fn for_path(&self, path: SpendPath) -> &Keypair {
         match path {
             SpendPath::Cooperative => &self.cooperative,
-            SpendPath::PhoneRecovery | SpendPath::HwwRecovery => &self.recovery,
+            SpendPath::PhoneRecovery | SpendPath::HwwRecovery | SpendPath::Heir => &self.recovery,
         }
     }
 }

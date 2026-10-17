@@ -23,6 +23,10 @@ pub mod types;
 
 pub const PHONE_RECOVERY_BLOCKS: u16 = 61_200;
 pub const HWW_RECOVERY_BLOCKS: u16 = 65_535;
+/// The heir's own key opens vault coins that have not moved for this many blocks. 65,535 is the
+/// longest relative timelock Bitcoin allows, so the heir waits as long as the HWW alone does and
+/// a month longer than the phone alone.
+pub const HEIR_RECOVERY_BLOCKS: u16 = 65_535;
 pub const MONTHS_PER_ROLLOVER: usize = 12;
 pub const DEFAULT_MONTHLY_LIMIT_SATS: u64 = 10_000_000;
 pub const DEFAULT_FEE_RATE_SAT_VB: u64 = 1;

@@ -1,7 +1,7 @@
 use anzen::{
     cold_wallet,
     core::{
-        HWW_RECOVERY_BLOCKS, PHONE_RECOVERY_BLOCKS,
+        HEIR_RECOVERY_BLOCKS, HWW_RECOVERY_BLOCKS, PHONE_RECOVERY_BLOCKS,
         chain::{BitcoinCoreBackend, Blockchain, RpcConfig},
         recovery::SweepResult,
         social::{self, CloudRecoveryBackup},
@@ -10,6 +10,7 @@ use anzen::{
             load_config, read_json, set_policy_limits,
         },
     },
+    heir_wallet,
     hot_wallet::{self, HotWallet, HotWalletBackend},
 };
 use bitcoin::{Address, Network};
@@ -65,6 +66,20 @@ fn phone_recover(
     Ok(result)
 }
 
+fn heir_claim(
+    data_dir: &std::path::Path,
+    rpc: &BitcoinCoreBackend,
+    destination: &Address,
+) -> anyhow::Result<SweepResult> {
+    let config = load_config(data_dir)?;
+    let tip = rpc.chain_tip()?;
+    let utxos = rpc.scan_vault(&config)?;
+    let (transaction, result) =
+        heir_wallet::claim_vault(data_dir, &config, &utxos, tip.height, destination)?;
+    rpc.broadcast(&transaction)?;
+    Ok(result)
+}
+
 fn hww_recover(
     data_dir: &std::path::Path,
     rpc: &BitcoinCoreBackend,
@@ -86,8 +101,14 @@ fn real_regtest_enforces_both_recovery_delays_and_rotates_the_phone_epoch() {
     let phone_dir = tempfile::tempdir().unwrap();
     let hww_dir = tempfile::tempdir().unwrap();
     let rotation_dir = tempfile::tempdir().unwrap();
+    let heir_dir = tempfile::tempdir().unwrap();
     let phone_vault = initialize(phone_dir.path());
     let hww_vault = initialize(hww_dir.path());
+    heir_wallet::initialize(heir_dir.path(), Network::Regtest, "Heir").unwrap();
+    let heir_vault = initialize(heir_dir.path());
+    assert!(heir_vault.config.heir.is_some());
+    // The rotating vault names an heir too, so the rotation must carry the heir's key over.
+    heir_wallet::initialize(rotation_dir.path(), Network::Regtest, "Rotation heir").unwrap();
     let rotation_vault = initialize(rotation_dir.path());
     let recovery_friend = social::generate_friend_key("Rotation recovery friend").unwrap();
     cold_wallet::add_recovery_friend(
@@ -112,6 +133,9 @@ fn real_regtest_enforces_both_recovery_delays_and_rotates_the_phone_epoch() {
     rpc.mine(1, &address(&hww_vault.config.vault_address))
         .unwrap();
     let hww_confirmation = rpc.chain_info().unwrap().blocks;
+    rpc.mine(1, &address(&heir_vault.config.vault_address))
+        .unwrap();
+    let heir_confirmation = rpc.chain_info().unwrap().blocks;
     rpc.mine(1, &address(&rotation_vault.config.vault_address))
         .unwrap();
     rpc.mine(100, &destination).unwrap();
@@ -144,6 +168,14 @@ fn real_regtest_enforces_both_recovery_delays_and_rotates_the_phone_epoch() {
         format!("{early_hww:#}").contains("blocks remaining"),
         "{early_hww:#}"
     );
+    // The heir waits at least as long as the HWW alone.
+    fs::remove_file(heir_dir.path().join(PHONE_DEVICE_FILE)).unwrap();
+    fs::remove_file(heir_dir.path().join(HWW_DEVICE_FILE)).unwrap();
+    let early_heir = heir_claim(heir_dir.path(), &rpc, &destination).unwrap_err();
+    assert!(
+        format!("{early_heir:#}").contains("blocks remaining"),
+        "{early_heir:#}"
+    );
 
     mine_until_next_height(
         &rpc,
@@ -153,6 +185,20 @@ fn real_regtest_enforces_both_recovery_delays_and_rotates_the_phone_epoch() {
     let hww_sweep = hww_recover(hww_dir.path(), &rpc, &destination).unwrap();
     assert_eq!(hww_sweep.input_count, 1);
     rpc.mine(1, &destination).unwrap();
+
+    // One block later the heir's own coin has also sat untouched for 65,535 blocks.
+    assert_eq!(
+        rpc.chain_info().unwrap().blocks + 1,
+        heir_confirmation + u64::from(HEIR_RECOVERY_BLOCKS)
+    );
+    let heir_sweep = heir_claim(heir_dir.path(), &rpc, &destination).unwrap();
+    assert_eq!(heir_sweep.input_count, 1);
+    rpc.mine(1, &destination).unwrap();
+    assert!(
+        rpc.scan_vault(&load_config(heir_dir.path()).unwrap())
+            .unwrap()
+            .is_empty()
+    );
 
     fs::remove_file(rotation_dir.path().join(PHONE_DEVICE_FILE)).unwrap();
     let recovery = cold_wallet::decrypt_phone_backup_package(
@@ -210,6 +256,12 @@ fn real_regtest_enforces_both_recovery_delays_and_rotates_the_phone_epoch() {
     );
     rpc.mine(1, &destination).unwrap();
     let new_config = load_config(rotation_dir.path()).unwrap();
+    assert_eq!(new_config.heir, old_config.heir);
+    assert!(
+        new_config
+            .vault_descriptor
+            .contains(&new_config.heir.as_ref().unwrap().vault_pubkey)
+    );
     assert_eq!(new_config.monthly_limit_sats, 10_000_000);
     assert_eq!(new_config.emergency_access_limit_sats, 20_000_000);
     assert_eq!(rpc.scan_vault(&old_config).unwrap().len(), 0);

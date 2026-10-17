@@ -103,6 +103,21 @@ Once the chain's median time passes the unlock date, `anzen phone savings-spend 
 
 `anzen recovery-kit --owner "Name" --output kit.html` writes a printable recovery kit for heirs and recovery friends: one self-contained HTML document, laid out as printed pages, that explains the two keys, the four situations someone can be in (both devices, HWW only, phone only, recovery friend), a timeline of when each path opens with real dates for every savings lock, numbered steps, a page to fill in by hand, and the exact descriptors for a technical helper. Print it or save it as PDF from any browser. The kit contains only public data and cannot move coins, but it reveals where the coins are, so keep it private and print a new one after a key rotation, a new savings lock, or a recovery-friend change.
 
+### Naming an heir
+
+An owner can name one heir, who holds a key of their own. The heir's key is added to every policy as one more leaf, so it must be named before `anzen init` (it is part of the vault address):
+
+```text
+vault:   tr(NUMS, { multi_a(2, phone, hww),
+                    { { and_v(v:older(61200), pk(phone)), and_v(v:older(65535), pk(hww)) },
+                      and_v(v:older(65535), pk(heir)) } })
+savings: the savings policy above plus and_v(v:pk(heir), after(unlock + 485 days))
+```
+
+The heir's vault clock is the coin's age, like the recovery paths: 65,535 blocks (about 15 months, the longest relative timelock Bitcoin allows) after the coins last moved. While the owner is active, the yearly rollover keeps moving the vault coins, which restarts the heir's wait every time; when the owner stops, the coins stop moving and the heir's key opens. A health check cannot restart it, because only moving coins can. If the owner's phone is still running, its one presigned renewal can move the coins once more and push the date back by up to a year. On savings locks the heir's date is fixed: 485 days after the unlock date, a month after the HWW alone.
+
+The heir never needs the owner's devices or secrets. On their own device they run `anzen heir init --name NAME` and give the owner the printed key, which the owner records with `anzen heir import --name NAME --key KEY` before `anzen init`. Later the heir rebuilds the vault from the descriptors printed in the recovery kit with `anzen heir restore --vault-descriptor D --savings-descriptor S`, checks dates with `anzen heir status`, and moves every coin their key can already open with `anzen heir claim ADDRESS`. The recovery kit gains a page that shows the heir's clock as a picture, a situation and step-by-step section for the heir, and the heir's dates on every timeline.
+
 Presigned transactions are convenience permissions, not custody. Losing them cannot lose the bitcoin because every principal output still has the three vault-script paths above.
 
 For a concrete byte-level example of this graph—including txids, outpoints, locktimes, sequences, values, addresses, and scripts—see the checked-in [vault output test vector](test-vectors/vault-output-graph.json).
