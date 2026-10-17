@@ -104,6 +104,16 @@ pub fn create_cloud_recovery_backup(
     Ok(backup)
 }
 
+/// Answer a health-check challenge with the HWW cooperative and recovery keys. A real device shows the vault it
+/// belongs to and asks for confirmation before signing; the signature cannot move coins.
+pub fn sign_health_challenge(
+    data_dir: &Path,
+    challenge: &crate::core::health::Challenge,
+) -> Result<crate::core::health::HealthProof> {
+    let hww = load_device_keys(data_dir, HWW_DEVICE_FILE)?;
+    crate::core::health::sign_challenge(challenge, &hww.vault_keypair)
+}
+
 /// Add a 1-of-N OpenPGP recovery friend by wrapping the existing symmetric backup key.
 pub fn add_recovery_friend(data_dir: &Path, public_key: &[u8]) -> Result<String> {
     let config = load_config(data_dir)?;

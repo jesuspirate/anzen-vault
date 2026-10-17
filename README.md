@@ -97,6 +97,12 @@ By default one HWW ceremony presigns two years (`phone set-policy --years 2`). T
 
 Once the chain's median time passes the unlock date, `anzen phone savings-spend DEST --unlock YYYY-MM-DD --output spend.json` builds a spend of every coin in that lock at today's fee rate and adds the phone's signature; `anzen hww confirm-savings-spend spend.json --output approved.json` shows the destination, amount and fee before the HWW signs, and `anzen phone broadcast-savings-spend approved.json` sends it. `--unlock` can be left out when there is only one lock. If a device is lost, `anzen phone recover-savings DEST` works 425 days after the date and `anzen hww recover-savings DEST` 455 days after. After a phone-key rotation the phone finds the key that created the lock in its rotation history. Savings spends are built when they are used, not presigned, so they need no CPFP: the fee rate is fetched at that moment and capped at 1,000 sat/vB.
 
+### Health checks and the recovery kit
+
+`anzen health check` asks the phone and the HWW to sign a fresh, single-use challenge with their vault keys and verifies each signature against the vault policy. A pass proves the device still holds the right key; it never moves coins and costs nothing. Results are kept in `health.json`, and `anzen health status` shows when each device was last checked and when the next check is due (every six months). A rotated phone key starts over as unchecked.
+
+`anzen recovery-kit --owner "Name" --output kit.html` writes a printable recovery kit for heirs and recovery friends: one self-contained HTML document, laid out as printed pages, that explains the two keys, the four situations someone can be in (both devices, HWW only, phone only, recovery friend), a timeline of when each path opens with real dates for every savings lock, numbered steps, a page to fill in by hand, and the exact descriptors for a technical helper. Print it or save it as PDF from any browser. The kit contains only public data and cannot move coins, but it reveals where the coins are, so keep it private and print a new one after a key rotation, a new savings lock, or a recovery-friend change.
+
 Presigned transactions are convenience permissions, not custody. Losing them cannot lose the bitcoin because every principal output still has the three vault-script paths above.
 
 For a concrete byte-level example of this graph—including txids, outpoints, locktimes, sequences, values, addresses, and scripts—see the checked-in [vault output test vector](test-vectors/vault-output-graph.json).

@@ -137,6 +137,15 @@ where
     )
 }
 
+/// Answer a health-check challenge with the phone cooperative and recovery keys.
+pub fn sign_health_challenge(
+    data_dir: &Path,
+    challenge: &crate::core::health::Challenge,
+) -> Result<crate::core::health::HealthProof> {
+    let phone = load_device_keys(data_dir, PHONE_DEVICE_FILE)?;
+    crate::core::health::sign_challenge(challenge, &phone.vault_keypair)
+}
+
 pub fn vanity_address_prefix(network: Network) -> Result<&'static str> {
     match network {
         Network::Bitcoin => Ok("bc1pvault"),

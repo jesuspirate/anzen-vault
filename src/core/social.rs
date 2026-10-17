@@ -225,6 +225,17 @@ pub fn friend_public_keys(backup: &CloudRecoveryBackup) -> Vec<String> {
         .collect()
 }
 
+/// The name a recovery friend's OpenPGP key was issued to, for the printed recovery kit. This is
+/// a label the friend chose, not a verified identity.
+pub fn friend_user_id(public_key: &[u8]) -> Option<String> {
+    let (public, _) = SignedPublicKey::from_reader_single(public_key).ok()?;
+    public
+        .details
+        .users
+        .first()
+        .map(|user| String::from_utf8_lossy(user.id.id()).into_owned())
+}
+
 pub fn friend_fingerprint(public_key: &[u8]) -> Result<String> {
     let (public, _) = SignedPublicKey::from_reader_single(public_key)
         .context("failed to parse recovery friend's OpenPGP public key")?;
