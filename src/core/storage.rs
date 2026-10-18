@@ -15,6 +15,11 @@ pub const PHONE_DEVICE_FILE: &str = "phone/device.json";
 pub const HWW_DEVICE_FILE: &str = "hww/device.json";
 pub const HWW_PUBLIC_FILE: &str = "hww/public.json";
 pub const PHONE_BACKUP_FILE: &str = "cloud/phone-seed-backup.json";
+/// The heir's public key, recorded before the vault is created so it is in every policy.
+pub const HEIR_PUBLIC_FILE: &str = "heir/public.json";
+/// The software stand-in for the heir's own wallet. In real use this lives with the heir.
+pub const HEIR_DEVICE_FILE: &str = "heir/device.json";
+pub const HEIR_PUBLIC_KIND: &str = "heir-public-key";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultConfig {
@@ -35,11 +40,34 @@ pub struct VaultConfig {
     /// Hard-locked savings outputs, one per unlock date. See `core::savings`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub savings_locks: Vec<crate::core::savings::SavingsLock>,
+    /// The person who inherits the vault, if the owner named one. Their key is in every vault
+    /// and savings policy from the start; see `VaultPolicy::with_heir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heir: Option<HeirConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeirConfig {
+    pub name: String,
+    pub vault_pubkey: String,
+}
+
+impl HeirConfig {
+    pub fn parsed_vault_pubkey(&self) -> Result<crate::core::keys::VaultKey> {
+        crate::core::keys::VaultKey::from_str(&self.vault_pubkey).context("invalid heir key")
+    }
 }
 
 impl VaultConfig {
     pub fn bitcoin_network(&self) -> Result<Network> {
         parse_network_name(&self.network)
+    }
+
+    pub fn heir_key(&self) -> Result<Option<crate::core::keys::VaultKey>> {
+        self.heir
+            .as_ref()
+            .map(HeirConfig::parsed_vault_pubkey)
+            .transpose()
     }
 }
 
@@ -70,6 +98,36 @@ impl PublicDeviceFile {
         crate::core::keys::VaultKey::from_str(&self.vault_pubkey)
             .context("invalid public device vault key")
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeirPublicFile {
+    pub version: u8,
+    pub kind: String,
+    pub network: String,
+    pub name: String,
+    pub vault_pubkey: String,
+}
+
+/// The heir named for a new vault, if `heir/public.json` exists.
+pub fn load_heir(data_dir: &Path, network: Network) -> Result<Option<HeirConfig>> {
+    let path = data_dir.join(HEIR_PUBLIC_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let file: HeirPublicFile = read_json(&path)?;
+    if file.version != 1 || file.kind != HEIR_PUBLIC_KIND {
+        bail!("unsupported heir public key file");
+    }
+    if parse_network_name(&file.network)? != network {
+        bail!("the heir key was set up for a different network than the vault");
+    }
+    let heir = HeirConfig {
+        name: file.name,
+        vault_pubkey: file.vault_pubkey,
+    };
+    heir.parsed_vault_pubkey()?;
+    Ok(Some(heir))
 }
 
 impl DeviceFile {
@@ -107,7 +165,15 @@ pub fn initialize_vault_for_network(data_dir: &Path, network: Network) -> Result
         phone_file.vault_key_index,
     )?;
     let hww_vault_key = hww_vault_key(data_dir, network)?;
-    let policy = VaultPolicy::new_for_network(phone.vault_pubkey, hww_vault_key, network)?;
+    let heir = load_heir(data_dir, network)?;
+    let heir_key = heir
+        .as_ref()
+        .map(HeirConfig::parsed_vault_pubkey)
+        .transpose()?;
+    if heir_key.is_some_and(|key| key == phone.vault_pubkey || key == hww_vault_key) {
+        bail!("the heir must have their own key, not one of the vault devices' keys");
+    }
+    let policy = VaultPolicy::with_heir(phone.vault_pubkey, hww_vault_key, heir_key, network)?;
     let (hot_external, hot_internal) = phone.hot_descriptors(&secp)?;
     let config = VaultConfig {
         version: 1,
@@ -123,6 +189,7 @@ pub fn initialize_vault_for_network(data_dir: &Path, network: Network) -> Result
         monthly_limit_sats: 0,
         emergency_access_limit_sats: 0,
         savings_locks: Vec::new(),
+        heir,
     };
     write_json(&data_dir.join(CONFIG_FILE), &config)?;
 

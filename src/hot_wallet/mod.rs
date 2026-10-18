@@ -181,8 +181,19 @@ where
         bail!("phone and HWW must use the same network");
     }
     let hww_pubkey = public_hww.parsed_vault_pubkey()?;
-    let vanity =
-        grind_vanity_phone_key(network, hww_pubkey, suffix, worker_count, report_progress)?;
+    // The heir is part of the vault address, so it must be named before the search starts.
+    let heir = crate::core::storage::load_heir(data_dir, network)?
+        .as_ref()
+        .map(crate::core::storage::HeirConfig::parsed_vault_pubkey)
+        .transpose()?;
+    let vanity = grind_vanity_phone_key(
+        network,
+        hww_pubkey,
+        heir,
+        suffix,
+        worker_count,
+        report_progress,
+    )?;
     let device = persist_phone(data_dir, network, &vanity.phone)?;
     Ok(VanityInitialization {
         device,
@@ -201,6 +212,7 @@ fn available_worker_count() -> usize {
 fn grind_vanity_phone_key<F>(
     network: Network,
     hww_pubkey: crate::core::keys::VaultKey,
+    heir: Option<crate::core::keys::VaultKey>,
     suffix: &str,
     worker_count: usize,
     report_progress: F,
@@ -216,7 +228,7 @@ where
     let base_phone = DeviceKeys::generate_for_network(&Secp256k1::new(), network)?;
     // Public derivation is enough to test candidates; the winner is re-derived privately below.
     let parent = base_phone.vault_parent(&Secp256k1::new())?;
-    let template = Arc::new(VaultAddressTemplate::new(hww_pubkey, network)?);
+    let template = Arc::new(VaultAddressTemplate::with_heir(hww_pubkey, heir, network)?);
     let stopped = Arc::new(AtomicBool::new(false));
     let attempts = Arc::new(AtomicU64::new(0));
     let last_report = Arc::new(AtomicU64::new(0));
@@ -1462,7 +1474,8 @@ mod tests {
     fn vanity_search_encodes_the_mainnet_prefix() {
         let network = Network::Bitcoin;
         let hww = DeviceKeys::generate_for_network(&Secp256k1::new(), network).unwrap();
-        let result = grind_vanity_phone_key(network, hww.vault_pubkey, "v", 4, |_| {}).unwrap();
+        let result =
+            grind_vanity_phone_key(network, hww.vault_pubkey, None, "v", 4, |_| {}).unwrap();
         assert!(result.vault_address.starts_with("bc1pv"));
         assert_eq!(result.worker_count, 4);
         assert!(result.attempts > 0);

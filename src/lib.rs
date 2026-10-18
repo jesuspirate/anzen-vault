@@ -4,15 +4,16 @@
 //!
 //! ```text
 //! cold_wallet ─┐
-//!              ├──> core
+//! heir_wallet ─┼──> core
 //! hot_wallet ──┘
 //! ```
 //!
-//! `cold_wallet` and `hot_wallet` never depend on one another. Application front ends, such as
-//! the CLI, compose their public APIs.
+//! `cold_wallet`, `heir_wallet` and `hot_wallet` never depend on one another. Application front
+//! ends, such as the CLI, compose their public APIs.
 
 pub mod cold_wallet;
 pub mod core;
+pub mod heir_wallet;
 pub mod hot_wallet;
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use super::{
-    DEFAULT_FEE_RATE_SAT_VB, HWW_RECOVERY_BLOCKS, PHONE_RECOVERY_BLOCKS,
+    DEFAULT_FEE_RATE_SAT_VB, HEIR_RECOVERY_BLOCKS, HWW_RECOVERY_BLOCKS, PHONE_RECOVERY_BLOCKS,
     ceremony::{PolicyPackage, Schedule, is_supported_policy_package},
     keys::DeviceKeys,
     policy::{SpendPath, VaultPolicy},
@@ -28,6 +28,7 @@ pub enum SweepPath {
     Cooperative,
     PhoneRecovery,
     HwwRecovery,
+    Heir,
 }
 
 impl SweepPath {
@@ -36,6 +37,7 @@ impl SweepPath {
             Self::Cooperative => SpendPath::Cooperative,
             Self::PhoneRecovery => SpendPath::PhoneRecovery,
             Self::HwwRecovery => SpendPath::HwwRecovery,
+            Self::Heir => SpendPath::Heir,
         }
     }
 
@@ -44,6 +46,7 @@ impl SweepPath {
             Self::Cooperative => Sequence::MAX,
             Self::PhoneRecovery => Sequence(u32::from(PHONE_RECOVERY_BLOCKS)),
             Self::HwwRecovery => Sequence(u32::from(HWW_RECOVERY_BLOCKS)),
+            Self::Heir => Sequence(u32::from(HEIR_RECOVERY_BLOCKS)),
         }
     }
 
@@ -52,6 +55,7 @@ impl SweepPath {
             Self::Cooperative => None,
             Self::PhoneRecovery => Some(u64::from(PHONE_RECOVERY_BLOCKS)),
             Self::HwwRecovery => Some(u64::from(HWW_RECOVERY_BLOCKS)),
+            Self::Heir => Some(u64::from(HEIR_RECOVERY_BLOCKS)),
         }
     }
 }
@@ -330,8 +334,12 @@ pub fn validate_phone_rotation(
     }
     let hww_pubkey = crate::core::keys::VaultKey::from_str(&old_config.hww_vault_pubkey)?;
     let phone_pubkey = crate::core::keys::VaultKey::from_str(&package.new_phone_vault_pubkey)?;
-    let policy =
-        VaultPolicy::new_for_network(phone_pubkey, hww_pubkey, old_config.bitcoin_network()?)?;
+    let policy = VaultPolicy::with_heir(
+        phone_pubkey,
+        hww_pubkey,
+        old_config.heir_key()?,
+        old_config.bitcoin_network()?,
+    )?;
     if policy.descriptor_string() != package.new_vault_descriptor
         || policy.address.to_string() != package.new_vault_address
     {
@@ -374,6 +382,8 @@ pub fn rotated_config(
         // Savings locks keep the keys they were created with: nothing can move them before
         // their date, so a rotation cannot sweep them.
         savings_locks: old_config.savings_locks.clone(),
+        // A new phone key keeps the heir the owner named.
+        heir: old_config.heir.clone(),
     })
 }
 

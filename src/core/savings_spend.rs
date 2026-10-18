@@ -8,6 +8,7 @@
 //! * Cooperative: phone and HWW together, from the unlock date.
 //! * Phone recovery: the phone alone, 425 days after the unlock date.
 //! * HWW recovery: the HWW alone, 455 days after the unlock date.
+//! * Heir: the heir's own key, 485 days after the unlock date, when the lock names an heir.
 
 use super::{
     fees::{MAX_FEE_RATE_SAT_VB, MIN_FEE_RATE_SAT_VB},
@@ -82,6 +83,7 @@ pub fn ready_lock_time(policy: &SavingsPolicy, path: SpendPath, median_time: u64
             SpendPath::Cooperative => "this savings lock opens",
             SpendPath::PhoneRecovery => "phone-only recovery of this savings lock opens",
             SpendPath::HwwRecovery => "HWW-only recovery of this savings lock opens",
+            SpendPath::Heir => "the heir's claim on this savings lock opens",
         };
         let when = chrono::DateTime::from_timestamp(i64::from(lock_time), 0).map_or_else(
             || lock_time.to_string(),
@@ -344,6 +346,10 @@ pub fn sign_savings_recovery(
         SpendPath::Cooperative => bail!("a cooperative savings spend needs both devices"),
         SpendPath::PhoneRecovery => &lock.phone_vault_pubkey,
         SpendPath::HwwRecovery => &lock.hww_vault_pubkey,
+        SpendPath::Heir => lock
+            .heir_vault_pubkey
+            .as_ref()
+            .context("this savings lock has no heir")?,
     };
     if signer.vault_key().to_string() != *expected_key {
         bail!("this device key did not create the savings lock");
