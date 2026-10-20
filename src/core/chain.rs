@@ -2,7 +2,7 @@ use super::{policy::ControllerPolicy, storage::VaultConfig, types::VaultUtxo};
 use anyhow::{Context, Result, bail};
 use bdk_electrum::{
     BdkElectrumClient,
-    electrum_client::{Client as ElectrumClient, ElectrumApi},
+    electrum_client::{Client as ElectrumClient, ConfigBuilder, ElectrumApi},
 };
 use bitcoin::{
     Address, Amount, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid,
@@ -26,6 +26,7 @@ pub const MAINNET_ELECTRUM_SERVERS: &[&str] = &[
 
 pub const REGTEST_ELECTRUM_SERVERS: &[&str] = &["tcp://127.0.0.1:50001"];
 pub const SIGNET_ELECTRUM_SERVERS: &[&str] = &["ssl://mempool.space:60602"];
+const ELECTRUM_TIMEOUT_SECONDS: u8 = 60;
 
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
@@ -358,8 +359,13 @@ impl ElectrumBackend {
         let mut errors = Vec::new();
         for server in servers {
             let attempt = (|| -> Result<Self> {
-                let raw = ElectrumClient::new(server)
-                    .with_context(|| format!("invalid Electrum server URL {server}"))?;
+                // Without a timeout an unreachable server hangs the command instead of failing
+                // over to the next one.
+                let config = ConfigBuilder::new()
+                    .timeout(Some(ELECTRUM_TIMEOUT_SECONDS))
+                    .build();
+                let raw = ElectrumClient::from_config(server, config)
+                    .with_context(|| format!("could not connect to Electrum server {server}"))?;
                 let genesis = raw
                     .block_header(0)
                     .with_context(|| format!("Electrum server {server} did not return genesis"))?
