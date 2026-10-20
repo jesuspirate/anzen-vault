@@ -286,8 +286,9 @@ pub fn restore_public_config(
     use crate::core::{policy::SavingsPolicy, savings::SavingsLock};
     let vault = VaultPolicy::from_descriptor_for_network(vault_descriptor, network)?;
     let keys = vault.keys(network)?;
-    if let Some(heir) = &heir
-        && keys.heir.map(|key| key.to_string()) != Some(heir.vault_pubkey.clone())
+    if heir
+        .as_ref()
+        .is_some_and(|heir| keys.heir.map(|key| key.to_string()) != Some(heir.vault_pubkey.clone()))
     {
         bail!("this vault does not name this heir's key");
     }
