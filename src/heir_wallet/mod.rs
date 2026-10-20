@@ -15,16 +15,15 @@
 //! Like the cold wallet, this module signs only. The CLI reads the chain and broadcasts.
 
 use crate::core::{
-    HWW_RECOVERY_BLOCKS, PHONE_RECOVERY_BLOCKS,
     keys::{DeviceKeys, VaultKey},
-    policy::{SavingsPolicy, SpendPath, VaultPolicy},
+    policy::SpendPath,
     recovery::{self, SweepPath, SweepResult},
     savings::SavingsLock,
     savings_spend,
     storage::{
         CONFIG_FILE, DeviceFile, HEIR_DEVICE_FILE, HEIR_PUBLIC_FILE, HEIR_PUBLIC_KIND,
         HeirPublicFile, VaultConfig, config_exists, load_device_keys, network_name,
-        validate_supported_network, write_json,
+        restore_public_config, validate_supported_network, write_json,
     },
     types::VaultUtxo,
 };
@@ -121,45 +120,8 @@ pub fn restore(
     }
     let heir = crate::core::storage::load_heir(data_dir, network)?
         .context("set up the heir's key first: anzen heir init (or heir import)")?;
-    let vault = VaultPolicy::from_descriptor_for_network(vault_descriptor, network)?;
-    let (phone, hww, vault_heir) = vault.keys(network)?;
-    if vault_heir.map(|key| key.to_string()) != Some(heir.vault_pubkey.clone()) {
-        bail!("this vault does not name this heir's key");
-    }
-    let mut savings_locks = Vec::with_capacity(savings_descriptors.len());
-    for text in savings_descriptors {
-        let policy = SavingsPolicy::from_descriptor_for_network(text, network)?;
-        let (lock_phone, lock_hww, lock_heir) = policy.keys();
-        if lock_heir.map(|key| key.to_string()) != Some(heir.vault_pubkey.clone()) {
-            bail!("a savings lock does not name this heir's key");
-        }
-        savings_locks.push(SavingsLock {
-            unlock: policy.unlock,
-            phone_vault_pubkey: lock_phone.to_string(),
-            hww_vault_pubkey: lock_hww.to_string(),
-            heir_vault_pubkey: Some(heir.vault_pubkey.clone()),
-            address: policy.address.to_string(),
-            default_deposit: false,
-        });
-    }
-    savings_locks.sort_by_key(|lock| lock.unlock);
-    let config = VaultConfig {
-        version: 1,
-        network: network_name(network).to_owned(),
-        phone_vault_pubkey: phone.to_string(),
-        hww_vault_pubkey: hww.to_string(),
-        // The heir has no phone wallet; only the heir commands use this config.
-        phone_hot_external_descriptor: String::new(),
-        phone_hot_internal_descriptor: String::new(),
-        vault_descriptor: vault.descriptor_string(),
-        vault_address: vault.address.to_string(),
-        phone_recovery_blocks: PHONE_RECOVERY_BLOCKS,
-        hww_recovery_blocks: HWW_RECOVERY_BLOCKS,
-        monthly_limit_sats: 0,
-        emergency_access_limit_sats: 0,
-        savings_locks,
-        heir: Some(heir),
-    };
+    // The heir has no phone wallet; only the heir commands use this config.
+    let config = restore_public_config(network, vault_descriptor, savings_descriptors, Some(heir))?;
     write_json(&data_dir.join(CONFIG_FILE), &config)?;
     Ok(config)
 }

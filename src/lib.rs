@@ -3,18 +3,20 @@
 //! The dependency direction is intentional:
 //!
 //! ```text
-//! cold_wallet ─┐
-//! heir_wallet ─┼──> core
-//! hot_wallet ──┘
+//! cold_wallet ────┐
+//! heir_wallet ────┤
+//! hot_wallet ─────┼──> core
+//! yubikey_wallet ─┘
 //! ```
 //!
-//! `cold_wallet`, `heir_wallet` and `hot_wallet` never depend on one another. Application front
+//! `cold_wallet`, `heir_wallet`, `hot_wallet` and `yubikey_wallet` never depend on one another. Application front
 //! ends, such as the CLI, compose their public APIs.
 
 pub mod cold_wallet;
 pub mod core;
 pub mod heir_wallet;
 pub mod hot_wallet;
+pub mod yubikey_wallet;
 
 #[cfg(test)]
 pub(crate) mod test_support {

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use anzen::{cold_wallet, core, heir_wallet, hot_wallet};
+use anzen::{cold_wallet, core, heir_wallet, hot_wallet, yubikey_wallet};
 use bitcoin::Network;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Serialize, de::DeserializeOwned};
@@ -78,6 +78,12 @@ enum Command {
         #[command(subcommand)]
         command: HeirCommand,
     },
+    /// The optional third key, used on a computer: any two of phone, hardware wallet and
+    /// YubiKey can move the coins.
+    Yubikey {
+        #[command(subcommand)]
+        command: YubikeyCommand,
+    },
     /// Watch the vault from an always-on computer and send yourself an alert when coins move.
     Watch {
         #[command(subcommand)]
@@ -139,6 +145,35 @@ enum HeirCommand {
     Status,
     /// With the heir's key: move every vault and savings coin it can already open.
     Claim { destination: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum YubikeyCommand {
+    /// On the YubiKey's computer: create its key with the simulated key store and show its 24
+    /// backup words once. Refused where the phone's or hardware wallet's key lives.
+    Init,
+    /// On the phone: add the YubiKey to the new vault by its public key, as
+    /// [fingerprint/path]xpub. Run before `anzen init`.
+    Import {
+        #[arg(long)]
+        key: String,
+    },
+    /// On the YubiKey's computer: learn the vault from the descriptors in the recovery kit.
+    Restore {
+        #[arg(long)]
+        vault_descriptor: String,
+        #[arg(long = "savings-descriptor")]
+        savings_descriptors: Vec<String>,
+    },
+    /// Show the YubiKey's key and the vault it belongs to.
+    Status,
+    /// Check a sweep the phone or hardware wallet proposed, sign it with the YubiKey and
+    /// broadcast it.
+    ConfirmSweep {
+        proposal: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -257,6 +292,13 @@ enum PhoneCommand {
     },
     /// Verify and broadcast an HWW-approved cooperative sweep.
     BroadcastSweep { approved_sweep: PathBuf },
+    /// Hardware wallet lost: propose moving every vault coin with the phone and the YubiKey.
+    /// The YubiKey's computer finishes it with `anzen yubikey confirm-sweep`.
+    YubikeySweep {
+        destination: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Build and phone-sign a spend of every coin in an unlocked savings lock.
     SavingsSpend {
         destination: String,
@@ -329,6 +371,13 @@ enum HwwCommand {
     },
     /// Sweep mature vault outputs using the HWW-only recovery path.
     Recover { destination: String },
+    /// Phone lost: propose moving every vault coin with the hardware wallet and the YubiKey.
+    /// The YubiKey's computer finishes it with `anzen yubikey confirm-sweep`.
+    YubikeySweep {
+        destination: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Immediately invalidate every live programmable-policy state.
     RevokePolicy {
         /// Verified safe destination for the small controller-output remainder.
@@ -514,6 +563,7 @@ fn main() -> Result<()> {
         Command::Social { command } => run_social(command, &cli.data_dir, &cli.chain),
         Command::Health { command } => run_health(&cli.data_dir, command),
         Command::Heir { command } => run_heir(command, &cli.data_dir, &cli.chain, network),
+        Command::Yubikey { command } => run_yubikey(command, &cli.data_dir, &cli.chain, network),
         Command::Watch { command } => run_watch(command, &cli.data_dir, &cli.chain, network),
         Command::RecoveryKit { output, owner } => write_recovery_kit(&cli.data_dir, &output, owner),
         Command::Node { command } => run_node(command, &cli.chain, network),
@@ -699,6 +749,20 @@ fn run_phone(
             destination,
             output,
         } => phone_create_sweep(data_dir, rpc_args, &destination, &output)?,
+        PhoneCommand::YubikeySweep {
+            destination,
+            output,
+        } => {
+            let destination = configured_address(data_dir, &destination)?;
+            let config = core::storage::load_config(data_dir)?;
+            let backend = rpc_args.connect_chain(data_dir)?;
+            let utxos = backend.scan_vault(&config)?;
+            let package =
+                hot_wallet::create_yubikey_sweep(data_dir, &config, &utxos, &destination)?;
+            report_pair_sweep(&package, artifact_reports_to_stderr(&output))?;
+            write_artifact(&output, &package)?;
+            report_artifact(&output, "Phone-signed sweep for the YubiKey")?;
+        }
         PhoneCommand::BroadcastSweep { approved_sweep } => {
             let package: core::recovery::CooperativeSweepPackage = read_artifact(&approved_sweep)?;
             let backend = rpc_args.connect_hot(data_dir)?;
@@ -873,6 +937,20 @@ fn run_hww(
                 bail!("chain backend returned an unexpected HWW recovery transaction ID");
             }
             print_sweep_result("HWW recovery sweep broadcast", &result);
+        }
+        HwwCommand::YubikeySweep {
+            destination,
+            output,
+        } => {
+            let destination = configured_address(data_dir, &destination)?;
+            let config = core::storage::load_config(data_dir)?;
+            let backend = rpc_args.connect_chain(data_dir)?;
+            let utxos = backend.scan_vault(&config)?;
+            let package =
+                cold_wallet::create_yubikey_sweep(data_dir, &config, &utxos, &destination)?;
+            report_pair_sweep(&package, artifact_reports_to_stderr(&output))?;
+            write_artifact(&output, &package)?;
+            report_artifact(&output, "HWW-signed sweep for the YubiKey")?;
         }
         HwwCommand::RevokePolicy { destination, yes } => {
             let destination = configured_address(data_dir, &destination)?;
@@ -1278,6 +1356,90 @@ fn print_active_policy(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn run_yubikey(
+    command: YubikeyCommand,
+    data_dir: &Path,
+    rpc_args: &ChainArgs,
+    network: Network,
+) -> Result<()> {
+    match command {
+        YubikeyCommand::Init => {
+            let yubikey = yubikey_wallet::initialize(data_dir, network)?;
+            println!("YubiKey key: {}", yubikey.vault_pubkey);
+            if let Some(words) = yubikey.mnemonic {
+                println!(
+                    "YubiKey backup words (write them on paper, keep them apart from the hardware wallet's): {words}"
+                );
+            }
+            println!(
+                "Next, on the phone before `anzen init`: anzen yubikey import --key {}",
+                yubikey.vault_pubkey
+            );
+        }
+        YubikeyCommand::Import { key } => {
+            let yubikey = yubikey_wallet::import(data_dir, network, &key)?;
+            println!("YubiKey key: {}", yubikey.vault_pubkey);
+            println!(
+                "The vault created by `anzen init` will open with any two of phone, hardware wallet and YubiKey."
+            );
+        }
+        YubikeyCommand::Restore {
+            vault_descriptor,
+            savings_descriptors,
+        } => {
+            let config = yubikey_wallet::restore(
+                data_dir,
+                network,
+                &vault_descriptor,
+                &savings_descriptors,
+            )?;
+            println!(
+                "Vault learned from the recovery kit: {}",
+                config.vault_address
+            );
+            println!(
+                "This computer can now confirm a sweep the phone or the hardware wallet proposes."
+            );
+        }
+        YubikeyCommand::Status => {
+            match core::storage::load_yubikey(data_dir, network)? {
+                Some(key) => println!("YubiKey key: {key}"),
+                None => println!("No YubiKey is set up here."),
+            }
+            if core::storage::config_exists(data_dir) {
+                let config = core::storage::load_config(data_dir)?;
+                match config.yubikey_key()? {
+                    Some(_) => {
+                        println!("Vault: {}", config.vault_address);
+                        println!(
+                            "Any two of phone, hardware wallet and YubiKey can move the coins."
+                        );
+                    }
+                    None => println!(
+                        "This vault has no YubiKey. To add one, set up a new vault with it and move the coins there."
+                    ),
+                }
+            }
+        }
+        YubikeyCommand::ConfirmSweep { proposal, yes } => {
+            let package: core::recovery::PairSweepPackage = read_artifact(&proposal)?;
+            let config = core::storage::load_config(data_dir)?;
+            // Check everything before asking the person to approve.
+            core::recovery::validate_pair_sweep(&config, &package)?;
+            report_pair_sweep(&package, true)?;
+            require_approval(yes, proposal.as_path(), "sweep with the YubiKey", "YubiKey")?;
+            let (transaction, result) = yubikey_wallet::confirm_sweep(data_dir, &config, &package)?;
+            let backend = rpc_args.connect_chain(data_dir)?;
+            let txid = backend.broadcast(&transaction)?;
+            if txid != result.txid {
+                bail!("chain backend returned an unexpected sweep transaction ID");
+            }
+            print_sweep_result("YubiKey sweep broadcast", &result);
+        }
+    }
+    Ok(())
+}
+
 fn run_heir(
     command: HeirCommand,
     data_dir: &Path,
@@ -1505,6 +1667,7 @@ fn write_recovery_kit(data_dir: &Path, output: &Path, owner: Option<String>) -> 
                 .heir
                 .as_ref()
                 .is_some_and(|heir| lock.heir_vault_pubkey.as_ref() == Some(&heir.vault_pubkey)),
+            yubikey: lock.yubikey_vault_pubkey.is_some(),
         });
     }
     let backup_path = data_dir.join(core::storage::PHONE_BACKUP_FILE);
@@ -1550,6 +1713,7 @@ fn write_recovery_kit(data_dir: &Path, output: &Path, owner: Option<String>) -> 
             key: heir.vault_pubkey.clone(),
             recovery_blocks: core::HEIR_RECOVERY_BLOCKS,
         }),
+        yubikey: config.yubikey_vault_pubkey.clone(),
     });
     fs::write(output, html).with_context(|| format!("failed to write {}", output.display()))?;
     println!("Recovery kit written: {}", output.display());
@@ -1947,6 +2111,30 @@ fn report_sweep(package: &core::recovery::CooperativeSweepPackage, stderr: bool)
     Ok(())
 }
 
+fn report_pair_sweep(package: &core::recovery::PairSweepPackage, stderr: bool) -> Result<()> {
+    let mut output: Box<dyn Write> = if stderr {
+        Box::new(io::stderr().lock())
+    } else {
+        Box::new(io::stdout().lock())
+    };
+    let (title, signed) = match package.path {
+        core::recovery::SweepPath::PhoneYubikey => {
+            ("VAULT SWEEP WITH PHONE + YUBIKEY", "Phone signed: true")
+        }
+        _ => (
+            "VAULT SWEEP WITH HARDWARE WALLET + YUBIKEY",
+            "Hardware wallet signed: true",
+        ),
+    };
+    writeln!(output, "{title}")?;
+    writeln!(output, "Destination: {}", package.destination)?;
+    writeln!(output, "Coins: {}", package.input_count)?;
+    writeln!(output, "Sent: {} sats", package.sent_sats)?;
+    writeln!(output, "Fee: {} sats (1 sat/vB)", package.fee_sats)?;
+    writeln!(output, "{signed}")?;
+    Ok(())
+}
+
 fn report_savings_spend(
     package: &core::savings_spend::SavingsSpendPackage,
     stderr: bool,
@@ -2024,6 +2212,10 @@ fn report_rotation(package: &core::recovery::PhoneRotationPackage, stderr: bool)
 }
 
 fn require_hww_approval(yes: bool, input: &Path, description: &str) -> Result<()> {
+    require_approval(yes, input, description, "HWW")
+}
+
+fn require_approval(yes: bool, input: &Path, description: &str, device: &str) -> Result<()> {
     if yes {
         return Ok(());
     }
@@ -2035,7 +2227,7 @@ fn require_hww_approval(yes: bool, input: &Path, description: &str) -> Result<()
     let mut response = String::new();
     io::stdin().read_line(&mut response)?;
     if response.trim() != "approve" {
-        bail!("HWW approval declined");
+        bail!("{device} approval declined");
     }
     Ok(())
 }
@@ -2136,6 +2328,10 @@ fn command_network(
         let heir: core::storage::HeirPublicFile =
             core::storage::read_json(&data_dir.join(core::storage::HEIR_PUBLIC_FILE))?;
         Some(core::storage::parse_network_name(&heir.network)?)
+    } else if data_dir.join(core::storage::YUBIKEY_PUBLIC_FILE).exists() {
+        let yubikey: core::storage::YubikeyPublicFile =
+            core::storage::read_json(&data_dir.join(core::storage::YUBIKEY_PUBLIC_FILE))?;
+        Some(core::storage::parse_network_name(&yubikey.network)?)
     } else if data_dir.join(core::watch::WATCH_PACKAGE_FILE).exists() {
         let package: core::watch::WatchPackage =
             core::storage::read_json(&data_dir.join(core::watch::WATCH_PACKAGE_FILE))?;

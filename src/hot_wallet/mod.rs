@@ -186,9 +186,12 @@ where
         .as_ref()
         .map(crate::core::storage::HeirConfig::parsed_vault_pubkey)
         .transpose()?;
+    // So is the YubiKey.
+    let yubikey = crate::core::storage::load_yubikey(data_dir, network)?;
     let vanity = grind_vanity_phone_key(
         network,
         hww_pubkey,
+        yubikey,
         heir,
         suffix,
         worker_count,
@@ -212,6 +215,7 @@ fn available_worker_count() -> usize {
 fn grind_vanity_phone_key<F>(
     network: Network,
     hww_pubkey: crate::core::keys::VaultKey,
+    yubikey: Option<crate::core::keys::VaultKey>,
     heir: Option<crate::core::keys::VaultKey>,
     suffix: &str,
     worker_count: usize,
@@ -228,7 +232,9 @@ where
     let base_phone = DeviceKeys::generate_for_network(&Secp256k1::new(), network)?;
     // Public derivation is enough to test candidates; the winner is re-derived privately below.
     let parent = base_phone.vault_parent(&Secp256k1::new())?;
-    let template = Arc::new(VaultAddressTemplate::with_heir(hww_pubkey, heir, network)?);
+    let template = Arc::new(VaultAddressTemplate::with_keys(
+        hww_pubkey, yubikey, heir, network,
+    )?);
     let stopped = Arc::new(AtomicBool::new(false));
     let attempts = Arc::new(AtomicU64::new(0));
     let last_report = Arc::new(AtomicU64::new(0));
@@ -1112,6 +1118,18 @@ pub fn recover(
     recovery::sign_recovery_sweep(plan, SweepPath::PhoneRecovery, &phone)
 }
 
+/// Propose a sweep of every vault coin with the phone and the YubiKey, for when the hardware
+/// wallet is lost. The phone signs here; the YubiKey's computer finishes it.
+pub fn create_yubikey_sweep(
+    data_dir: &Path,
+    config: &VaultConfig,
+    utxos: &[crate::core::types::VaultUtxo],
+    destination: &Address,
+) -> Result<recovery::PairSweepPackage> {
+    let phone = load_device_keys(data_dir, PHONE_DEVICE_FILE)?;
+    recovery::create_pair_sweep(config, utxos, SweepPath::PhoneYubikey, destination, &phone)
+}
+
 pub fn create_cooperative_sweep(
     data_dir: &Path,
     backend: &dyn HotWalletBackend,
@@ -1481,7 +1499,7 @@ mod tests {
         let network = Network::Bitcoin;
         let hww = DeviceKeys::generate_for_network(&Secp256k1::new(), network).unwrap();
         let result =
-            grind_vanity_phone_key(network, hww.vault_pubkey, None, "v", 4, |_| {}).unwrap();
+            grind_vanity_phone_key(network, hww.vault_pubkey, None, None, "v", 4, |_| {}).unwrap();
         assert!(result.vault_address.starts_with("bc1pv"));
         assert_eq!(result.worker_count, 4);
         assert!(result.attempts > 0);

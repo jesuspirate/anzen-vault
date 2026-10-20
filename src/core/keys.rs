@@ -18,6 +18,11 @@ pub const COOPERATIVE_BRANCH: u32 = 0;
 /// wallet policy that uses the same key with the same derivation in two leaves, so the recovery
 /// leaves need their own branch.
 pub const RECOVERY_BRANCH: u32 = 2;
+/// Child used by the phone and the YubiKey in their two-key leaf, spelled `/<4;5>/*`.
+pub const PHONE_YUBIKEY_BRANCH: u32 = 4;
+/// Child used by the HWW and the YubiKey in their two-key leaf, spelled `/<6;7>/*`. Each pair
+/// leaf has its own branch so no key expression appears twice in a wallet policy.
+pub const HWW_YUBIKEY_BRANCH: u32 = 6;
 /// Every vault policy is used at a single address index.
 pub const ADDRESS_INDEX: u32 = 0;
 
@@ -80,10 +85,7 @@ impl VaultKey {
 
     /// Key that signs the leaf for `path`.
     pub fn for_path(&self, path: SpendPath) -> XOnlyPublicKey {
-        match path {
-            SpendPath::Cooperative => self.cooperative(),
-            SpendPath::PhoneRecovery | SpendPath::HwwRecovery | SpendPath::Heir => self.recovery(),
-        }
+        self.child(&Secp256k1::verification_only(), branch_for_path(path))
     }
 
     /// Descriptor key expression for one branch pair: `[fp/path]xpub/<b;b+1>/*`.
@@ -137,12 +139,24 @@ impl<'de> serde::Deserialize<'de> for VaultKey {
     }
 }
 
+/// The branch every device uses for the leaf of `path`.
+pub fn branch_for_path(path: SpendPath) -> u32 {
+    match path {
+        SpendPath::Cooperative => COOPERATIVE_BRANCH,
+        SpendPath::PhoneRecovery | SpendPath::HwwRecovery | SpendPath::Heir => RECOVERY_BRANCH,
+        SpendPath::PhoneYubikey => PHONE_YUBIKEY_BRANCH,
+        SpendPath::HwwYubikey => HWW_YUBIKEY_BRANCH,
+    }
+}
+
 /// The private keys behind a [`VaultKey`]: one per branch, so each leaf is signed with the key
 /// it names.
 #[derive(Debug, Clone, Copy)]
 pub struct VaultKeypairs {
     pub cooperative: Keypair,
     pub recovery: Keypair,
+    pub phone_yubikey: Keypair,
+    pub hww_yubikey: Keypair,
 }
 
 impl VaultKeypairs {
@@ -158,6 +172,8 @@ impl VaultKeypairs {
         Ok(Self {
             cooperative: at(COOPERATIVE_BRANCH)?,
             recovery: at(RECOVERY_BRANCH)?,
+            phone_yubikey: at(PHONE_YUBIKEY_BRANCH)?,
+            hww_yubikey: at(HWW_YUBIKEY_BRANCH)?,
         })
     }
 
@@ -165,6 +181,8 @@ impl VaultKeypairs {
         match path {
             SpendPath::Cooperative => &self.cooperative,
             SpendPath::PhoneRecovery | SpendPath::HwwRecovery | SpendPath::Heir => &self.recovery,
+            SpendPath::PhoneYubikey => &self.phone_yubikey,
+            SpendPath::HwwYubikey => &self.hww_yubikey,
         }
     }
 }

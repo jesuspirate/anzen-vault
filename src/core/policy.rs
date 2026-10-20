@@ -1,6 +1,8 @@
 use super::{
     HEIR_RECOVERY_BLOCKS, HWW_RECOVERY_BLOCKS, PHONE_RECOVERY_BLOCKS,
-    keys::{COOPERATIVE_BRANCH, RECOVERY_BRANCH, VaultKey},
+    keys::{
+        COOPERATIVE_BRANCH, HWW_YUBIKEY_BRANCH, PHONE_YUBIKEY_BRANCH, RECOVERY_BRANCH, VaultKey,
+    },
 };
 use anyhow::{Context, Result, bail};
 use bitcoin::{
@@ -157,6 +159,73 @@ pub enum SpendPath {
     HwwRecovery,
     /// The heir's own key, after the longest delay. Only present when the owner named an heir.
     Heir,
+    /// The phone and the YubiKey together, when the HWW is lost. Only with a YubiKey.
+    PhoneYubikey,
+    /// The HWW and the YubiKey together, when the phone is lost. Only with a YubiKey.
+    HwwYubikey,
+}
+
+impl SpendPath {
+    /// The two-key leaves: any two of the owner's keys.
+    pub fn is_two_key(self) -> bool {
+        matches!(
+            self,
+            Self::Cooperative | Self::PhoneYubikey | Self::HwwYubikey
+        )
+    }
+}
+
+/// The account keys an Anzen vault or savings policy is built from. The YubiKey and the heir
+/// are optional; without them the policy is exactly the two-device one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyKeys {
+    pub phone: VaultKey,
+    pub hww: VaultKey,
+    /// A third key the owner holds: any two of phone, HWW and YubiKey can move the coins.
+    pub yubikey: Option<VaultKey>,
+    pub heir: Option<VaultKey>,
+}
+
+impl PolicyKeys {
+    pub fn new(phone: VaultKey, hww: VaultKey) -> Self {
+        Self {
+            phone,
+            hww,
+            yubikey: None,
+            heir: None,
+        }
+    }
+
+    /// Refuse a key that appears in two roles.
+    pub fn check_distinct(&self) -> Result<()> {
+        let mut seen = vec![self.phone, self.hww];
+        for key in [self.yubikey, self.heir].into_iter().flatten() {
+            if seen.contains(&key) {
+                bail!("each key in the vault must be different");
+            }
+            seen.push(key);
+        }
+        if self.phone == self.hww {
+            bail!("each key in the vault must be different");
+        }
+        Ok(())
+    }
+
+    /// The two-key leaves with a YubiKey, `{ phone+yubikey, hww+yubikey }`, each written
+    /// through `leaf` (to add a savings date).
+    fn pair_branch(&self, leaf: impl Fn(String) -> String) -> Option<String> {
+        self.yubikey.map(|yubikey| {
+            let phone_y = self.phone.branch_expression(PHONE_YUBIKEY_BRANCH);
+            let yubikey_p = yubikey.branch_expression(PHONE_YUBIKEY_BRANCH);
+            let hww_y = self.hww.branch_expression(HWW_YUBIKEY_BRANCH);
+            let yubikey_h = yubikey.branch_expression(HWW_YUBIKEY_BRANCH);
+            format!(
+                "{{{},{}}}",
+                leaf(format!("multi_a(2,{phone_y},{yubikey_p})")),
+                leaf(format!("multi_a(2,{hww_y},{yubikey_h})"))
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +276,8 @@ pub struct VaultAddressTemplate {
     hww_cooperative: XOnlyPublicKey,
     hww_recovery_node: TapNodeHash,
     heir_node: Option<TapNodeHash>,
+    /// With a YubiKey: its key in the phone pair leaf, and the fixed HWW pair leaf.
+    yubikey: Option<(XOnlyPublicKey, TapNodeHash)>,
 }
 
 impl VaultAddressTemplate {
@@ -215,6 +286,15 @@ impl VaultAddressTemplate {
     }
 
     pub fn with_heir(hww: VaultKey, heir: Option<VaultKey>, network: Network) -> Result<Self> {
+        Self::with_keys(hww, None, heir, network)
+    }
+
+    pub fn with_keys(
+        hww: VaultKey,
+        yubikey: Option<VaultKey>,
+        heir: Option<VaultKey>,
+        network: Network,
+    ) -> Result<Self> {
         let secp = Secp256k1::verification_only();
         let internal_key = nums_xpub(network)
             .derive_pub(
@@ -237,11 +317,22 @@ impl VaultAddressTemplate {
                 LeafVersion::TapScript,
             )
         });
+        let yubikey = yubikey.map(|yubikey| {
+            let hww_pair = TapNodeHash::from_script(
+                &cooperative_script(
+                    hww.child(&secp, HWW_YUBIKEY_BRANCH),
+                    yubikey.child(&secp, HWW_YUBIKEY_BRANCH),
+                ),
+                LeafVersion::TapScript,
+            );
+            (yubikey.child(&secp, PHONE_YUBIKEY_BRANCH), hww_pair)
+        });
         Ok(Self {
             internal_key,
             hww_cooperative: hww.child(&secp, COOPERATIVE_BRANCH),
             hww_recovery_node,
             heir_node,
+            yubikey,
         })
     }
 
@@ -263,6 +354,14 @@ impl VaultAddressTemplate {
         if let Some(heir_node) = self.heir_node {
             recovery_node = TapNodeHash::from_node_hashes(recovery_node, heir_node);
         }
+        if let Some((yubikey_phone, hww_pair_node)) = self.yubikey {
+            let phone_pair_node = TapNodeHash::from_script(
+                &cooperative_script(phone.child(secp, PHONE_YUBIKEY_BRANCH), yubikey_phone),
+                LeafVersion::TapScript,
+            );
+            let pairs_node = TapNodeHash::from_node_hashes(phone_pair_node, hww_pair_node);
+            recovery_node = TapNodeHash::from_node_hashes(pairs_node, recovery_node);
+        }
         let merkle_root = TapNodeHash::from_node_hashes(cooperative_node, recovery_node);
         self.internal_key.tap_tweak(secp, Some(merkle_root)).0
     }
@@ -277,55 +376,76 @@ impl VaultAddressTemplate {
     }
 }
 
-/// A descriptor key without its `/<a;b>/*` branch suffix: the account key expression.
-fn account_expression(key: &DescriptorPublicKey) -> String {
+/// A descriptor key split into its account key expression and the first number of its
+/// `/<a;b>/*` branch pair.
+fn account_and_branch(key: &DescriptorPublicKey) -> (String, Option<u32>) {
     let text = key.to_string();
-    text.split_once("/<")
-        .map_or(text.clone(), |(base, _)| base.to_owned())
+    match text.split_once("/<") {
+        Some((base, rest)) => (
+            base.to_owned(),
+            rest.split_once(';')
+                .and_then(|(branch, _)| branch.parse().ok()),
+        ),
+        None => (text, None),
+    }
 }
 
-/// The phone and HWW account keys of the two-key leaf, in that order.
+/// The accounts and branches of one leaf's keys, in script order.
+fn leaf_accounts(
+    miniscript: &miniscript::Miniscript<DescriptorPublicKey, miniscript::Tap>,
+) -> Vec<(String, Option<u32>)> {
+    miniscript
+        .iter_pk()
+        .map(|key| account_and_branch(&key))
+        .collect()
+}
+
+/// The phone and HWW account keys of the cooperative leaf, in that order.
 fn cooperative_accounts(
     tr: &miniscript::descriptor::Tr<DescriptorPublicKey>,
 ) -> Result<Vec<String>> {
-    Ok(tr
-        .iter_scripts()
-        .map(|(_, miniscript)| miniscript.iter_pk().collect::<Vec<_>>())
-        .find(|keys| keys.len() == 2)
-        .context("descriptor has no two-key leaf")?
-        .iter()
-        .map(account_expression)
-        .collect())
+    tr.iter_scripts()
+        .map(|(_, miniscript)| leaf_accounts(miniscript))
+        .find(|keys| {
+            keys.len() == 2
+                && keys
+                    .iter()
+                    .all(|(_, branch)| *branch == Some(COOPERATIVE_BRANCH))
+        })
+        .map(|keys| keys.into_iter().map(|(account, _)| account).collect())
+        .context("descriptor has no cooperative leaf")
 }
 
-/// Read the phone, HWW and heir account keys back out of an Anzen policy descriptor. The
-/// caller rebuilds the policy from them and compares, so a descriptor of any other shape is
-/// rejected there.
-fn policy_keys(
-    descriptor: &Descriptor<DescriptorPublicKey>,
-) -> Result<(VaultKey, VaultKey, Option<VaultKey>)> {
+/// Read the account keys back out of an Anzen policy descriptor. The caller rebuilds the policy
+/// from them and compares, so a descriptor of any other shape is rejected there.
+fn policy_keys(descriptor: &Descriptor<DescriptorPublicKey>) -> Result<PolicyKeys> {
     let Descriptor::Tr(tr) = descriptor else {
         bail!("descriptor is not Taproot");
     };
     let cooperative = cooperative_accounts(tr)?;
     let mut heir = None;
+    let mut yubikey = None;
     for (_, miniscript) in tr.iter_scripts() {
-        let keys: Vec<_> = miniscript.iter_pk().collect();
-        if let [key] = keys.as_slice() {
-            let account = account_expression(key);
-            if !cooperative.contains(&account) {
-                if heir.is_some_and(|existing: String| existing != account) {
+        match leaf_accounts(miniscript).as_slice() {
+            [(account, _)] if !cooperative.contains(account) => {
+                if heir
+                    .as_ref()
+                    .is_some_and(|existing: &String| existing != account)
+                {
                     bail!("descriptor names more than one heir");
                 }
-                heir = Some(account);
+                heir = Some(account.clone());
             }
+            [_, (account, Some(PHONE_YUBIKEY_BRANCH))] => yubikey = Some(account.clone()),
+            _ => {}
         }
     }
-    Ok((
-        VaultKey::from_str(&cooperative[0])?,
-        VaultKey::from_str(&cooperative[1])?,
-        heir.as_deref().map(VaultKey::from_str).transpose()?,
-    ))
+    Ok(PolicyKeys {
+        phone: VaultKey::from_str(&cooperative[0])?,
+        hww: VaultKey::from_str(&cooperative[1])?,
+        yubikey: yubikey.as_deref().map(VaultKey::from_str).transpose()?,
+        heir: heir.as_deref().map(VaultKey::from_str).transpose()?,
+    })
 }
 
 fn cooperative_script(phone: XOnlyPublicKey, hww: XOnlyPublicKey) -> ScriptBuf {
@@ -381,6 +501,29 @@ impl VaultPolicy {
         heir: Option<VaultKey>,
         network: Network,
     ) -> Result<Self> {
+        Self::build(
+            &PolicyKeys {
+                heir,
+                ..PolicyKeys::new(phone, hww)
+            },
+            network,
+        )
+    }
+
+    /// The full vault policy. With a YubiKey, its two pair leaves sit beside the recovery
+    /// branch, so any two of the three keys can spend at once:
+    ///
+    /// ```text
+    /// tr(NUMS/<0;1>/*, { multi_a(2, phone/<0;1>/*, hww/<0;1>/*),
+    ///                    { { multi_a(2, phone/<4;5>/*, yubikey/<4;5>/*),
+    ///                        multi_a(2, hww/<6;7>/*, yubikey/<6;7>/*) },
+    ///                      recovery } })
+    /// ```
+    pub fn build(keys: &PolicyKeys, network: Network) -> Result<Self> {
+        keys.check_distinct()?;
+        let PolicyKeys {
+            phone, hww, heir, ..
+        } = *keys;
         let nums = nums_expression(network);
         let (phone_c, hww_c) = (
             phone.branch_expression(COOPERATIVE_BRANCH),
@@ -397,6 +540,9 @@ impl VaultPolicy {
             let heir_r = heir.branch_expression(RECOVERY_BRANCH);
             recovery =
                 format!("{{{recovery},and_v(v:older({HEIR_RECOVERY_BLOCKS}),pk({heir_r}))}}");
+        }
+        if let Some(pairs) = keys.pair_branch(|leaf| leaf) {
+            recovery = format!("{{{pairs},{recovery}}}");
         }
         let descriptor_text = format!("tr({nums},{{multi_a(2,{phone_c},{hww_c}),{recovery}}})");
         let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&descriptor_text)
@@ -438,26 +584,34 @@ impl VaultPolicy {
         let spend_info = tr.spend_info();
         let cooperative_accounts = cooperative_accounts(multipath)?;
 
+        let (phone_account, hww_account) = (&cooperative_accounts[0], &cooperative_accounts[1]);
         for ((_, multipath_leaf), (depth, miniscript)) in
             multipath.iter_scripts().zip(tr.iter_scripts())
         {
-            let accounts: Vec<String> = multipath_leaf
-                .iter_pk()
-                .map(|key| account_expression(&key))
-                .collect();
+            let accounts = leaf_accounts(multipath_leaf);
             let keys: Vec<XOnlyPublicKey> = miniscript
                 .iter_pk()
                 .map(|key| key.inner.x_only_public_key().0)
                 .collect();
+            const C: Option<u32> = Some(COOPERATIVE_BRANCH);
+            const P: Option<u32> = Some(PHONE_YUBIKEY_BRANCH);
+            const H: Option<u32> = Some(HWW_YUBIKEY_BRANCH);
             let (leaf_path, expected) = match (accounts.as_slice(), keys.as_slice()) {
-                ([_, _], [phone, hww]) => {
+                ([(_, C), (_, C)], [phone, hww]) => {
                     (SpendPath::Cooperative, cooperative_script(*phone, *hww))
                 }
-                ([account], [key]) if *account == cooperative_accounts[0] => (
+                ([(first, P), (_, P)], [phone, yubikey]) if first == phone_account => (
+                    SpendPath::PhoneYubikey,
+                    cooperative_script(*phone, *yubikey),
+                ),
+                ([(first, H), (_, H)], [hww, yubikey]) if first == hww_account => {
+                    (SpendPath::HwwYubikey, cooperative_script(*hww, *yubikey))
+                }
+                ([(account, _)], [key]) if account == phone_account => (
                     SpendPath::PhoneRecovery,
                     recovery_script(*key, PHONE_RECOVERY_BLOCKS),
                 ),
-                ([account], [key]) if *account == cooperative_accounts[1] => (
+                ([(account, _)], [key]) if account == hww_account => (
                     SpendPath::HwwRecovery,
                     recovery_script(*key, HWW_RECOVERY_BLOCKS),
                 ),
@@ -487,19 +641,24 @@ impl VaultPolicy {
         bail!("vault descriptor does not contain the requested {path:?} leaf")
     }
 
-    /// The phone, HWW and heir keys of an Anzen vault descriptor, checked by rebuilding it.
-    pub fn keys(&self, network: Network) -> Result<(VaultKey, VaultKey, Option<VaultKey>)> {
-        let (phone, hww, heir) = policy_keys(&self.descriptor)?;
-        let rebuilt = Self::with_heir(phone, hww, heir, network)?;
+    /// The keys of an Anzen vault descriptor, checked by rebuilding it.
+    pub fn keys(&self, network: Network) -> Result<PolicyKeys> {
+        let keys = policy_keys(&self.descriptor)?;
+        let rebuilt = Self::build(&keys, network)?;
         if rebuilt.descriptor != self.descriptor {
             bail!("this is not an Anzen vault descriptor");
         }
-        Ok((phone, hww, heir))
+        Ok(keys)
     }
 
     /// Whether this vault has an heir leaf.
     pub fn has_heir(&self) -> bool {
         self.leaf(SpendPath::Heir).is_ok()
+    }
+
+    /// Whether this vault has the YubiKey pair leaves.
+    pub fn has_yubikey(&self) -> bool {
+        self.leaf(SpendPath::HwwYubikey).is_ok()
     }
 
     pub fn descriptor_string(&self) -> String {
@@ -533,9 +692,7 @@ pub struct SavingsPolicy {
     pub descriptor: Descriptor<DescriptorPublicKey>,
     pub address: Address,
     pub unlock: u32,
-    phone: VaultKey,
-    hww: VaultKey,
-    heir: Option<VaultKey>,
+    keys: PolicyKeys,
 }
 
 impl SavingsPolicy {
@@ -555,6 +712,23 @@ impl SavingsPolicy {
         unlock: u32,
         network: Network,
     ) -> Result<Self> {
+        Self::build(
+            &PolicyKeys {
+                heir,
+                ..PolicyKeys::new(phone, hww)
+            },
+            unlock,
+            network,
+        )
+    }
+
+    /// The full savings policy. A YubiKey adds two pair leaves with the same date as the
+    /// cooperative one: any two keys, never before `unlock`.
+    pub fn build(keys: &PolicyKeys, unlock: u32, network: Network) -> Result<Self> {
+        keys.check_distinct()?;
+        let PolicyKeys {
+            phone, hww, heir, ..
+        } = *keys;
         if unlock < bitcoin::absolute::LOCK_TIME_THRESHOLD {
             bail!("savings unlock must be a Unix time, not a block height");
         }
@@ -583,6 +757,9 @@ impl SavingsPolicy {
             let heir_r = heir.branch_expression(RECOVERY_BRANCH);
             recovery = format!("{{{recovery},and_v(v:pk({heir_r}),after({heir_after}))}}");
         }
+        if let Some(pairs) = keys.pair_branch(|leaf| format!("and_v(v:{leaf},after({unlock}))")) {
+            recovery = format!("{{{pairs},{recovery}}}");
+        }
         let descriptor_text = format!(
             "tr({nums},{{and_v(v:multi_a(2,{phone_c},{hww_c}),after({unlock})),{recovery}}})"
         );
@@ -593,9 +770,7 @@ impl SavingsPolicy {
             descriptor,
             address,
             unlock,
-            phone,
-            hww,
-            heir,
+            keys: *keys,
         })
     }
 
@@ -603,22 +778,22 @@ impl SavingsPolicy {
     pub fn from_descriptor_for_network(descriptor_text: &str, network: Network) -> Result<Self> {
         let descriptor = Descriptor::<DescriptorPublicKey>::from_str(descriptor_text)
             .with_context(|| format!("invalid savings descriptor: {descriptor_text}"))?;
-        let (phone, hww, heir) = policy_keys(&descriptor)?;
+        let keys = policy_keys(&descriptor)?;
         let text = descriptor.to_string();
         let unlock = text
             .split_once("after(")
             .and_then(|(_, rest)| rest.split_once(')'))
             .and_then(|(number, _)| number.parse::<u32>().ok())
             .context("savings descriptor has no unlock date")?;
-        let policy = Self::with_heir(phone, hww, heir, unlock, network)?;
+        let policy = Self::build(&keys, unlock, network)?;
         if policy.descriptor != descriptor {
             bail!("this is not an Anzen savings descriptor");
         }
         Ok(policy)
     }
 
-    pub fn keys(&self) -> (VaultKey, VaultKey, Option<VaultKey>) {
-        (self.phone, self.hww, self.heir)
+    pub fn keys(&self) -> PolicyKeys {
+        self.keys
     }
 
     pub fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>> {
@@ -628,7 +803,7 @@ impl SavingsPolicy {
     /// The earliest nLockTime a spend through `path` can use.
     pub fn earliest_lock_time(&self, path: SpendPath) -> u32 {
         match path {
-            SpendPath::Cooperative => self.unlock,
+            SpendPath::Cooperative | SpendPath::PhoneYubikey | SpendPath::HwwYubikey => self.unlock,
             SpendPath::PhoneRecovery => self.unlock + SAVINGS_PHONE_RECOVERY_SECS,
             SpendPath::HwwRecovery => self.unlock + SAVINGS_HWW_RECOVERY_SECS,
             SpendPath::Heir => self.unlock + SAVINGS_HEIR_RECOVERY_SECS,
@@ -638,34 +813,31 @@ impl SavingsPolicy {
     pub fn leaf(&self, path: SpendPath) -> Result<VaultLeaf> {
         let tr = taproot_spend(&self.descriptor)?;
         let spend_info = tr.spend_info();
-        let single_key = match path {
-            SpendPath::Cooperative => None,
-            SpendPath::PhoneRecovery => Some(self.phone.recovery()),
-            SpendPath::HwwRecovery => Some(self.hww.recovery()),
-            SpendPath::Heir => Some(
-                self.heir
-                    .context("this savings lock has no heir")?
-                    .recovery(),
-            ),
+        let PolicyKeys {
+            phone,
+            hww,
+            yubikey,
+            heir,
+        } = self.keys;
+        let yubikey = || yubikey.context("this savings lock has no YubiKey");
+        // Each leaf is told apart by exactly the keys it holds, in script order.
+        let wanted = match path {
+            SpendPath::Cooperative => vec![phone.for_path(path), hww.for_path(path)],
+            SpendPath::PhoneYubikey => vec![phone.for_path(path), yubikey()?.for_path(path)],
+            SpendPath::HwwYubikey => vec![hww.for_path(path), yubikey()?.for_path(path)],
+            SpendPath::PhoneRecovery => vec![phone.recovery()],
+            SpendPath::HwwRecovery => vec![hww.recovery()],
+            SpendPath::Heir => vec![heir.context("this savings lock has no heir")?.recovery()],
         };
         for (depth, miniscript) in tr.iter_scripts() {
-            let script = miniscript.encode();
-            let is_multi = script
-                .instructions()
-                .any(|i| matches!(i, Ok(bitcoin::script::Instruction::Op(OP_CHECKSIGADD))));
-            let matches = match single_key {
-                None => is_multi,
-                Some(key) => {
-                    !is_multi
-                        && script
-                            .as_bytes()
-                            .windows(32)
-                            .any(|w| w == key.serialize().as_slice())
-                }
-            };
-            if !matches {
+            let keys: Vec<XOnlyPublicKey> = miniscript
+                .iter_pk()
+                .map(|key| key.inner.x_only_public_key().0)
+                .collect();
+            if keys != wanted {
                 continue;
             }
+            let script = miniscript.encode();
             let leaf_version = LeafVersion::TapScript;
             let leaf_hash = TapLeafHash::from_script(&script, leaf_version);
             let control_block = spend_info

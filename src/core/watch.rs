@@ -720,10 +720,11 @@ fn describe_spend(
         let path = targets.spend_path(pot, input);
         let rank = match path {
             Some(SpendPath::Cooperative) => 1,
-            Some(SpendPath::Heir) => 2,
-            Some(SpendPath::HwwRecovery) => 3,
-            Some(SpendPath::PhoneRecovery) => 4,
-            None => 5,
+            Some(SpendPath::PhoneYubikey | SpendPath::HwwYubikey) => 2,
+            Some(SpendPath::Heir) => 3,
+            Some(SpendPath::HwwRecovery) => 4,
+            Some(SpendPath::PhoneRecovery) => 5,
+            None => 6,
         };
         if worst.is_none_or(|(old, _, _)| rank > old) {
             worst = Some((rank, pot, path));
@@ -739,6 +740,22 @@ fn describe_spend(
              such as a sweep, a key change or a new yearly ceremony. If that was you, nothing to \
              do (on a separate watcher, export a fresh watch plan). If not, both of your keys \
              may be exposed.",
+        ),
+        Some(SpendPath::PhoneYubikey) => WatchEvent::new(
+            Level::Notice,
+            format!("{name} coins moved with your phone and YubiKey"),
+            "Your phone and YubiKey signed together, which is how you move coins when the \
+             hardware wallet is lost. If that was you, nothing to do. If not, both your phone \
+             and your YubiKey may be exposed: move every remaining coin with your hardware \
+             wallet now.",
+        ),
+        Some(SpendPath::HwwYubikey) => WatchEvent::new(
+            Level::Notice,
+            format!("{name} coins moved with your hardware wallet and YubiKey"),
+            "Your hardware wallet and YubiKey signed together, which is how you move coins when \
+             the phone is lost. If that was you, nothing to do. If not, both your hardware \
+             wallet and your YubiKey may be exposed: move every remaining coin with your phone \
+             now.",
         ),
         Some(SpendPath::PhoneRecovery) => WatchEvent::new(
             Level::Alert,

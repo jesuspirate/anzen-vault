@@ -276,6 +276,18 @@ pub fn recover(
     recovery::sign_recovery_sweep(plan, SweepPath::HwwRecovery, &*hww)
 }
 
+/// Propose a sweep of every vault coin with the hardware wallet and the YubiKey, for when the
+/// phone is lost. The hardware wallet signs here; the YubiKey's computer finishes it.
+pub fn create_yubikey_sweep(
+    data_dir: &Path,
+    config: &VaultConfig,
+    utxos: &[VaultUtxo],
+    destination: &Address,
+) -> Result<recovery::PairSweepPackage> {
+    let hww = load_hww(data_dir)?;
+    recovery::create_pair_sweep(config, utxos, SweepPath::HwwYubikey, destination, &*hww)
+}
+
 /// Validate a phone-built savings spend and add the HWW signature.
 pub fn approve_savings_spend(
     data_dir: &Path,

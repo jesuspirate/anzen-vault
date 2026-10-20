@@ -44,6 +44,7 @@ readonly TESTS=(
     presigned-renewal
     heir-claim
     watch-alerts
+    yubikey-recovery
 )
 
 list_tests() {
@@ -1238,6 +1239,111 @@ test_heir_claim() {
     success "Maya received the vault and the savings with no device of the owner's."
 }
 
+# Any two of phone, hardware wallet and YubiKey: sweep with each pair that includes the YubiKey.
+test_yubikey_recovery() {
+    local computer="$DEMO_ROOT/yubikey-computer"
+    local new_vault_dir="$DEMO_ROOT/new-vault"
+    local captured yubikey_key vault_descriptor vault_address new_vault_address other_address
+    local proposal="${E2E_TEST}-sweep.json"
+    local tampered="${E2E_TEST}-tampered-sweep.json"
+    local second_proposal="${E2E_TEST}-second-sweep.json"
+    local hww_words="$DEMO_ROOT/${E2E_TEST}-hww-24-words.json"
+
+    step "Set up the YubiKey on its own computer"
+    anzen_filtered '
+        /^(Simulated phone initialized|Phone vault key:)/ { print }
+    ' "$MAIN" phone init
+    expect_failure "the YubiKey's key is never made on the phone" "$MAIN" yubikey init
+    anzen_capture captured "$computer" yubikey init
+    yubikey_key=$(printf '%s\n' "$captured" | awk '/^YubiKey key:/ {print $3}')
+    anzen "$MAIN" yubikey import --key "$yubikey_key"
+    success "The phone recorded the YubiKey's public key before creating the vault."
+
+    step "Create the vault: any two of the three keys can move it"
+    anzen_filtered '
+        /^(Simulated HWW initialized|HWW vault key:)/ { print }
+    ' "$MAIN" hww init
+    anzen_filtered '
+        /^(Vault initialized|Vault address:)/ { print }
+    ' "$MAIN" init
+    vault_descriptor=$(jq -r .vault_descriptor "$MAIN/anzen.json")
+    vault_address=$(jq -r .vault_address "$MAIN/anzen.json")
+    if ! grep -q "<4;5>" <<<"$vault_descriptor" || ! grep -q "<6;7>" <<<"$vault_descriptor"; then
+        printf 'ERROR: the vault has no YubiKey pair leaves\n' >&2
+        exit 1
+    fi
+    anzen "$computer" yubikey restore --vault-descriptor "$vault_descriptor"
+    anzen "$computer" yubikey status
+    anzen "$MAIN" recovery-kit --output "$DEMO_ROOT/${E2E_TEST}-kit.html" --owner Jet
+    if ! grep -q "Three keys, any two" "$DEMO_ROOT/${E2E_TEST}-kit.html"; then
+        printf 'ERROR: the recovery kit does not explain the YubiKey\n' >&2
+        exit 1
+    fi
+    success "The YubiKey's computer knows the vault from the recovery kit."
+
+    step "Fund the vault"
+    NOW=$(date -u +%s)
+    anzen_capture captured "$MAIN" phone receive-address
+    MINING_ADDRESS=$(printf '%s\n' "$captured" | awk '/^Hot receive address:/ {print $4}')
+    anzen "$MAIN" node set-time "$NOW"
+    mine_blocks 101 "Creating spendable regtest coins"
+    anzen "$MAIN" phone send "$vault_address" "$DEFAULT_FUNDING_SATS"
+    confirm_transaction "Confirming the vault funding transaction"
+    status_compact
+    success "Vault funded."
+
+    step "The hardware wallet is lost (its 24 words are still on paper)"
+    show_file_command mv -- "$MAIN/hww/device.json" "$hww_words"
+    mv -- "$MAIN/hww/device.json" "$hww_words"
+    expect_failure "the phone alone waits months" "$MAIN" phone recover "$MINING_ADDRESS"
+    success "The phone alone cannot move the coins yet."
+
+    step "A new hardware wallet makes a fresh vault to move into"
+    show_command "$new_vault_dir" phone init
+    command anzen --data-dir "$new_vault_dir" phone init >/dev/null
+    command anzen --data-dir "$new_vault_dir" hww init >/dev/null
+    command anzen --data-dir "$new_vault_dir" init >/dev/null
+    new_vault_address=$(jq -r .vault_address "$new_vault_dir/anzen.json")
+    printf 'New vault address, checked on the new hardware wallet'"'"'s screen: %s\n' "$new_vault_address"
+    success "The destination is a vault the owner checked on a screen."
+
+    step "Phone and YubiKey move every coin to the new vault, with no wait"
+    anzen "$MAIN" phone yubikey-sweep "$new_vault_address" --output "$proposal"
+    other_address=$(command anzen --data-dir "$new_vault_dir" phone receive-address |
+        awk '/^Hot receive address:/ {print $4}')
+    jq --arg address "$other_address" '.destination = $address' "$proposal" >"$tampered"
+    expect_failure "the YubiKey's computer checks the destination against the signed transaction" \
+        "$computer" yubikey confirm-sweep "$tampered" --yes
+    anzen "$computer" yubikey confirm-sweep "$proposal" --yes
+    confirm_transaction "Confirming the phone + YubiKey sweep"
+    if [[ $(vault_balance_sats) != 0 ]]; then
+        printf 'ERROR: vault coins remain after the phone + YubiKey sweep\n' >&2
+        exit 1
+    fi
+    success "Two of three keys moved the whole vault at once."
+
+    step "Later: the hardware wallet is restored from its words, then the phone is lost"
+    show_file_command mv -- "$hww_words" "$MAIN/hww/device.json"
+    mv -- "$hww_words" "$MAIN/hww/device.json"
+    anzen "$MAIN" phone send "$vault_address" "$DEFAULT_FUNDING_SATS"
+    confirm_transaction "Confirming a new vault deposit"
+    show_file_command rm -- "$MAIN/phone/device.json"
+    rm -- "$MAIN/phone/device.json"
+    expect_failure "the hardware wallet alone waits about 15 months" \
+        "$MAIN" hww recover "$new_vault_address"
+    success "The hardware wallet alone cannot move the coins yet."
+
+    step "Hardware wallet and YubiKey move every coin to the new vault"
+    anzen "$MAIN" hww yubikey-sweep "$new_vault_address" --output "$second_proposal"
+    anzen "$computer" yubikey confirm-sweep "$second_proposal" --yes
+    confirm_transaction "Confirming the hardware wallet + YubiKey sweep"
+    if [[ $(vault_balance_sats) != 0 ]]; then
+        printf 'ERROR: vault coins remain after the hardware wallet + YubiKey sweep\n' >&2
+        exit 1
+    fi
+    success "Lost phone or lost hardware wallet: the YubiKey and the other key move everything."
+}
+
 # Run the watcher and fail unless its output contains every given line fragment.
 watch_expect() {
     local data_dir=$1
@@ -1377,6 +1483,7 @@ case "$E2E_TEST" in
     presigned-renewal) test_presigned_renewal ;;
     heir-claim) test_heir_claim ;;
     watch-alerts) test_watch_alerts ;;
+    yubikey-recovery) test_yubikey_recovery ;;
     *)
         printf 'ERROR: test %s is listed but has no case here\n' "$E2E_TEST" >&2
         exit 1

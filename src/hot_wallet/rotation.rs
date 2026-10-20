@@ -92,8 +92,9 @@ where
     let context = load_rotation_context(data_dir, backend)?;
     let network = context.old_config.bitcoin_network()?;
     let hww_pubkey = crate::core::keys::VaultKey::from_str(&context.old_config.hww_vault_pubkey)?;
+    let yubikey = context.old_config.yubikey_key()?;
     let heir = context.old_config.heir_key()?;
-    let pending = load_pending_vanity_phone(data_dir, &context.old_config, hww_pubkey, suffix)?;
+    let pending = load_pending_vanity_phone(data_dir, &context.old_config, suffix)?;
     let (new_phone, expected_address, attempts, actual_worker_count, resumed) = match pending {
         Some((phone, address)) => (phone, address, 0, 0, true),
         None => {
@@ -105,6 +106,7 @@ where
             } = grind_vanity_phone_key(
                 network,
                 hww_pubkey,
+                yubikey,
                 heir,
                 suffix,
                 worker_count,
@@ -144,7 +146,6 @@ fn load_rotation_context(
 fn load_pending_vanity_phone(
     data_dir: &Path,
     old_config: &VaultConfig,
-    hww_pubkey: crate::core::keys::VaultKey,
     suffix: &str,
 ) -> Result<Option<(DeviceKeys, String)>> {
     let pending_path = data_dir.join(recovery::PENDING_PHONE_ROTATION_FILE);
@@ -162,10 +163,8 @@ fn load_pending_vanity_phone(
         network,
         pending.vault_key_index,
     )?;
-    let policy = VaultPolicy::with_heir(
-        phone.vault_pubkey,
-        hww_pubkey,
-        old_config.heir_key()?,
+    let policy = VaultPolicy::build(
+        &old_config.policy_keys_with_phone(phone.vault_pubkey)?,
         network,
     )?;
     let expected_prefix = match network {
@@ -193,11 +192,8 @@ fn build_phone_rotation(
         old_phone,
     } = context;
     let network = old_config.bitcoin_network()?;
-    let hww_pubkey = crate::core::keys::VaultKey::from_str(&old_config.hww_vault_pubkey)?;
-    let new_policy = VaultPolicy::with_heir(
-        new_phone.vault_pubkey,
-        hww_pubkey,
-        old_config.heir_key()?,
+    let new_policy = VaultPolicy::build(
+        &old_config.policy_keys_with_phone(new_phone.vault_pubkey)?,
         network,
     )?;
     let new_config = recovery::rotated_config(&old_config, &new_phone, &new_policy)?;
