@@ -78,6 +78,11 @@ enum Command {
         #[command(subcommand)]
         command: HeirCommand,
     },
+    /// Watch the vault from an always-on computer and send yourself an alert when coins move.
+    Watch {
+        #[command(subcommand)]
+        command: WatchCommand,
+    },
     /// Write a printable, plain-language recovery kit for heirs and recovery friends.
     RecoveryKit {
         /// Where to write the kit (an HTML file; print it or save it as PDF from any browser).
@@ -134,6 +139,32 @@ enum HeirCommand {
     Status,
     /// With the heir's key: move every vault and savings coin it can already open.
     Claim { destination: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum WatchCommand {
+    /// Check the chain for anything new: once (for cron or a timer), or every --every seconds.
+    Run {
+        /// Keep watching, checking this often (seconds, at least 10).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(10..))]
+        every: Option<u64>,
+        /// Shell command run for each alert. It gets ANZEN_ALERT_LEVEL, ANZEN_ALERT_TITLE and
+        /// ANZEN_ALERT_MESSAGE, and the title and message on stdin. Alert text never contains
+        /// amounts, addresses or txids, so it is safe to forward to a push service.
+        #[arg(long, env = "ANZEN_NOTIFY_COMMAND")]
+        notify_command: Option<String>,
+        /// Also print amounts and txids in this computer's output.
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Write the watch plan (public descriptors and expected txids; no keys) for a watcher on
+    /// another computer. Export again after each ceremony.
+    Export {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// On the watcher computer: load a watch plan exported from the phone.
+    Import { plan: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -433,7 +464,10 @@ impl ChainArgs {
 
     fn connect_chain(&self, data_dir: &Path) -> Result<Box<dyn core::chain::Blockchain>> {
         let config = core::storage::load_config(data_dir)?;
-        let network = config.bitcoin_network()?;
+        self.connect_chain_for(config.bitcoin_network()?)
+    }
+
+    fn connect_chain_for(&self, network: Network) -> Result<Box<dyn core::chain::Blockchain>> {
         match self.selected_backend(network)? {
             ChainBackendKind::Rpc => Ok(Box::new(self.connect_core(network)?)),
             ChainBackendKind::Electrum => Ok(Box::new(self.connect_electrum(network)?)),
@@ -480,6 +514,7 @@ fn main() -> Result<()> {
         Command::Social { command } => run_social(command, &cli.data_dir, &cli.chain),
         Command::Health { command } => run_health(&cli.data_dir, command),
         Command::Heir { command } => run_heir(command, &cli.data_dir, &cli.chain, network),
+        Command::Watch { command } => run_watch(command, &cli.data_dir, &cli.chain, network),
         Command::RecoveryKit { output, owner } => write_recovery_kit(&cli.data_dir, &output, owner),
         Command::Node { command } => run_node(command, &cli.chain, network),
     }
@@ -2101,6 +2136,10 @@ fn command_network(
         let heir: core::storage::HeirPublicFile =
             core::storage::read_json(&data_dir.join(core::storage::HEIR_PUBLIC_FILE))?;
         Some(core::storage::parse_network_name(&heir.network)?)
+    } else if data_dir.join(core::watch::WATCH_PACKAGE_FILE).exists() {
+        let package: core::watch::WatchPackage =
+            core::storage::read_json(&data_dir.join(core::watch::WATCH_PACKAGE_FILE))?;
+        Some(package.bitcoin_network()?)
     } else {
         None
     };
@@ -2125,6 +2164,196 @@ fn command_network(
         (None, true) => Ok(Network::Bitcoin),
         (None, false) if signet => Ok(Network::Signet),
         (None, false) => Ok(Network::Regtest),
+    }
+}
+
+fn run_watch(
+    command: WatchCommand,
+    data_dir: &Path,
+    rpc_args: &ChainArgs,
+    network: Network,
+) -> Result<()> {
+    match command {
+        WatchCommand::Export { output } => {
+            let package = core::watch::load_package(data_dir)?;
+            core::storage::write_json(&output, &package)?;
+            println!("Watch plan written to {}", output.display());
+            println!(
+                "It holds descriptors and expected txids, no keys. Anyone who reads it can see \
+                 your vault's balance and history, so keep it private."
+            );
+            println!(
+                "On the watcher computer: anzen --data-dir <folder> watch import {}",
+                output.display()
+            );
+            Ok(())
+        }
+        WatchCommand::Import { plan } => {
+            let package: core::watch::WatchPackage = core::storage::read_json(&plan)?;
+            if package.bitcoin_network()? != network {
+                bail!(
+                    "this watch plan is for {}; pass the matching network flag",
+                    package.network
+                );
+            }
+            core::watch::import_package(data_dir, &package)?;
+            println!("Watch plan imported ({})", network_label(network));
+            println!(
+                "Savings locks watched: {}",
+                package.savings_descriptors.len()
+            );
+            println!("Planned transactions known: {}", package.known.len());
+            println!(
+                "Start watching: anzen --data-dir {} watch run --every 60",
+                data_dir.display()
+            );
+            Ok(())
+        }
+        WatchCommand::Run {
+            every,
+            notify_command,
+            reveal,
+        } => {
+            let Some(every) = every else {
+                return watch_once(
+                    data_dir,
+                    rpc_args,
+                    network,
+                    notify_command.as_deref(),
+                    reveal,
+                );
+            };
+            println!("Watching every {every} seconds. Stop with Ctrl-C.");
+            let mut failures = 0u32;
+            loop {
+                match watch_once(
+                    data_dir,
+                    rpc_args,
+                    network,
+                    notify_command.as_deref(),
+                    reveal,
+                ) {
+                    Ok(()) => {
+                        if failures >= WATCH_FAILURES_BEFORE_ALERT {
+                            notify_or_warn(
+                                notify_command.as_deref(),
+                                core::watch::Level::Info,
+                                "Watcher reconnected",
+                                "The watcher can read the chain again.",
+                            );
+                        }
+                        failures = 0;
+                    }
+                    Err(error) => {
+                        failures += 1;
+                        eprintln!("Watch check failed: {error:#}");
+                        if failures == WATCH_FAILURES_BEFORE_ALERT {
+                            notify_or_warn(
+                                notify_command.as_deref(),
+                                core::watch::Level::Notice,
+                                "Watcher cannot reach the chain",
+                                "The watcher has failed several checks in a row, so it cannot \
+                                 see vault moves right now. Check its node or Electrum server.",
+                            );
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(every));
+            }
+        }
+    }
+}
+
+/// Consecutive failed checks before the watcher tells the owner it is blind.
+const WATCH_FAILURES_BEFORE_ALERT: u32 = 3;
+
+fn watch_once(
+    data_dir: &Path,
+    rpc_args: &ChainArgs,
+    network: Network,
+    notify_command: Option<&str>,
+    reveal: bool,
+) -> Result<()> {
+    let package = core::watch::load_package(data_dir)?;
+    if package.bitcoin_network()? != network {
+        bail!("the watch plan is for {}", package.network);
+    }
+    let backend = rpc_args.connect_chain_for(network)?;
+    let state_path = data_dir.join(core::watch::WATCH_STATE_FILE);
+    let state = core::watch::WatchState::load(&state_path)?;
+    let report = core::watch::poll(
+        backend.as_ref(),
+        &package,
+        state,
+        chrono::Utc::now().timestamp(),
+    )?;
+    for event in &report.events {
+        println!(
+            "[{}] {}",
+            event.level.to_string().to_uppercase(),
+            event.title
+        );
+        println!("  {}", event.message);
+        if reveal {
+            if let Some(txid) = event.txid {
+                let state = if event.confirmed {
+                    "confirmed"
+                } else {
+                    "in the mempool"
+                };
+                println!("  Transaction: {txid} ({state})");
+            }
+            if let Some(sats) = event.amount_sats {
+                println!("  Coins involved: {} sats", format_number(sats));
+            }
+        }
+    }
+    // Save only once every alert is delivered, so a failed one is raised again next time.
+    if let Some(command) = notify_command {
+        for event in &report.events {
+            notify(command, event.level, &event.title, &event.message)?;
+        }
+    }
+    report.state.save(&state_path)?;
+    if report.events.is_empty() {
+        println!(
+            "No changes. Watching {} coin(s) up to block {}.",
+            report.coins_watched,
+            format_number(report.height)
+        );
+    }
+    Ok(())
+}
+
+fn notify(command: &str, level: core::watch::Level, title: &str, message: &str) -> Result<()> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env("ANZEN_ALERT_LEVEL", level.to_string())
+        .env("ANZEN_ALERT_TITLE", title)
+        .env("ANZEN_ALERT_MESSAGE", message)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("could not start the notify command")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // A command that ignores stdin may close it early; that is fine.
+        let _ = writeln!(stdin, "{title}\n\n{message}");
+    }
+    let status = child.wait().context("the notify command did not finish")?;
+    if !status.success() {
+        bail!("the notify command failed ({status}) for \"{title}\"");
+    }
+    Ok(())
+}
+
+fn notify_or_warn(command: Option<&str>, level: core::watch::Level, title: &str, message: &str) {
+    println!("[{}] {title}", level.to_string().to_uppercase());
+    println!("  {message}");
+    if let Some(command) = command {
+        if let Err(error) = notify(command, level, title, message) {
+            eprintln!("{error:#}");
+        }
     }
 }
 

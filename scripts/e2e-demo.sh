@@ -43,6 +43,7 @@ readonly TESTS=(
     savings-spend
     presigned-renewal
     heir-claim
+    watch-alerts
 )
 
 list_tests() {
@@ -1237,6 +1238,112 @@ test_heir_claim() {
     success "Maya received the vault and the savings with no device of the owner's."
 }
 
+# Run the watcher and fail unless its output contains every given line fragment.
+watch_expect() {
+    local data_dir=$1
+    shift
+    local watch_output
+    local expected
+    anzen_capture watch_output "$data_dir" watch run --notify-command "$WATCH_NOTIFY" --reveal
+    for expected in "$@"; do
+        if ! grep -qF -- "$expected" <<<"$watch_output"; then
+            printf 'ERROR: the watcher did not report "%s"\n' "$expected" >&2
+            exit 1
+        fi
+    done
+}
+
+require_alert() {
+    if ! grep -qxF -- "$1" "$WATCH_ALERTS"; then
+        printf 'ERROR: no "%s" alert was delivered\n' "$1" >&2
+        cat "$WATCH_ALERTS" >&2
+        exit 1
+    fi
+}
+
+test_watch_alerts() {
+    local watcher="$DEMO_ROOT/$E2E_TEST-watcher"
+    local plan="$DEMO_ROOT/$E2E_TEST-watch-plan.json"
+    local first_delay_base first_unlock unlock_date deposit_output deposit_address vault_address
+    WATCH_ALERTS="$DEMO_ROOT/$E2E_TEST-alerts.log"
+    WATCH_NOTIFY="printf '%s | %s\n' \"\$ANZEN_ALERT_LEVEL\" \"\$ANZEN_ALERT_TITLE\" >> $WATCH_ALERTS"
+    setup_vault
+
+    step "Approve monthly spending and one emergency withdrawal"
+    ceremony "$NOW" "$DEFAULT_MONTHLY_LIMIT_SATS" 50000000
+    first_delay_base=$(node_mtp)
+    confirm_transaction "Confirming the annual rollover"
+    success "The vault's plan is active."
+
+    step "Turn the watcher on, on the phone and on a separate always-on computer"
+    watch_expect "$MAIN" "[INFO] Watcher is on"
+    require_alert "info | Watcher is on"
+    watch_expect "$MAIN" "No changes."
+    anzen "$MAIN" watch export --output "$plan"
+    if grep -qE 'mnemonic|xprv|tprv' "$plan"; then
+        printf 'ERROR: the watch plan contains secret key material\n' >&2
+        exit 1
+    fi
+    anzen "$watcher" watch import "$plan"
+    anzen "$watcher" watch run
+    success "Two watchers hold only public data and see the same vault."
+
+    first_unlock=$((first_delay_base + MONTHLY_ALLOWANCE_DELAY_SECONDS))
+    advance_mtp_to "$first_unlock" "Fast-forward to the first allowance"
+    step "The first monthly allowance is released"
+    anzen "$MAIN" phone authorize 1
+    confirm_transaction "Confirming the first allowance"
+    watch_expect "$MAIN" "[NOTICE] Month 1 allowance released" "(confirmed)"
+    require_alert "notice | Month 1 allowance released"
+    success "The owner hears about each allowance release."
+
+    step "Someone starts the emergency withdrawal"
+    anzen "$MAIN" phone emergency initiate
+    watch_expect "$MAIN" "[ALERT] Emergency withdrawal started" "(in the mempool)" \
+        "anzen hww revoke-policy"
+    watch_expect "$watcher" "[ALERT] Emergency withdrawal started"
+    require_alert "alert | Emergency withdrawal started"
+    confirm_transaction "Confirming the emergency trigger"
+    watch_expect "$MAIN" "No changes."
+    success "The alert arrived before the trigger even confirmed, and only once."
+
+    step "The owner cancels it inside the week"
+    anzen "$MAIN" phone emergency cancel
+    confirm_transaction "Confirming the cancellation"
+    watch_expect "$MAIN" "[NOTICE] An allowance or emergency withdrawal was cancelled"
+    success "The cancel was reported too."
+
+    step "A savings deposit, and an alert that fails to send"
+    unlock_date=$(date -u -d "@$((NOW + 2 * 365 * 24 * 60 * 60))" +%Y-%m-%d)
+    anzen "$MAIN" savings create --unlock "$unlock_date"
+    watch_expect "$MAIN" "No changes."
+    anzen_capture deposit_output "$MAIN" deposit-address
+    deposit_address=$(printf '%s\n' "$deposit_output" | awk '/^Deposit address:/ {print $3}')
+    anzen "$MAIN" phone send "$deposit_address" 25000000
+    confirm_transaction "Confirming the savings deposit"
+    expect_failure "the notify command failed, so the watcher keeps the alert for next time" \
+        "$MAIN" watch run --notify-command false
+    watch_expect "$MAIN" "[INFO] Deposit to Savings until $unlock_date" "Coins involved: 25,000,000 sats"
+    require_alert "info | Deposit to Savings until $unlock_date"
+    success "A failed delivery was retried on the next check."
+
+    step "The watcher is off for more than a week while coins arrive"
+    vault_address=$(jq -r .vault_address "$MAIN/anzen.json")
+    anzen "$MAIN" phone send "$vault_address" 10000000
+    mine_blocks 1010 "Mining a week and a day of blocks"
+    watch_expect "$MAIN" "[NOTICE] Coins moved while the watcher was away" "0 vault or savings coin(s) moved and 1 arrived"
+    watch_expect "$MAIN" "No changes."
+    success "After a long gap the watcher re-scanned and said what changed."
+
+    step "Check that no alert text leaked amounts, addresses or txids"
+    cat "$WATCH_ALERTS"
+    if grep -qE 'sats|bcrt1|[0-9a-f]{64}' "$WATCH_ALERTS"; then
+        printf 'ERROR: an alert carried private details\n' >&2
+        exit 1
+    fi
+    success "Alerts are safe to forward to a push service."
+}
+
 if (( $(node_height) != 0 )); then
     printf 'ERROR: test %s requires a fresh height-zero regtest node.\n' "$E2E_TEST" >&2
     printf 'Run it through ./scripts/run-e2e.sh so the node is reset first.\n' >&2
@@ -1269,6 +1376,7 @@ case "$E2E_TEST" in
     savings-spend) test_savings_spend ;;
     presigned-renewal) test_presigned_renewal ;;
     heir-claim) test_heir_claim ;;
+    watch-alerts) test_watch_alerts ;;
     *)
         printf 'ERROR: test %s is listed but has no case here\n' "$E2E_TEST" >&2
         exit 1

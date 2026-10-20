@@ -118,6 +118,25 @@ The heir's vault clock is the coin's age, like the recovery paths: 65,535 blocks
 
 The heir never needs the owner's devices or secrets. On their own device they run `anzen heir init --name NAME` and give the owner the printed key, which the owner records with `anzen heir import --name NAME --key KEY` before `anzen init`. Later the heir rebuilds the vault from the descriptors printed in the recovery kit with `anzen heir restore --vault-descriptor D --savings-descriptor S`, checks dates with `anzen heir status`, and moves every coin their key can already open with `anzen heir claim ADDRESS`. The recovery kit gains a page that shows the heir's clock as a picture, a situation and step-by-step section for the heir, and the heir's dates on every timeline.
 
+### Watching the vault
+
+The delays only help if the owner hears about a move while there is still time to act. `anzen watch run` reads the chain from the owner's own Bitcoin Core node (every block since its last check, plus mempool spends through `gettxspendingprevout`) or Electrum server, and reports each transaction that touches the vault, the allowance controller or a savings lock:
+
+| What happened | Level | What the owner is told |
+| --- | --- | --- |
+| Emergency withdrawal started | alert | Cancel it within the week with the HWW (`anzen hww revoke-policy`) |
+| Coins moved with the phone alone, the HWW alone, or by an unknown script | alert | Move everything left with the other key now |
+| The heir's key claimed coins | alert | Their long wait had passed |
+| A monthly allowance was released | notice | If not you, revoke the rest with the HWW |
+| A cancel, a cooperative move not in the plan, or coins moved while the watcher was away | notice | Check that it was you |
+| Rollover or renewal, a deposit | info | Nothing to do |
+
+It also reminds the owner, at most weekly, when a vault coin's phone-alone path is two months from opening. Each transaction is reported once, from the mempool when the node sees it there. The watcher recognises the plan's own transactions by txid: at every policy activation the phone records the epoch's presigned rollover, renewal, allowance and emergency txids in `phone/watch-plan.json`. Any other spend is judged by the Taproot leaf its witness reveals.
+
+`--notify-command` runs a shell command for every alert, with `ANZEN_ALERT_LEVEL`, `ANZEN_ALERT_TITLE` and `ANZEN_ALERT_MESSAGE` set and the text on stdin, so delivery can be email, Signal or a self-hosted push server. The alert text never contains amounts, addresses or txids, so it is safe to hand to a push service; `--reveal` adds them to the local output only. The watcher saves its progress only after every alert was delivered, so a failed delivery is raised again on the next check. Run it once from cron or a timer, or keep it running with `--every 60`; after three failed checks in a row it says it cannot see the chain.
+
+The watcher holds no keys, so it can live on an always-on computer such as a home node. `anzen watch export --output plan.json` writes the public watch plan (descriptors and expected txids), and `anzen --data-dir watcher watch import plan.json` loads it there. Export again after each ceremony, new savings lock or key rotation. The plan cannot move coins but reveals the vault's balance and history, so keep it private.
+
 Presigned transactions are convenience permissions, not custody. Losing them cannot lose the bitcoin because every principal output still has the three vault-script paths above.
 
 For a concrete byte-level example of this graph—including txids, outpoints, locktimes, sequences, values, addresses, and scripts—see the checked-in [vault output test vector](test-vectors/vault-output-graph.json).
