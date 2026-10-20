@@ -79,6 +79,8 @@ The overview shows the state immediately after rollover. Large blue circles are 
 
 Each monthly transaction has exactly two inputs: the current allowance vault UTXO and the current connector. After roughly 30 days, the phone signs the connector input and releases 0.1 BTC. Except for month twelve, that transaction creates both the next smaller vault UTXO and the exact connector required by the next step. Spending the live connector in a dynamic revocation leaves the current vault UTXO untouched and makes the current and every dependent future allowance impossible.
 
+Months are collected in order; skipping one only delays the later ones, and nothing expires. What the phone does not spend can go back to the vault: choose a buffer to keep for bills and emergencies with `anzen phone buffer --set SATS`, and just before a ceremony run `anzen phone return-leftovers`. It sends everything above the buffer to the vault (the fee comes out of the buffer), and once it confirms, the ceremony's rollover folds it into the new months. `phone set-policy` reminds you when the phone holds more than its buffer. Returned coins need two keys again as soon as they land, but they are not part of the current presigned months, which is why the return belongs right before a ceremony.
+
 #### Emergency access
 
 ![Emergency access trigger, delayed withdrawal, and connector-only cancellation](media/emergency-access-chain.svg)
