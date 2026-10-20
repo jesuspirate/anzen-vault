@@ -568,6 +568,12 @@ pub fn activate_policy(
         emergency_access,
     };
     write_json(&epoch_dir.join("schedule.json"), &schedule)?;
+    // Tell the watcher about this epoch's presigned transactions before any of them can appear.
+    let mut plan = crate::core::watch::known_from_manifest(&manifest, manifest.renews.is_some());
+    if let Some(next) = ceremony::load_presigned_renewal(&manifest, batch_dir)? {
+        plan.extend(crate::core::watch::known_from_manifest(&next, true));
+    }
+    crate::core::watch::record_plan(data_dir, plan)?;
     let broadcast_txid = match manifest.rollover_anchor_vout {
         // A presigned renewal's fee was fixed a year ago; bump it to today's rate.
         Some(anchor_vout) => broadcast_with_anchor_bump(

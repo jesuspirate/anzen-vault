@@ -20,6 +20,7 @@ pub mod social;
 pub mod storage;
 pub mod transactions;
 pub mod types;
+pub mod watch;
 
 pub const PHONE_RECOVERY_BLOCKS: u16 = 61_200;
 pub const HWW_RECOVERY_BLOCKS: u16 = 65_535;

@@ -5,13 +5,15 @@ use bdk_electrum::{
     electrum_client::{Client as ElectrumClient, ElectrumApi},
 };
 use bitcoin::{
-    Address, Amount, BlockHash, Network, OutPoint, Transaction, TxOut,
+    Address, Amount, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid,
     blockdata::constants::genesis_block,
 };
 use bitcoincore_rpc::{
     Client, RpcApi,
     json::{GetBlockchainInfoResult, ScanTxOutRequest},
 };
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -51,6 +53,46 @@ pub struct ChainTip {
     pub best_block_hash: BlockHash,
 }
 
+/// The last block a watcher has read. If it is no longer on the best chain, the watcher starts
+/// over from a fresh scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchCursor {
+    pub height: u64,
+    pub block_hash: BlockHash,
+}
+
+/// A watcher's starting point: every unspent output paying a watched script at `cursor`.
+#[derive(Debug, Clone)]
+pub struct WatchBaseline {
+    pub cursor: WatchCursor,
+    pub coins: Vec<VaultUtxo>,
+    /// Transactions already confirmed by `cursor` that touch a watched script. The watcher
+    /// treats them as old news.
+    pub history: Vec<Txid>,
+}
+
+/// A transaction that pays a watched script or spends a watched coin. `height` is `None` while
+/// it waits in the mempool.
+#[derive(Debug, Clone)]
+pub struct WatchedTransaction {
+    pub transaction: Transaction,
+    pub height: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WatchActivity {
+    pub cursor: WatchCursor,
+    /// Confirmed transactions in chain order, then mempool transactions.
+    pub transactions: Vec<WatchedTransaction>,
+    /// False when the backend could not follow the chain block by block from the old cursor
+    /// (a reorganisation, or a gap longer than it scans). The watcher then takes a new baseline.
+    pub caught_up: bool,
+}
+
+/// A Bitcoin Core watcher reads every block since its cursor. After a longer gap (about a week)
+/// it takes a fresh UTXO scan instead.
+pub const WATCH_MAX_BLOCK_SCAN: u64 = 1_008;
+
 pub trait Blockchain {
     fn network(&self) -> Network;
     fn backend_description(&self) -> String;
@@ -73,6 +115,22 @@ pub trait Blockchain {
         self.broadcast(parent)?;
         self.broadcast(child)?;
         Ok(())
+    }
+    /// Every confirmed output paying one of `scripts`, and the block that scan describes.
+    fn watch_baseline(&self, _scripts: &[ScriptBuf]) -> Result<WatchBaseline> {
+        bail!("this chain backend cannot watch the vault")
+    }
+    /// Transactions since `since` that pay one of `scripts` or spend one of `coins`, plus mempool
+    /// spends of `coins`. `handled` lists transactions the watcher already processed as
+    /// confirmed; the backend may leave them out.
+    fn watch_activity(
+        &self,
+        _scripts: &[ScriptBuf],
+        _coins: &[OutPoint],
+        _since: &WatchCursor,
+        _handled: &HashSet<Txid>,
+    ) -> Result<WatchActivity> {
+        bail!("this chain backend cannot watch the vault")
     }
 }
 
@@ -147,6 +205,137 @@ impl Blockchain for BitcoinCoreBackend {
                 other.unwrap_or("no message")
             ),
         }
+    }
+
+    fn watch_baseline(&self, scripts: &[ScriptBuf]) -> Result<WatchBaseline> {
+        let requests = scripts
+            .iter()
+            .map(|script| ScanTxOutRequest::Single(format!("raw({})", script.to_hex_string())))
+            .collect::<Vec<_>>();
+        let result = self
+            .client
+            .scan_tx_out_set_blocking(&requests)
+            .context("Bitcoin Core watcher scantxoutset failed")?;
+        if result.success != Some(true) {
+            bail!("Bitcoin Core did not complete the watcher's UTXO scan");
+        }
+        let cursor = WatchCursor {
+            height: result
+                .height
+                .context("Bitcoin Core's UTXO scan did not report its height")?,
+            block_hash: result
+                .best_block_hash
+                .context("Bitcoin Core's UTXO scan did not report its block")?,
+        };
+        let mut coins = result
+            .unspents
+            .into_iter()
+            .map(|utxo| VaultUtxo {
+                outpoint: OutPoint::new(utxo.txid, utxo.vout),
+                txout: TxOut {
+                    value: utxo.amount,
+                    script_pubkey: utxo.script_pub_key,
+                },
+                confirmation_height: utxo.height,
+            })
+            .collect::<Vec<_>>();
+        coins.sort_by_key(|utxo| (utxo.confirmation_height, utxo.outpoint));
+        Ok(WatchBaseline {
+            cursor,
+            coins,
+            history: Vec::new(),
+        })
+    }
+
+    fn watch_activity(
+        &self,
+        scripts: &[ScriptBuf],
+        coins: &[OutPoint],
+        since: &WatchCursor,
+        handled: &HashSet<Txid>,
+    ) -> Result<WatchActivity> {
+        let stale = WatchActivity {
+            cursor: since.clone(),
+            transactions: Vec::new(),
+            caught_up: false,
+        };
+        let tip = self.chain_info()?.blocks;
+        if since.height > tip
+            || self
+                .client
+                .get_block_hash(since.height)
+                .context("Bitcoin Core getblockhash failed")?
+                != since.block_hash
+            || tip - since.height > WATCH_MAX_BLOCK_SCAN
+        {
+            return Ok(stale);
+        }
+        let scripts = scripts.iter().collect::<HashSet<_>>();
+        let mut coins = coins.iter().copied().collect::<HashSet<_>>();
+        let mut cursor = since.clone();
+        let mut transactions = Vec::new();
+        for height in since.height + 1..=tip {
+            let hash = self
+                .client
+                .get_block_hash(height)
+                .context("Bitcoin Core getblockhash failed")?;
+            let block = self
+                .client
+                .get_block(&hash)
+                .context("Bitcoin Core getblock failed")?;
+            if block.header.prev_blockhash != cursor.block_hash {
+                // The chain changed under us; start over next time from a fresh scan.
+                return Ok(stale);
+            }
+            for transaction in block.txdata {
+                let spends = transaction
+                    .input
+                    .iter()
+                    .any(|input| coins.contains(&input.previous_output));
+                let pays = transaction
+                    .output
+                    .iter()
+                    .any(|output| scripts.contains(&output.script_pubkey));
+                if !spends && !pays {
+                    continue;
+                }
+                for input in &transaction.input {
+                    coins.remove(&input.previous_output);
+                }
+                let txid = transaction.compute_txid();
+                for (vout, output) in transaction.output.iter().enumerate() {
+                    if scripts.contains(&output.script_pubkey) {
+                        coins.insert(OutPoint::new(txid, vout as u32));
+                    }
+                }
+                transactions.push(WatchedTransaction {
+                    transaction,
+                    height: Some(height),
+                });
+            }
+            cursor = WatchCursor {
+                height,
+                block_hash: hash,
+            };
+        }
+        for txid in self.mempool_spends(&coins)? {
+            if handled.contains(&txid) {
+                continue;
+            }
+            let transaction = self
+                .client
+                .get_raw_transaction(&txid, None)
+                .context("Bitcoin Core getrawtransaction failed for a mempool spend")?;
+            transactions.push(WatchedTransaction {
+                transaction,
+                height: None,
+            });
+        }
+        Ok(WatchActivity {
+            cursor,
+            transactions,
+            caught_up: true,
+        })
     }
 }
 
@@ -300,6 +489,103 @@ impl Blockchain for ElectrumBackend {
         self.broadcast(child)?;
         Ok(())
     }
+
+    fn watch_baseline(&self, scripts: &[ScriptBuf]) -> Result<WatchBaseline> {
+        let tip = self.chain_tip()?;
+        let mut coins = Vec::new();
+        let mut history = Vec::new();
+        for script in scripts {
+            coins.extend(
+                self.scan_script(script, "watched")?
+                    .into_iter()
+                    .filter(|coin| coin.confirmation_height <= tip.height),
+            );
+            history.extend(
+                self.client
+                    .inner
+                    .script_get_history(script)
+                    .context("Electrum history query failed")?
+                    .into_iter()
+                    .filter(|item| item.height > 0 && item.height as u64 <= tip.height)
+                    .map(|item| item.tx_hash),
+            );
+        }
+        coins.sort_by_key(|utxo| (utxo.confirmation_height, utxo.outpoint));
+        history.sort_unstable();
+        history.dedup();
+        Ok(WatchBaseline {
+            cursor: WatchCursor {
+                height: tip.height,
+                block_hash: tip.best_block_hash,
+            },
+            coins,
+            history,
+        })
+    }
+
+    fn watch_activity(
+        &self,
+        scripts: &[ScriptBuf],
+        _coins: &[OutPoint],
+        since: &WatchCursor,
+        handled: &HashSet<Txid>,
+    ) -> Result<WatchActivity> {
+        let tip = self.chain_tip()?;
+        let on_chain = since.height <= tip.height
+            && self
+                .client
+                .inner
+                .block_header(since.height as usize)
+                .context("Electrum block header query failed")?
+                .block_hash()
+                == since.block_hash;
+        if !on_chain {
+            return Ok(WatchActivity {
+                cursor: since.clone(),
+                transactions: Vec::new(),
+                caught_up: false,
+            });
+        }
+        // Electrum's script history lists every transaction that pays or spends a script.
+        let mut wanted = Vec::new();
+        for script in scripts {
+            for item in self
+                .client
+                .inner
+                .script_get_history(script)
+                .context("Electrum history query failed")?
+            {
+                let height = (item.height > 0).then_some(item.height as u64);
+                let new = height.is_none_or(|height| height > since.height && height <= tip.height);
+                if new && !handled.contains(&item.tx_hash) {
+                    wanted.push((height, item.tx_hash));
+                }
+            }
+        }
+        // Confirmed first, in height order, then the mempool.
+        wanted.sort_by_key(|(height, txid)| (height.is_none(), *height, *txid));
+        wanted.dedup();
+        let mut transactions = Vec::with_capacity(wanted.len());
+        for (height, txid) in wanted {
+            let transaction = self
+                .client
+                .inner
+                .transaction_get(&txid)
+                .context("Electrum transaction query failed")?;
+            transactions.push(WatchedTransaction {
+                transaction,
+                height,
+            });
+        }
+        Ok(WatchActivity {
+            cursor: WatchCursor {
+                height: tip.height,
+                block_hash: tip.best_block_hash,
+            },
+            transactions,
+            caught_up: true,
+        })
+    }
 }
 
 impl ElectrumBackend {
@@ -421,6 +707,32 @@ impl BitcoinCoreBackend {
             .collect::<Vec<_>>();
         utxos.sort_by_key(|utxo| (utxo.confirmation_height, utxo.outpoint));
         Ok(utxos)
+    }
+
+    /// Mempool transactions spending any of `coins` (Bitcoin Core 24+ `gettxspendingprevout`).
+    fn mempool_spends(&self, coins: &HashSet<OutPoint>) -> Result<Vec<Txid>> {
+        if coins.is_empty() {
+            return Ok(Vec::new());
+        }
+        let outputs = coins
+            .iter()
+            .map(|coin| serde_json::json!({ "txid": coin.txid.to_string(), "vout": coin.vout }))
+            .collect::<Vec<_>>();
+        let result: Vec<serde_json::Value> = self
+            .client
+            .call("gettxspendingprevout", &[serde_json::json!(outputs)])
+            .context(
+                "Bitcoin Core gettxspendingprevout failed (it needs Bitcoin Core 24 or newer)",
+            )?;
+        let mut spends = result
+            .iter()
+            .filter_map(|entry| entry.get("spendingtxid")?.as_str())
+            .map(Txid::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .context("Bitcoin Core returned an invalid spending txid")?;
+        spends.sort_unstable();
+        spends.dedup();
+        Ok(spends)
     }
 
     pub fn vault_balance(&self, config: &VaultConfig) -> Result<Amount> {
