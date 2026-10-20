@@ -25,6 +25,8 @@ pub struct KitSavings {
     pub uses_earlier_phone_key: bool,
     /// The lock was created with the named heir's key in it.
     pub heir: bool,
+    /// The lock was created with the YubiKey in it, so any two keys open it on its date.
+    pub yubikey: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,8 @@ pub struct KitInput {
     pub friends: Vec<KitFriend>,
     pub health: Vec<(Device, DeviceHealth)>,
     pub heir: Option<KitHeir>,
+    /// The YubiKey's public key, when the vault has the optional third key.
+    pub yubikey: Option<String>,
 }
 
 /// Blocks arrive about every ten minutes, so 144 blocks is about a day.
@@ -148,6 +152,7 @@ table{border-collapse:collapse;width:100%} th,td{text-align:left;vertical-align:
 
 const PHONE_ICON: &str = r##"<g><rect x="-18" y="-30" width="36" height="60" rx="7" fill="#ffffff" stroke="#1b2430" stroke-width="3"/><rect x="-12" y="-22" width="24" height="38" rx="2" fill="#e3eef6"/><circle cx="0" cy="23" r="3" fill="#1b2430"/></g>"##;
 const HEIR_ICON: &str = r##"<g><circle cx="0" cy="-12" r="11" fill="#ffffff" stroke="#1b2430" stroke-width="3"/><path d="M-20 24 C-20 6 20 6 20 24 Z" fill="#ffffff" stroke="#1b2430" stroke-width="3"/><circle cx="20" cy="-14" r="6" fill="#256b3e"/><rect x="18" y="-9" width="4" height="14" fill="#256b3e"/></g>"##;
+const YUBIKEY_ICON: &str = r##"<g><rect x="-30" y="-11" width="48" height="22" rx="5" fill="#ffffff" stroke="#1b2430" stroke-width="3"/><circle cx="-18" cy="0" r="4" fill="none" stroke="#1b2430" stroke-width="2.5"/><circle cx="2" cy="0" r="6" fill="#d9a520"/><rect x="18" y="-6" width="14" height="12" fill="#cfd6df" stroke="#1b2430" stroke-width="2"/></g>"##;
 const HWW_ICON: &str = r##"<g><rect x="-30" y="-17" width="60" height="34" rx="8" fill="#ffffff" stroke="#1b2430" stroke-width="3"/><rect x="-20" y="-9" width="26" height="18" rx="2" fill="#e3eef6"/><circle cx="17" cy="0" r="5" fill="#1b2430"/></g>"##;
 
 fn big_picture(input: &KitInput) -> String {
@@ -194,6 +199,105 @@ fn big_picture(input: &KitInput) -> String {
         );
     }
     svg.push_str("</svg>");
+    svg
+}
+
+/// Three keys, any two: the picture on the big-picture page of a vault with a YubiKey.
+fn three_keys_picture(input: &KitInput) -> String {
+    let savings = !input.savings.is_empty();
+    let height = if savings { 400 } else { 300 };
+    let mut svg = format!(
+        r##"<svg viewBox="0 0 720 {height}" role="img" aria-label="Three keys, the phone, the hardware wallet and the YubiKey: any two of them together open the vault">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1b2430"/></marker></defs>
+<g transform="translate(90,55)">{PHONE_ICON}</g>
+<text x="90" y="108" text-anchor="middle" font-size="15" font-weight="700" fill="#1b2430">Key 1: the phone</text>
+<g transform="translate(90,150)">{HWW_ICON}</g>
+<text x="90" y="186" text-anchor="middle" font-size="15" font-weight="700" fill="#1b2430">Key 2: hardware wallet</text>
+<g transform="translate(90,235)">{YUBIKEY_ICON}</g>
+<text x="90" y="268" text-anchor="middle" font-size="15" font-weight="700" fill="#1b2430">Key 3: YubiKey</text>
+<text x="90" y="287" text-anchor="middle" font-size="13" fill="#4f5b6b">used on a computer</text>
+<path d="M150 60 C250 60 260 140 330 140" fill="none" stroke="#1b2430" stroke-width="3" marker-end="url(#arrow)"/>
+<path d="M150 150 L330 150" fill="none" stroke="#1b2430" stroke-width="3" marker-end="url(#arrow)"/>
+<path d="M150 235 C250 235 260 160 330 160" fill="none" stroke="#1b2430" stroke-width="3" marker-end="url(#arrow)"/>
+<rect x="196" y="124" width="84" height="26" rx="13" fill="#ffffff" stroke="#1b2430" stroke-width="2"/>
+<text x="238" y="142" text-anchor="middle" font-size="14" font-weight="700" fill="#1b2430">ANY TWO</text>
+<rect x="340" y="85" width="350" height="130" rx="14" fill="#e3eef6" stroke="#1f5f8b" stroke-width="3"/>
+<text x="515" y="121" text-anchor="middle" font-size="20" font-weight="700" fill="#1f5f8b">The Vault</text>
+<text x="515" y="147" text-anchor="middle" font-size="14" fill="#1b2430">Any two keys together: open any time</text>
+<text x="515" y="169" text-anchor="middle" font-size="14" fill="#1b2430">Only one key: opens after a long wait</text>
+<text x="515" y="191" text-anchor="middle" font-size="13" fill="#4f5b6b">(phone: ~{} months, hardware wallet: ~{} months)</text>
+"##,
+        (blocks_to_days(input.phone_recovery_blocks) as f64 / 30.44).round(),
+        (blocks_to_days(input.hww_recovery_blocks) as f64 / 30.44).round(),
+    );
+    if savings {
+        let first = input
+            .savings
+            .iter()
+            .map(|lock| lock.unlock)
+            .min()
+            .unwrap_or_default();
+        let _ = write!(
+            svg,
+            r##"<rect x="340" y="270" width="350" height="110" rx="14" fill="#f6ecdc" stroke="#7a4f12" stroke-width="3"/>
+<text x="515" y="304" text-anchor="middle" font-size="20" font-weight="700" fill="#7a4f12">Savings Lock{}</text>
+<text x="515" y="329" text-anchor="middle" font-size="14" fill="#1b2430">Nobody can open it before its date,</text>
+<text x="515" y="350" text-anchor="middle" font-size="14" fill="#1b2430">not even with all three keys. First date: {}</text>
+<path d="M515 218 L515 262" fill="none" stroke="#1b2430" stroke-width="3" stroke-dasharray="7 6" marker-end="url(#arrow)"/>
+<text x="525" y="246" font-size="13" fill="#4f5b6b">after its date</text>
+"##,
+            if input.savings.len() > 1 { "s" } else { "" },
+            esc(&date(i64::from(first))),
+        );
+    }
+    svg.push_str("</svg>");
+    svg
+}
+
+/// The three keys in a row, each either in hand or missing (crossed out), with what that means.
+fn keys_in_hand(have: [bool; 3], outcome: &str) -> String {
+    let labels = ["Phone", "Hardware wallet", "YubiKey"];
+    let icons = [PHONE_ICON, HWW_ICON, YUBIKEY_ICON];
+    let mut svg = format!(
+        r##"<svg viewBox="0 0 720 120" role="img" aria-label="{}">"##,
+        esc(&format!(
+            "You have: {}. {outcome}",
+            labels
+                .iter()
+                .zip(have)
+                .filter(|(_, held)| *held)
+                .map(|(label, _)| *label)
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ))
+    );
+    for (index, ((label, icon), held)) in labels.iter().zip(icons).zip(have).enumerate() {
+        let x = 70 + index as i32 * 130;
+        let opacity = if held { "1" } else { "0.35" };
+        let _ = write!(
+            svg,
+            r##"<g opacity="{opacity}" transform="translate({x},45)">{icon}</g><text x="{x}" y="100" text-anchor="middle" font-size="13" font-weight="700" fill="#1b2430">{label}</text>"##
+        );
+        if !held {
+            let _ = write!(
+                svg,
+                r##"<path d="M{a} 17 L{b} 73 M{b} 17 L{a} 73" stroke="#9a3b1c" stroke-width="5" stroke-linecap="round"/>"##,
+                a = x - 26,
+                b = x + 26,
+            );
+        }
+    }
+    let fast = have.iter().filter(|held| **held).count() >= 2;
+    let (fill, stroke, color) = if fast {
+        ("#e2f1e7", "#256b3e", "#256b3e")
+    } else {
+        ("#f8e4dc", "#9a3b1c", "#9a3b1c")
+    };
+    let _ = write!(
+        svg,
+        r##"<rect x="430" y="22" width="270" height="60" rx="12" fill="{fill}" stroke="{stroke}" stroke-width="3"/><text x="565" y="58" text-anchor="middle" font-size="16" font-weight="700" fill="{color}">{}</text></svg>"##,
+        esc(outcome)
+    );
     svg
 }
 
@@ -307,6 +411,101 @@ fn health_line(device: Device, health: DeviceHealth) -> String {
     }
 }
 
+/// Section 2 for a vault with a YubiKey: one situation per set of keys still in hand.
+fn yubikey_situations(phone_wait: &str, hww_wait: &str, friends_line: &str, heir: &str) -> String {
+    let situation = |letter: &str, title: &str, have: [bool; 3], outcome: &str, body: &str| {
+        format!(
+            r#"<div class="box situation"><div class="letter">{letter}</div><div><h3>{title}</h3>{picture}<p>{body}</p></div></div>
+"#,
+            picture = keys_in_hand(have, outcome),
+        )
+    };
+    let mut html = String::new();
+    html.push_str(&situation(
+        "A",
+        "You have the phone and the hardware wallet",
+        [true, true, false],
+        "Opens today",
+        "The everyday case. Everything in the vault can be moved today. Savings locks open on their dates. The YubiKey is not needed.",
+    ));
+    html.push_str(&situation(
+        "B",
+        "The phone is lost",
+        [false, true, true],
+        "Opens today",
+        "The hardware wallet and the YubiKey together move everything today. No waiting and no cloud account needed.",
+    ));
+    html.push_str(&situation(
+        "C",
+        "The hardware wallet is lost",
+        [true, false, true],
+        "Opens today",
+        "Two ways back. The simplest: put the hardware wallet's 24 secret words into a new hardware wallet, and you are back to situation A. Or, if you think someone found the lost one, the phone and the YubiKey move everything today into a new vault whose address you check on the new hardware wallet's screen.",
+    ));
+    html.push_str(&situation(
+        "D",
+        "The YubiKey is lost",
+        [true, true, false],
+        "Opens today",
+        "Nothing is at risk: one key alone cannot move the coins quickly. The phone and the hardware wallet still work as in situation A. Then get a new YubiKey: either rebuild the same key from its 24 words on the computer and pair the new YubiKey with it, or set up a new vault with the new YubiKey and move the coins there.",
+    ));
+    html.push_str(&format!(
+        r#"<div class="box situation warn"><div class="letter">E</div><div><h3>Only one key is left</h3>{picture}<p>It still works, but only after a long wait: {phone_wait} with the phone, {hww_wait} with the hardware wallet. The YubiKey alone never opens the vault. Before waiting, look for the secret words of the lost keys (section 5): words restore a key onto a new device.</p></div></div>
+"#,
+        picture = keys_in_hand([false, true, false], "Opens after a wait"),
+    ));
+    html.push_str(r#"<div class="box situation warn"><div class="letter">F</div><div><h3>A key was stolen</h3><p>One stolen key is not enough to take anything quickly, but do not wait. Use the two keys you still have to move everything to a new vault today (situation A, B or C). After that, the stolen key opens nothing.</p></div></div>
+"#);
+    html.push_str(&format!(
+        r#"<div class="box situation"><div class="letter">G</div><div><h3>You have no device, but you are a recovery friend</h3><p>A recovery friend holds a personal key that can unlock the phone's cloud backup, which rebuilds the phone key. With the YubiKey or the hardware wallet as well, the vault opens today. Alone, it opens after {phone_wait}. {friends_line}</p></div></div>
+"#
+    ));
+    html.push_str(heir);
+    html
+}
+
+/// Section 4 for a vault with a YubiKey: the steps for each situation in section 2.
+fn yubikey_steps(phone_wait: &str, hww_wait: &str, heir_steps: &str) -> String {
+    format!(
+        r#"<div class="box"><h3>A · Phone and hardware wallet</h3><ol class="steps">
+<li>Unlock the phone and open the Anzen app.</li>
+<li>Choose <em>Move everything</em> and enter your new wallet's address.</li>
+<li>Connect the hardware wallet, enter its PIN, and check that the address on its screen matches yours, character by character.</li>
+<li>Approve on the hardware wallet. The app sends the coins.</li>
+</ol><p class="note">Technical: <code>anzen phone create-sweep</code>, <code>anzen hww confirm-sweep</code>, <code>anzen phone broadcast-sweep</code>.</p></div>
+<div class="box"><h3>B · Phone lost: hardware wallet and YubiKey</h3><ol class="steps">
+<li>Set up a new vault first (a new phone and the hardware wallet, or a new hardware wallet). Check the new vault's address on the hardware wallet's screen and write down its first and last six characters.</li>
+<li>Connect the hardware wallet to the computer, enter its PIN, choose <em>Phone lost: move with YubiKey</em>, and enter the new vault's address. Approve on the hardware wallet.</li>
+<li>On the computer, plug in the YubiKey. The app shows where the coins are going. Check it matches what you wrote down, then touch the YubiKey to approve.</li>
+<li>The coins move to the new vault right away.</li>
+</ol><p class="note">Technical: <code>anzen hww yubikey-sweep &lt;address&gt; --output sweep.json</code>, then on the YubiKey's computer <code>anzen yubikey confirm-sweep sweep.json</code>.</p></div>
+<div class="box"><h3>C · Hardware wallet lost: phone and YubiKey</h3><ol class="steps">
+<li><strong>Simplest:</strong> buy any new hardware wallet, choose <em>restore</em>, and type in the lost one's 24 secret words. Then follow situation A. Nothing else changes.</li>
+<li><strong>If the lost one may be in someone's hands:</strong> set up a new hardware wallet with a new key, and let the app make a new vault from the phone, the new hardware wallet and the YubiKey. Check the new vault's address on the new hardware wallet's screen.</li>
+<li>In the phone app choose <em>Hardware wallet lost: move with YubiKey</em>. It proposes moving every coin to the new vault.</li>
+<li>On the computer, plug in the YubiKey. Check the address it shows against the one you saw on the new hardware wallet's screen, then touch the YubiKey to approve.</li>
+</ol><p class="note">Technical: <code>anzen phone yubikey-sweep &lt;address&gt; --output sweep.json</code>, then on the YubiKey's computer <code>anzen yubikey confirm-sweep sweep.json</code>.</p></div>
+<div class="box"><h3>D · YubiKey lost</h3><ol class="steps">
+<li>Keep using the phone and the hardware wallet as usual. They move the coins on their own.</li>
+<li>Get a new YubiKey. Either rebuild the same key from the lost one's 24 words on the computer and pair the new YubiKey with it, or set it up fresh and move the coins to a new vault that includes it (situation A).</li>
+</ol></div>
+<div class="box"><h3>E · Only one key left</h3><ol class="steps">
+<li>First look for the secret words of the missing keys (section 5). Words put into a new device bring a key back, and then two keys are enough.</li>
+<li>Otherwise keep the remaining device safe and wait: {phone_wait} for the phone, {hww_wait} for the hardware wallet. The app shows the exact day.</li>
+</ol><p class="note">Technical: <code>anzen phone recover &lt;address&gt;</code> or <code>anzen hww recover &lt;address&gt;</code>.</p></div>
+<div class="box"><h3>F · A key was stolen</h3><ol class="steps">
+<li>Today, use the two keys you still have (steps A, B or C) to move everything to a new vault.</li>
+<li>Set up a replacement for the stolen key, and print a new kit.</li>
+</ol></div>
+<div class="box"><h3>G · Recovery friend</h3><ol class="steps">
+<li>Get a copy of the phone's encrypted cloud backup file from the family.</li>
+<li>Use your personal recovery key to unlock it. The app shows the vault it belongs to.</li>
+<li>With the YubiKey or the hardware wallet as well, follow step C or A. Alone, move the coins to the heir's new wallet after {phone_wait}.</li>
+</ol><p class="note">Technical: <code>anzen social emergency-access &lt;backup&gt; --private-key &lt;your key&gt; &lt;address&gt;</code>.</p></div>
+{heir_steps}"#
+    )
+}
+
 pub fn render(input: &KitInput) -> String {
     let phone_days = blocks_to_days(input.phone_recovery_blocks);
     let hww_days = blocks_to_days(input.hww_recovery_blocks);
@@ -324,6 +523,7 @@ pub fn render(input: &KitInput) -> String {
         let wait = months_label(blocks_to_days(heir.recovery_blocks));
         (if name.is_empty() { "the heir" } else { name }, wait, heir)
     });
+    let has_yubikey = input.yubikey.is_some();
     let network_note = match input.network {
         Network::Bitcoin => String::new(),
         _ => r#"<div class="box warn"><strong>Test vault.</strong> This kit describes a vault on a Bitcoin test network. It holds no real bitcoin.</div>"#.to_owned(),
@@ -352,7 +552,7 @@ pub fn render(input: &KitInput) -> String {
 <div class="box"><h3>Print a new one when things change</h3><p>After a phone is replaced, a savings lock is added, or a recovery friend changes. The newest printed date wins.</p></div>
 </div>
 <div class="box"><h3>What is inside</h3><ol>
-<li>The big picture: two keys and a vault</li>
+<li>The big picture: {keys_toc}</li>
 <li>Which situation are you in?{heir_toc}</li>
 <li>When each door opens</li>
 <li>Step by step, for each situation</li>
@@ -369,6 +569,11 @@ pub fn render(input: &KitInput) -> String {
             " (including {}, the named heir)",
             esc(name)
         )),
+        keys_toc = if has_yubikey {
+            "three keys, any two"
+        } else {
+            "two keys and a vault"
+        },
     );
 
     // Page 2: big picture.
@@ -395,24 +600,47 @@ pub fn render(input: &KitInput) -> String {
             person = owner.map_or_else(|| "the owner".to_owned(), esc),
         );
     }
-    let _ = write!(
-        html,
-        r#"<section class="page">
+    if has_yubikey {
+        let _ = write!(
+            html,
+            r#"<section class="page">
 <div class="label">1 · The big picture</div>
-<h2>Two keys and a vault</h2>
-<p>The bitcoin sits in a <strong>vault</strong>. It is not at a bank or a company: it is protected by the Bitcoin network itself, using two keys that only the family holds. Nobody else, including the makers of the app, can open it or stop it from being opened.</p>
+<h2>Three keys, any two</h2>
+<p>The bitcoin sits in a <strong>vault</strong>. It is not at a bank or a company: it is protected by the Bitcoin network itself, using three keys that only the family holds. Nobody else, including the makers of the app, can open it or stop it from being opened.</p>
 {picture}
 <ul>
 <li><strong>Key 1 is a phone</strong> with the Anzen app.</li>
-<li><strong>Key 2 is a hardware wallet</strong>: a small dedicated device, protected by a PIN code.</li>
-<li><strong>With both keys</strong> the vault opens right away.</li>
-<li><strong>With only one key</strong> it still opens, but only after a long wait: {phone_wait} with the phone, {hww_wait} with the hardware wallet. The wait protects against a thief who steals just one key. The clock restarts whenever the coins are moved, so the app shows the exact date for each coin.</li>
+<li><strong>Key 2 is a hardware wallet</strong>: a small dedicated device with its own screen, protected by a PIN code.</li>
+<li><strong>Key 3 is a YubiKey</strong>: a small USB key that is plugged into a computer, never into the phone. It is kept in a different place from the hardware wallet.</li>
+<li><strong>Any two keys together</strong> open the vault right away. Losing any one key is not a problem: the other two still work.</li>
+<li><strong>One key alone</strong> cannot move the coins quickly. The phone alone works after {phone_wait}, the hardware wallet alone after {hww_wait}, the YubiKey alone never. A thief with one key gets nothing.</li>
+<li><strong>Each key has 24 secret words on paper.</strong> The words can rebuild that key on a new device, so a lost device is not a lost key.</li>
 {money}
 </ul>
 </section>
 "#,
-        picture = big_picture(input),
-    );
+            picture = three_keys_picture(input),
+        );
+    } else {
+        let _ = write!(
+            html,
+            r#"<section class="page">
+    <div class="label">1 · The big picture</div>
+    <h2>Two keys and a vault</h2>
+    <p>The bitcoin sits in a <strong>vault</strong>. It is not at a bank or a company: it is protected by the Bitcoin network itself, using two keys that only the family holds. Nobody else, including the makers of the app, can open it or stop it from being opened.</p>
+    {picture}
+    <ul>
+    <li><strong>Key 1 is a phone</strong> with the Anzen app.</li>
+    <li><strong>Key 2 is a hardware wallet</strong>: a small dedicated device, protected by a PIN code.</li>
+    <li><strong>With both keys</strong> the vault opens right away.</li>
+    <li><strong>With only one key</strong> it still opens, but only after a long wait: {phone_wait} with the phone, {hww_wait} with the hardware wallet. The wait protects against a thief who steals just one key. The clock restarts whenever the coins are moved, so the app shows the exact date for each coin.</li>
+    {money}
+    </ul>
+    </section>
+    "#,
+            picture = big_picture(input),
+        );
+    }
 
     // Page 2b: the heir's door.
     if let Some((name, wait, _)) = &heir {
@@ -451,9 +679,29 @@ pub fn render(input: &KitInput) -> String {
             .join(", ");
         format!("Recovery friends set up: {names}.")
     };
-    let _ = write!(
-        html,
-        r#"<section class="page">
+    let heir_situation = heir.as_ref().map_or_else(String::new, |(name, wait, _)| {
+        format!(
+            r#"<div class="box situation ok"><div class="letter">{letter}</div><div><h3>You are {name}, the named heir</h3><p>Your own key opens the vault once its coins have not moved for {wait}. You need nothing else from the owner. If you also have the owner's devices, situation A is faster.</p></div></div>
+"#,
+            letter = if has_yubikey { "H" } else { "E" },
+            name = esc(name),
+        )
+    });
+    if has_yubikey {
+        let _ = write!(
+            html,
+            r#"<section class="page">
+<div class="label">2 · Which situation are you in?</div>
+<h2>Count the keys you still have</h2>
+<p class="big">Two keys open the vault today. Find the picture that matches what you have, then go to its steps in section 4.</p>
+{situations}</section>
+"#,
+            situations = yubikey_situations(&phone_wait, &hww_wait, &friends_line, &heir_situation),
+        );
+    } else {
+        let _ = write!(
+            html,
+            r#"<section class="page">
 <div class="label">2 · Which situation are you in?</div>
 <h2>Find your situation, then go to its steps</h2>
 <div class="box situation"><div class="letter">A</div><div><h3>You have the phone and the hardware wallet</h3><p>The fastest case. Everything in the vault can be moved today. Savings locks open on their dates.</p><p class="note">You also need the phone's unlock code and the hardware wallet's PIN. Section 5 says where they are kept.</p></div></div>
@@ -462,12 +710,8 @@ pub fn render(input: &KitInput) -> String {
 <div class="box situation"><div class="letter">D</div><div><h3>You have neither device, but you are a recovery friend</h3><p>A recovery friend holds a personal key that can unlock the phone's cloud backup. The vault then opens after {phone_wait}. {friends_line}</p></div></div>
 {heir_situation}</section>
 "#,
-        heir_situation = heir.as_ref().map_or_else(String::new, |(name, wait, _)| format!(
-            r#"<div class="box situation ok"><div class="letter">E</div><div><h3>You are {name}, the named heir</h3><p>Your own key opens the vault once its coins have not moved for {wait}. You need nothing else from the owner. If you also have the owner's devices, situation A is faster.</p></div></div>
-"#,
-            name = esc(name),
-        )),
-    );
+        );
+    }
 
     // Page 4: timelines.
     let mut timelines = timeline(
@@ -475,7 +719,15 @@ pub fn render(input: &KitInput) -> String {
         "#1f5f8b",
         "Coins last moved",
         &[
-            ("Any day".to_owned(), "Both keys".to_owned()),
+            (
+                "Any day".to_owned(),
+                if has_yubikey {
+                    "Any two keys"
+                } else {
+                    "Both keys"
+                }
+                .to_owned(),
+            ),
             (
                 format!("{} later", capitalize(&phone_wait)),
                 "Phone alone".to_owned(),
@@ -492,7 +744,15 @@ pub fn render(input: &KitInput) -> String {
     for lock in &input.savings {
         let unlock = i64::from(lock.unlock);
         let mut stops = vec![
-            (date(unlock), "Both keys".to_owned()),
+            (
+                date(unlock),
+                if lock.yubikey {
+                    "Any two keys"
+                } else {
+                    "Both keys"
+                }
+                .to_owned(),
+            ),
             (
                 date(unlock + i64::from(SAVINGS_PHONE_RECOVERY_SECS)),
                 "Phone alone".to_owned(),
@@ -543,18 +803,23 @@ pub fn render(input: &KitInput) -> String {
     );
 
     // Page 5: steps.
-    let _ = write!(
-        html,
-        r#"<section class="page">
-<div class="label">4 · Step by step</div>
-<h2>What to do, in order</h2>
-<div class="box ok"><h3>Before anything else</h3><ol class="steps">
-<li>Take your time. Nothing here expires quickly, and the bitcoin is safe while you read.</li>
-<li>If you are unsure which situation you are in, ask a technical helper to look at section 6. It only needs this kit.</li>
-<li>Never type the hardware wallet's secret words into a phone, computer or website. Nobody legitimate will ever ask for them.</li>
-<li>Prepare a new wallet of your own to receive the bitcoin. A knowledgeable friend can help with this.</li>
-</ol></div>
-<div class="box"><h3>A · Both devices</h3><ol class="steps">
+    let heir_steps = heir.as_ref().map_or_else(String::new, |(name, wait, _)| format!(
+            r#"<div class="box ok"><h3>{letter} · {name}, the named heir</h3><ol class="steps">
+<li>Find your own key: your hardware wallet, or the secret words you were given. Only ever enter those words into your own hardware wallet or the Anzen app on your own device, never into a website or someone else's device.</li>
+<li>Open the Anzen app with your key and this kit. It shows the day your key opens: {wait} after the vault coins last moved, and a fixed date for each savings lock.</li>
+<li>Before that day, nothing can be done and nothing is lost. Put a reminder in your calendar.</li>
+<li>On that day, choose <em>Claim as heir</em> and enter the address of your own new wallet. Check it character by character.</li>
+<li>The app moves every coin your key can open. Coins in a savings lock that opens later can be claimed on their own date.</li>
+</ol><p class="note">Technical, on {name}'s own computer: <code>anzen heir restore --vault-descriptor &lt;vault descriptor&gt; --savings-descriptor &lt;each savings descriptor&gt;</code> using the descriptors in section 6, then <code>anzen heir status</code> for the dates and <code>anzen heir claim &lt;address&gt;</code> to move the coins.</p></div>
+"#,
+            name = esc(name),
+            letter = if has_yubikey { "H" } else { "E" },
+        ));
+    let situation_steps = if has_yubikey {
+        yubikey_steps(&phone_wait, &hww_wait, &heir_steps)
+    } else {
+        format!(
+            r#"<div class="box"><h3>A · Both devices</h3><ol class="steps">
 <li>Unlock the phone and open the Anzen app.</li>
 <li>Choose <em>Move everything</em> and enter your new wallet's address.</li>
 <li>Connect the hardware wallet, enter its PIN, and check that the address on its screen matches yours, character by character.</li>
@@ -575,19 +840,22 @@ pub fn render(input: &KitInput) -> String {
 <li>Use your personal recovery key to unlock it. The app shows the vault it belongs to.</li>
 <li>After {phone_wait}, move the coins to the heir's new wallet.</li>
 </ol><p class="note">Technical: <code>anzen social emergency-access &lt;backup&gt; --private-key &lt;your key&gt; &lt;address&gt;</code>.</p></div>
-{heir_steps}</section>
+{heir_steps}"#
+        )
+    };
+    let _ = write!(
+        html,
+        r#"<section class="page">
+<div class="label">4 · Step by step</div>
+<h2>What to do, in order</h2>
+<div class="box ok"><h3>Before anything else</h3><ol class="steps">
+<li>Take your time. Nothing here expires quickly, and the bitcoin is safe while you read.</li>
+<li>If you are unsure which situation you are in, ask a technical helper to look at section 6. It only needs this kit.</li>
+<li>Never type the hardware wallet's secret words into a phone, computer or website. Nobody legitimate will ever ask for them.</li>
+<li>Prepare a new wallet of your own to receive the bitcoin. A knowledgeable friend can help with this.</li>
+</ol></div>
+{situation_steps}</section>
 "#,
-        heir_steps = heir.as_ref().map_or_else(String::new, |(name, wait, _)| format!(
-            r#"<div class="box ok"><h3>E · {name}, the named heir</h3><ol class="steps">
-<li>Find your own key: your hardware wallet, or the secret words you were given. Only ever enter those words into your own hardware wallet or the Anzen app on your own device, never into a website or someone else's device.</li>
-<li>Open the Anzen app with your key and this kit. It shows the day your key opens: {wait} after the vault coins last moved, and a fixed date for each savings lock.</li>
-<li>Before that day, nothing can be done and nothing is lost. Put a reminder in your calendar.</li>
-<li>On that day, choose <em>Claim as heir</em> and enter the address of your own new wallet. Check it character by character.</li>
-<li>The app moves every coin your key can open. Coins in a savings lock that opens later can be claimed on their own date.</li>
-</ol><p class="note">Technical, on {name}'s own computer: <code>anzen heir restore --vault-descriptor &lt;vault descriptor&gt; --savings-descriptor &lt;each savings descriptor&gt;</code> using the descriptors in section 6, then <code>anzen heir status</code> for the dates and <code>anzen heir claim &lt;address&gt;</code> to move the coins.</p></div>
-"#,
-            name = esc(name),
-        )),
     );
 
     // Page 6: fill-in.
@@ -605,6 +873,11 @@ pub fn render(input: &KitInput) -> String {
         esc(&capitalize(name)),
         esc(name),
     ));
+    let yubikey_rows = if has_yubikey {
+        "<div>The YubiKey (kept apart from the hardware wallet)</div><div></div>\n<div>Where the YubiKey's PIN is written</div><div></div>\n<div>Where the YubiKey's 24 secret words are</div><div></div>\n<div>The computer used with the YubiKey</div><div></div>\n"
+    } else {
+        ""
+    };
     let _ = write!(
         html,
         r#"<section class="page">
@@ -618,7 +891,7 @@ pub fn render(input: &KitInput) -> String {
 <div>Where the phone's unlock code is written</div><div></div>
 <div>Cloud account with the backup (Apple or Google)</div><div></div>
 <div>Where the hardware wallet's secret words are</div><div></div>
-{heir_rows}{friend_rows}
+{yubikey_rows}{heir_rows}{friend_rows}
 <div>Lawyer or executor</div><div></div>
 <div>Someone technical who can help</div><div></div>
 </div>
@@ -658,13 +931,17 @@ pub fn render(input: &KitInput) -> String {
 <p class="label">Address</p><span class="mono">{vault_address}</span>
 <p class="label">Descriptor</p><span class="mono">{vault_descriptor}</span>
 <p class="note">Phone alone: {phone_blocks} blocks after confirmation. Hardware wallet alone: {hww_blocks} blocks. Recovery friends unlock the phone's encrypted backup with their OpenPGP key and then use the phone path.</p>
-{heir_details}{savings_rows}
+{yubikey_details}{heir_details}{savings_rows}
 </section>
 "#,
         vault_address = esc(&input.vault_address),
         vault_descriptor = esc(&input.vault_descriptor),
         phone_blocks = input.phone_recovery_blocks,
         hww_blocks = input.hww_recovery_blocks,
+        yubikey_details = input.yubikey.as_ref().map_or_else(String::new, |key| format!(
+            r#"<h3>YubiKey</h3><p class="label">The YubiKey's key</p><span class="mono">{}</span><p class="note">Two extra leaves let the YubiKey sign with either other key, with no delay: <code>multi_a(2,phone/&lt;4;5&gt;/*,yubikey/&lt;4;5&gt;/*)</code> and <code>multi_a(2,hww/&lt;6;7&gt;/*,yubikey/&lt;6;7&gt;/*)</code>. In savings locks the same pairs carry <code>after(unlock)</code>. The YubiKey has no leaf of its own, so it can never sign alone.</p>"#,
+            esc(key),
+        )),
         heir_details = heir.as_ref().map_or_else(String::new, |(name, _, heir)| format!(
             r#"<h3>Heir</h3><p class="label">{}'s key</p><span class="mono">{}</span><p class="note">The heir leaf is <code>and_v(v:older({}),pk(heir))</code> in the vault and <code>and_v(v:pk(heir),after(unlock + {} days))</code> in each savings lock that names the heir. The heir signs alone with the key at <code>/2/0</code> below the account key shown.</p>"#,
             esc(&capitalize(name)),
@@ -675,16 +952,21 @@ pub fn render(input: &KitInput) -> String {
     );
 
     // Page 8: glossary.
-    html.push_str(r#"<section class="page">
+    let key_row = if has_yubikey {
+        "<tr><td>Key</td><td>A device that can approve moving the bitcoin. This vault has three: the phone, the hardware wallet and the YubiKey. Any two are enough.</td></tr>\n<tr><td>YubiKey</td><td>A small USB key, used by plugging it into a computer and touching it. It has no screen, so the computer shows what it is approving, and a second key confirms the destination.</td></tr>"
+    } else {
+        "<tr><td>Key</td><td>A device that can approve moving the bitcoin. This vault has two: the phone and the hardware wallet.</td></tr>"
+    };
+    let glossary = r#"<section class="page">
 <div class="label">7 · Words used in this kit</div>
 <h2>Plain meanings</h2>
 <div class="scroll"><table>
 <tr><th>Word</th><th>What it means here</th></tr>
-<tr><td>Key</td><td>A device that can approve moving the bitcoin. This vault has two: the phone and the hardware wallet.</td></tr>
+{KEY_ROW}
 <tr><td>Hardware wallet</td><td>A small single-purpose device that keeps a key offline. It shows what it is approving on its own screen.</td></tr>
 <tr><td>PIN</td><td>The short code that unlocks the hardware wallet. Too many wrong tries erase it.</td></tr>
 <tr><td>Secret words</td><td>A list of 12 or 24 words that can rebuild a key. Whoever has them has the key. Never type them anywhere.</td></tr>
-<tr><td>Vault</td><td>Where most of the bitcoin is kept. Both keys open it at once; one key opens it after a wait.</td></tr>
+<tr><td>Vault</td><td>Where most of the bitcoin is kept. Two keys together open it at once; one key opens it after a wait.</td></tr>
 <tr><td>Savings lock</td><td>Bitcoin that nobody can move before a set date, not even the owner.</td></tr>
 <tr><td>Cloud backup</td><td>An encrypted copy of the phone key in the owner's Apple or Google account. It is useless without the hardware wallet or a recovery friend's key.</td></tr>
 <tr><td>Heir key</td><td>A key that belongs to the person named as heir. It opens the vault only after the coins have not moved for a long time.</td></tr>
@@ -693,7 +975,8 @@ pub fn render(input: &KitInput) -> String {
 </table></div>
 </section>
 </body></html>
-"#);
+"#;
+    html.push_str(&glossary.replace("{KEY_ROW}", key_row));
     html
 }
 
@@ -719,6 +1002,7 @@ mod tests {
                 default_deposit: true,
                 uses_earlier_phone_key: true,
                 heir: true,
+                yubikey: false,
             }],
             friends: vec![KitFriend {
                 name: Some("Alice".to_owned()),
@@ -735,6 +1019,7 @@ mod tests {
                 ),
             ],
             heir: None,
+            yubikey: None,
         }
     }
 
@@ -788,6 +1073,7 @@ mod tests {
             default_deposit: false,
             uses_earlier_phone_key: false,
             heir: false,
+            yubikey: false,
         });
         let html = render(&input);
         for expected in [
@@ -805,6 +1091,42 @@ mod tests {
             assert!(html.contains(expected), "kit is missing {expected:?}");
         }
         assert!(!html.contains("<B>"), "heir name must be escaped");
+    }
+
+    #[test]
+    fn kit_explains_three_keys_any_two_with_a_picture_per_loss() {
+        let mut input = input();
+        let two_keys = render(&input);
+        assert!(two_keys.contains("Two keys and a vault"));
+        assert!(!two_keys.contains("YubiKey"));
+        input.yubikey = Some("[abcd1234/86'/1'/100'/0/0]tpubyubikey".to_owned());
+        input.savings[0].yubikey = true;
+        let html = render(&input);
+        for expected in [
+            "Three keys, any two",
+            "ANY TWO",
+            "The phone is lost",
+            "The hardware wallet is lost",
+            "The YubiKey is lost",
+            "Only one key is left",
+            "A key was stolen",
+            "Opens today",
+            "Opens after a wait",
+            "24 secret words",
+            "new hardware wallet's screen",
+            "anzen hww yubikey-sweep",
+            "anzen phone yubikey-sweep",
+            "anzen yubikey confirm-sweep",
+            "Where the YubiKey's 24 secret words are",
+            "tpubyubikey",
+            "Any two keys",
+            "never into the phone",
+        ] {
+            assert!(html.contains(expected), "kit is missing {expected:?}");
+        }
+        assert!(!html.contains("Two keys and a vault"));
+        // Each loss case has its own picture of the keys in hand.
+        assert!(html.matches("You have: ").count() >= 5);
     }
 
     #[test]

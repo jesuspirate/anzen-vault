@@ -102,6 +102,7 @@ fn fixed_config(phone: &DeviceKeys, hww: &DeviceKeys) -> VaultConfig {
         network: "regtest".to_owned(),
         phone_vault_pubkey: phone.vault_pubkey.to_string(),
         hww_vault_pubkey: hww.vault_pubkey.to_string(),
+        yubikey_vault_pubkey: None,
         phone_hot_external_descriptor: hot_external,
         phone_hot_internal_descriptor: hot_internal,
         vault_descriptor: policy.descriptor_string(),

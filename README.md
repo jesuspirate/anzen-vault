@@ -118,6 +118,44 @@ The heir's vault clock is the coin's age, like the recovery paths: 65,535 blocks
 
 The heir never needs the owner's devices or secrets. On their own device they run `anzen heir init --name NAME` and give the owner the printed key, which the owner records with `anzen heir import --name NAME --key KEY` before `anzen init`. Later the heir rebuilds the vault from the descriptors printed in the recovery kit with `anzen heir restore --vault-descriptor D --savings-descriptor S`, checks dates with `anzen heir status`, and moves every coin their key can already open with `anzen heir claim ADDRESS`. The recovery kit gains a page that shows the heir's clock as a picture, a situation and step-by-step section for the heir, and the heir's dates on every timeline.
 
+### Adding a YubiKey as a third key
+
+An owner can add one YubiKey as an optional third key. With it, **any two of phone, hardware wallet and YubiKey** can move the coins at any time, so losing one device never means waiting. The YubiKey has no leaf of its own: it signs only together with one of the other two keys. Like the heir, it is part of the vault address, so it is added before `anzen init` (to add one to an existing vault, create a new vault with it and move the coins):
+
+```text
+vault:   tr(NUMS, { multi_a(2, phone/<0;1>, hww/<0;1>),
+                    { { multi_a(2, phone/<4;5>, yubikey/<4;5>),
+                        multi_a(2, hww/<6;7>,   yubikey/<6;7>) },
+                      recovery leaves (and the heir, if named) } })
+savings: the same pairs with after(unlock)
+```
+
+Each leaf gets its own derivation branch because a stock Ledger refuses a wallet policy that repeats a key expression. The cooperative leaf, the presigned yearly graph and the single-key recovery paths are unchanged.
+
+The YubiKey is used only on a computer, never on the phone, so a stolen phone never holds two keys; `anzen yubikey init` refuses to run where the phone's or the hardware wallet's key lives. Its key is backed up as 24 words on paper. The prototype keeps it in a software key store on that computer, standing in for the key a real YubiKey will unlock.
+
+```bash
+# On the YubiKey's computer
+anzen --data-dir yubikey yubikey init
+# On the phone, before `anzen init`
+anzen yubikey import --key "[fingerprint/86'/1'/100'/0/0]tpub..."
+# Later, on the YubiKey's computer, from the descriptors in the recovery kit
+anzen --data-dir yubikey yubikey restore --vault-descriptor "tr(...)"
+```
+
+To move the coins when a device is lost, the device you still have proposes and signs a sweep of every vault coin, and the YubiKey's computer checks it, signs it and broadcasts it:
+
+```bash
+# Hardware wallet lost: phone + YubiKey
+anzen phone yubikey-sweep NEW_VAULT_ADDRESS --output sweep.json
+# Phone lost: hardware wallet + YubiKey
+anzen hww yubikey-sweep NEW_VAULT_ADDRESS --output sweep.json
+# Either way, on the YubiKey's computer
+anzen --data-dir yubikey yubikey confirm-sweep sweep.json
+```
+
+A YubiKey has no screen. The destination should be a new vault whose address was checked on a hardware wallet's screen, and the computer re-derives everything it signs from its own copy of the vault, so a forged proposal is refused. If a hardware wallet is lost but its 24 words are safe, the simplest fix is to restore them onto a new hardware wallet and carry on with phone and hardware wallet as before. With a YubiKey, the recovery kit becomes "three keys, any two", with a picture of the keys in hand for each case: lost phone, lost hardware wallet, lost YubiKey, one key left, and theft.
+
 ### Watching the vault
 
 The delays only help if the owner hears about a move while there is still time to act. `anzen watch run` reads the chain from the owner's own Bitcoin Core node (every block since its last check, plus mempool spends through `gettxspendingprevout`) or Electrum server, and reports each transaction that touches the vault, the allowance controller or a savings lock:

@@ -402,10 +402,7 @@ pub fn estimate_vault_vsize<P: TaprootPolicy + ?Sized>(
     path: SpendPath,
 ) -> Result<u64> {
     let leaf = policy.leaf(path)?;
-    let signature_count = match path {
-        SpendPath::Cooperative => 2,
-        SpendPath::PhoneRecovery | SpendPath::HwwRecovery | SpendPath::Heir => 1,
-    };
+    let signature_count = if path.is_two_key() { 2 } else { 1 };
     let mut estimated = transaction.clone();
     for input in &mut estimated.input {
         let mut witness = Witness::new();
@@ -430,10 +427,7 @@ pub fn estimate_policy_vsize(
 ) -> Result<u64> {
     let vault_leaf = vault.leaf(vault_path)?;
     let controller_leaf = controller.leaf(controller_path)?;
-    let vault_signature_count = match vault_path {
-        SpendPath::Cooperative => 2,
-        SpendPath::PhoneRecovery | SpendPath::HwwRecovery | SpendPath::Heir => 1,
-    };
+    let vault_signature_count = if vault_path.is_two_key() { 2 } else { 1 };
     let mut estimated = transaction.clone();
     let vault_indexes = vault_input_indexes.iter().copied().collect::<BTreeSet<_>>();
     let controller_indexes = controller_input_indexes

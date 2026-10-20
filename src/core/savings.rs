@@ -31,6 +31,9 @@ pub struct SavingsLock {
     /// the life of the lock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heir_vault_pubkey: Option<String>,
+    /// The owner's YubiKey when the lock was created, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yubikey_vault_pubkey: Option<String>,
     pub address: String,
     /// Recurring deposits go here by default.
     #[serde(default)]
@@ -44,6 +47,7 @@ impl SavingsLock {
             phone_vault_pubkey: config.phone_vault_pubkey.clone(),
             hww_vault_pubkey: config.hww_vault_pubkey.clone(),
             heir_vault_pubkey: config.heir.as_ref().map(|heir| heir.vault_pubkey.clone()),
+            yubikey_vault_pubkey: config.yubikey_vault_pubkey.clone(),
             address: String::new(),
             default_deposit: false,
         };
@@ -55,13 +59,18 @@ impl SavingsLock {
     }
 
     fn build_policy(&self, network: Network) -> Result<SavingsPolicy> {
-        SavingsPolicy::with_heir(
-            crate::core::keys::VaultKey::from_str(&self.phone_vault_pubkey)?,
-            crate::core::keys::VaultKey::from_str(&self.hww_vault_pubkey)?,
-            self.heir_vault_pubkey
-                .as_deref()
+        let key = |text: &Option<String>| {
+            text.as_deref()
                 .map(crate::core::keys::VaultKey::from_str)
-                .transpose()?,
+                .transpose()
+        };
+        SavingsPolicy::build(
+            &crate::core::policy::PolicyKeys {
+                phone: crate::core::keys::VaultKey::from_str(&self.phone_vault_pubkey)?,
+                hww: crate::core::keys::VaultKey::from_str(&self.hww_vault_pubkey)?,
+                yubikey: key(&self.yubikey_vault_pubkey)?,
+                heir: key(&self.heir_vault_pubkey)?,
+            },
             self.unlock,
             network,
         )

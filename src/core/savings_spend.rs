@@ -80,7 +80,9 @@ pub fn ready_lock_time(policy: &SavingsPolicy, path: SpendPath, median_time: u64
     if median_time <= u64::from(lock_time) {
         let days = (u64::from(lock_time) - median_time).div_ceil(86_400);
         let what = match path {
-            SpendPath::Cooperative => "this savings lock opens",
+            SpendPath::Cooperative | SpendPath::PhoneYubikey | SpendPath::HwwYubikey => {
+                "this savings lock opens"
+            }
             SpendPath::PhoneRecovery => "phone-only recovery of this savings lock opens",
             SpendPath::HwwRecovery => "HWW-only recovery of this savings lock opens",
             SpendPath::Heir => "the heir's claim on this savings lock opens",
@@ -343,7 +345,9 @@ pub fn sign_savings_recovery(
     signer: &dyn VaultSigner,
 ) -> Result<(Transaction, SweepResult)> {
     let expected_key = match path {
-        SpendPath::Cooperative => bail!("a cooperative savings spend needs both devices"),
+        SpendPath::Cooperative | SpendPath::PhoneYubikey | SpendPath::HwwYubikey => {
+            bail!("a two-key savings spend needs two signatures")
+        }
         SpendPath::PhoneRecovery => &lock.phone_vault_pubkey,
         SpendPath::HwwRecovery => &lock.hww_vault_pubkey,
         SpendPath::Heir => lock

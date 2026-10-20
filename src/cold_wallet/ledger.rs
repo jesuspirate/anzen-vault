@@ -233,8 +233,11 @@ impl VaultSigner for LedgerHww {
         input_indexes: &[usize],
     ) -> Result<()> {
         ensure!(
-            !matches!(path, SpendPath::PhoneRecovery | SpendPath::Heir),
-            "the HWW cannot sign the phone's or the heir's recovery path"
+            !matches!(
+                path,
+                SpendPath::PhoneRecovery | SpendPath::Heir | SpendPath::PhoneYubikey
+            ),
+            "the HWW cannot sign a path that belongs to the phone, the YubiKey or the heir"
         );
         let (wallet, hmac) =
             self.registered(policy.wallet_name(), policy.descriptor(), policy.address())?;
@@ -491,7 +494,27 @@ impl Transport for LedgerTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{keys::DeviceKeys, policy::VaultPolicy};
+    use crate::core::{
+        keys::DeviceKeys,
+        policy::{PolicyKeys, VaultPolicy},
+    };
+
+    #[test]
+    fn a_yubikey_vault_gives_each_pair_its_own_branch() {
+        let secp = bitcoin::key::Secp256k1::new();
+        let [phone, hww, yubikey] = [0; 3].map(|_| DeviceKeys::generate(&secp).unwrap());
+        let keys = PolicyKeys {
+            yubikey: Some(yubikey.vault_pubkey),
+            ..PolicyKeys::new(phone.vault_pubkey, hww.vault_pubkey)
+        };
+        let vault = VaultPolicy::build(&keys, Network::Regtest).unwrap();
+        let policy = wallet_policy("Anzen vault".to_owned(), &vault.descriptor).unwrap();
+        assert_eq!(policy.keys.len(), 4);
+        assert_eq!(
+            policy.descriptor_template,
+            "tr(@3/**,{multi_a(2,@0/**,@1/**),{{multi_a(2,@0/<4;5>/*,@2/<4;5>/*),multi_a(2,@1/<6;7>/*,@2/<6;7>/*)},{and_v(v:older(61200),pk(@0/<2;3>/*)),and_v(v:older(65535),pk(@1/<2;3>/*))}}})"
+        );
+    }
 
     #[test]
     fn an_heir_vault_is_a_four_key_wallet_policy() {

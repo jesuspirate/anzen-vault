@@ -258,6 +258,7 @@ mod tests {
             network: "regtest".to_owned(),
             phone_vault_pubkey: phone.vault_pubkey.to_string(),
             hww_vault_pubkey: hww.vault_pubkey.to_string(),
+            yubikey_vault_pubkey: None,
             phone_hot_external_descriptor: String::new(),
             phone_hot_internal_descriptor: String::new(),
             vault_descriptor: String::new(),

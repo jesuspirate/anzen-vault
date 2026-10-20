@@ -20,6 +20,11 @@ pub const HEIR_PUBLIC_FILE: &str = "heir/public.json";
 /// The software stand-in for the heir's own wallet. In real use this lives with the heir.
 pub const HEIR_DEVICE_FILE: &str = "heir/device.json";
 pub const HEIR_PUBLIC_KIND: &str = "heir-public-key";
+/// The owner's optional third key. Recorded before `anzen init`, like the heir's.
+pub const YUBIKEY_PUBLIC_FILE: &str = "yubikey/public.json";
+/// The software stand-in for a YubiKey's key, kept on the computer that uses the YubiKey.
+pub const YUBIKEY_DEVICE_FILE: &str = "yubikey/device.json";
+pub const YUBIKEY_PUBLIC_KIND: &str = "yubikey-public-key";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultConfig {
@@ -44,6 +49,10 @@ pub struct VaultConfig {
     /// and savings policy from the start; see `VaultPolicy::with_heir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heir: Option<HeirConfig>,
+    /// The owner's optional third key. With it, any two of phone, HWW and YubiKey can move the
+    /// coins; see `VaultPolicy::build`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yubikey_vault_pubkey: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +78,65 @@ impl VaultConfig {
             .map(HeirConfig::parsed_vault_pubkey)
             .transpose()
     }
+
+    pub fn yubikey_key(&self) -> Result<Option<crate::core::keys::VaultKey>> {
+        self.yubikey_vault_pubkey
+            .as_deref()
+            .map(|key| crate::core::keys::VaultKey::from_str(key).context("invalid YubiKey key"))
+            .transpose()
+    }
+
+    /// Every key the vault policy is built from.
+    pub fn policy_keys(&self) -> Result<crate::core::policy::PolicyKeys> {
+        Ok(crate::core::policy::PolicyKeys {
+            phone: crate::core::keys::VaultKey::from_str(&self.phone_vault_pubkey)
+                .context("invalid configured phone key")?,
+            hww: crate::core::keys::VaultKey::from_str(&self.hww_vault_pubkey)
+                .context("invalid configured HWW key")?,
+            yubikey: self.yubikey_key()?,
+            heir: self.heir_key()?,
+        })
+    }
+
+    /// The vault's keys with a new phone key in place of the configured one, for a rotation.
+    pub fn policy_keys_with_phone(
+        &self,
+        phone: crate::core::keys::VaultKey,
+    ) -> Result<crate::core::policy::PolicyKeys> {
+        Ok(crate::core::policy::PolicyKeys {
+            phone,
+            ..self.policy_keys()?
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YubikeyPublicFile {
+    pub version: u8,
+    pub kind: String,
+    pub network: String,
+    pub vault_pubkey: String,
+}
+
+/// The YubiKey recorded for a new vault, if `yubikey/public.json` exists.
+pub fn load_yubikey(
+    data_dir: &Path,
+    network: Network,
+) -> Result<Option<crate::core::keys::VaultKey>> {
+    let path = data_dir.join(YUBIKEY_PUBLIC_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let file: YubikeyPublicFile = read_json(&path)?;
+    if file.version != 1 || file.kind != YUBIKEY_PUBLIC_KIND {
+        bail!("unsupported YubiKey public key file");
+    }
+    if parse_network_name(&file.network)? != network {
+        bail!("the YubiKey was set up for a different network than the vault");
+    }
+    Ok(Some(
+        crate::core::keys::VaultKey::from_str(&file.vault_pubkey).context("invalid YubiKey key")?,
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,7 +241,16 @@ pub fn initialize_vault_for_network(data_dir: &Path, network: Network) -> Result
     if heir_key.is_some_and(|key| key == phone.vault_pubkey || key == hww_vault_key) {
         bail!("the heir must have their own key, not one of the vault devices' keys");
     }
-    let policy = VaultPolicy::with_heir(phone.vault_pubkey, hww_vault_key, heir_key, network)?;
+    let yubikey = load_yubikey(data_dir, network)?;
+    let policy = VaultPolicy::build(
+        &crate::core::policy::PolicyKeys {
+            phone: phone.vault_pubkey,
+            hww: hww_vault_key,
+            yubikey,
+            heir: heir_key,
+        },
+        network,
+    )?;
     let (hot_external, hot_internal) = phone.hot_descriptors(&secp)?;
     let config = VaultConfig {
         version: 1,
@@ -190,10 +267,65 @@ pub fn initialize_vault_for_network(data_dir: &Path, network: Network) -> Result
         emergency_access_limit_sats: 0,
         savings_locks: Vec::new(),
         heir,
+        yubikey_vault_pubkey: yubikey.map(|key| key.to_string()),
     };
     write_json(&data_dir.join(CONFIG_FILE), &config)?;
 
     Ok(config)
+}
+
+/// A vault config rebuilt from the public descriptors in the recovery kit, for a device that
+/// holds only one key (the heir's, or the YubiKey's computer). It has no phone wallet and cannot
+/// sign for any key but its own. `heir` is copied in when the heir is the one restoring.
+pub fn restore_public_config(
+    network: Network,
+    vault_descriptor: &str,
+    savings_descriptors: &[String],
+    heir: Option<HeirConfig>,
+) -> Result<VaultConfig> {
+    use crate::core::{policy::SavingsPolicy, savings::SavingsLock};
+    let vault = VaultPolicy::from_descriptor_for_network(vault_descriptor, network)?;
+    let keys = vault.keys(network)?;
+    if let Some(heir) = &heir
+        && keys.heir.map(|key| key.to_string()) != Some(heir.vault_pubkey.clone())
+    {
+        bail!("this vault does not name this heir's key");
+    }
+    let mut savings_locks = Vec::with_capacity(savings_descriptors.len());
+    for text in savings_descriptors {
+        let policy = SavingsPolicy::from_descriptor_for_network(text, network)?;
+        let lock_keys = policy.keys();
+        if lock_keys.yubikey != keys.yubikey || lock_keys.heir != keys.heir {
+            bail!("a savings lock does not belong to this vault");
+        }
+        savings_locks.push(SavingsLock {
+            unlock: policy.unlock,
+            phone_vault_pubkey: lock_keys.phone.to_string(),
+            hww_vault_pubkey: lock_keys.hww.to_string(),
+            yubikey_vault_pubkey: lock_keys.yubikey.map(|key| key.to_string()),
+            heir_vault_pubkey: lock_keys.heir.map(|key| key.to_string()),
+            address: policy.address.to_string(),
+            default_deposit: false,
+        });
+    }
+    savings_locks.sort_by_key(|lock| lock.unlock);
+    Ok(VaultConfig {
+        version: 1,
+        network: network_name(network).to_owned(),
+        phone_vault_pubkey: keys.phone.to_string(),
+        hww_vault_pubkey: keys.hww.to_string(),
+        phone_hot_external_descriptor: String::new(),
+        phone_hot_internal_descriptor: String::new(),
+        vault_descriptor: vault.descriptor_string(),
+        vault_address: vault.address.to_string(),
+        phone_recovery_blocks: PHONE_RECOVERY_BLOCKS,
+        hww_recovery_blocks: HWW_RECOVERY_BLOCKS,
+        monthly_limit_sats: 0,
+        emergency_access_limit_sats: 0,
+        savings_locks,
+        heir,
+        yubikey_vault_pubkey: keys.yubikey.map(|key| key.to_string()),
+    })
 }
 
 /// The HWW's vault key: from its key store when the HWW is the software stand-in, otherwise

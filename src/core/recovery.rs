@@ -1,7 +1,7 @@
 use super::{
     DEFAULT_FEE_RATE_SAT_VB, HEIR_RECOVERY_BLOCKS, HWW_RECOVERY_BLOCKS, PHONE_RECOVERY_BLOCKS,
     ceremony::{PolicyPackage, Schedule, is_supported_policy_package},
-    keys::DeviceKeys,
+    keys::{DeviceKeys, VaultKey},
     policy::{SpendPath, VaultPolicy},
     signer::VaultSigner,
     social::CloudRecoveryBackup,
@@ -29,6 +29,10 @@ pub enum SweepPath {
     PhoneRecovery,
     HwwRecovery,
     Heir,
+    /// Phone and YubiKey together, when the hardware wallet is lost.
+    PhoneYubikey,
+    /// Hardware wallet and YubiKey together, when the phone is lost.
+    HwwYubikey,
 }
 
 impl SweepPath {
@@ -38,12 +42,14 @@ impl SweepPath {
             Self::PhoneRecovery => SpendPath::PhoneRecovery,
             Self::HwwRecovery => SpendPath::HwwRecovery,
             Self::Heir => SpendPath::Heir,
+            Self::PhoneYubikey => SpendPath::PhoneYubikey,
+            Self::HwwYubikey => SpendPath::HwwYubikey,
         }
     }
 
     fn sequence(self) -> Sequence {
         match self {
-            Self::Cooperative => Sequence::MAX,
+            Self::Cooperative | Self::PhoneYubikey | Self::HwwYubikey => Sequence::MAX,
             Self::PhoneRecovery => Sequence(u32::from(PHONE_RECOVERY_BLOCKS)),
             Self::HwwRecovery => Sequence(u32::from(HWW_RECOVERY_BLOCKS)),
             Self::Heir => Sequence(u32::from(HEIR_RECOVERY_BLOCKS)),
@@ -52,7 +58,7 @@ impl SweepPath {
 
     fn delay(self) -> Option<u64> {
         match self {
-            Self::Cooperative => None,
+            Self::Cooperative | Self::PhoneYubikey | Self::HwwYubikey => None,
             Self::PhoneRecovery => Some(u64::from(PHONE_RECOVERY_BLOCKS)),
             Self::HwwRecovery => Some(u64::from(HWW_RECOVERY_BLOCKS)),
             Self::Heir => Some(u64::from(HEIR_RECOVERY_BLOCKS)),
@@ -169,8 +175,8 @@ pub fn sign_recovery_sweep(
     path: SweepPath,
     signer: &dyn VaultSigner,
 ) -> Result<(Transaction, SweepResult)> {
-    if path == SweepPath::Cooperative {
-        bail!("cooperative sweeps require both device signatures");
+    if path.policy_path().is_two_key() {
+        bail!("this sweep needs two keys to sign");
     }
     signer.sign_all_vault_inputs(&mut plan.psbt, &plan.policy, path.policy_path())?;
     let transaction = finalize_vault_psbt(plan.psbt)?;
@@ -255,52 +261,216 @@ pub fn validate_cooperative_sweep(
     if package.version != 1 || package.kind != "cooperative-sweep" || !package.phone_approved {
         bail!("unsupported or unsigned cooperative sweep package");
     }
-    if package.vault_descriptor != config.vault_descriptor {
-        bail!("cooperative sweep package does not match the configured vault policy");
+    validate_sweep_psbt(
+        config,
+        SweepPath::Cooperative,
+        &SweepTerms {
+            vault_descriptor: &package.vault_descriptor,
+            destination: &package.destination,
+            psbt: &package.psbt,
+            input_count: package.input_count,
+            sent_sats: package.sent_sats,
+            fee_sats: package.fee_sats,
+        },
+    )
+}
+
+/// What a sweep proposal claims; checked against its PSBT before anyone signs.
+struct SweepTerms<'a> {
+    vault_descriptor: &'a str,
+    destination: &'a str,
+    psbt: &'a str,
+    input_count: usize,
+    sent_sats: u64,
+    fee_sats: u64,
+}
+
+/// A sweep spends only this vault's coins, all of them to one destination, at the standard fee.
+fn validate_sweep_psbt(
+    config: &VaultConfig,
+    path: SweepPath,
+    terms: &SweepTerms,
+) -> Result<(VaultPolicy, Psbt)> {
+    if terms.vault_descriptor != config.vault_descriptor {
+        bail!("the sweep does not match the configured vault policy");
     }
     let policy = VaultPolicy::from_descriptor_for_network(
         &config.vault_descriptor,
         config.bitcoin_network()?,
     )?;
     let destination =
-        Address::from_str(&package.destination)?.require_network(config.bitcoin_network()?)?;
-    let psbt = Psbt::from_str(&package.psbt).context("invalid cooperative sweep PSBT")?;
+        Address::from_str(terms.destination)?.require_network(config.bitcoin_network()?)?;
+    let psbt = Psbt::from_str(terms.psbt).context("invalid sweep PSBT")?;
     let transaction = &psbt.unsigned_tx;
-    if transaction.input.len() != package.input_count
-        || psbt.inputs.len() != package.input_count
+    if transaction.input.len() != terms.input_count
+        || psbt.inputs.len() != terms.input_count
         || transaction.input.is_empty()
         || transaction
             .input
             .iter()
-            .any(|input| input.sequence != Sequence::MAX)
+            .any(|input| input.sequence != path.sequence())
+        || transaction.lock_time != absolute::LockTime::ZERO
         || transaction.output.len() != 1
         || transaction.output[0].script_pubkey != destination.script_pubkey()
-        || transaction.output[0].value.to_sat() != package.sent_sats
+        || transaction.output[0].value.to_sat() != terms.sent_sats
     {
-        bail!("cooperative sweep transaction does not match its package");
+        bail!("the sweep transaction does not match its proposal");
     }
     let vault_script = policy.address.script_pubkey();
     let input_sats = psbt.inputs.iter().try_fold(0_u64, |total, input| {
         let prevout = input
             .witness_utxo
             .as_ref()
-            .context("cooperative sweep input lacks witness UTXO")?;
+            .context("a sweep input lacks its witness UTXO")?;
         if prevout.script_pubkey != vault_script {
-            bail!("cooperative sweep input is outside the vault policy");
+            bail!("a sweep input is outside the vault policy");
         }
         total
             .checked_add(prevout.value.to_sat())
-            .context("cooperative sweep input sum overflowed")
+            .context("sweep input sum overflowed")
     })?;
     let fee_sats = input_sats
-        .checked_sub(package.sent_sats)
-        .context("cooperative sweep outputs exceed its inputs")?;
-    let expected_fee = estimate_vault_vsize(transaction, &policy, SpendPath::Cooperative)?
-        * DEFAULT_FEE_RATE_SAT_VB;
-    if fee_sats != package.fee_sats || fee_sats != expected_fee {
-        bail!("cooperative sweep fee does not match its package");
+        .checked_sub(terms.sent_sats)
+        .context("sweep outputs exceed its inputs")?;
+    let expected_fee =
+        estimate_vault_vsize(transaction, &policy, path.policy_path())? * DEFAULT_FEE_RATE_SAT_VB;
+    if fee_sats != terms.fee_sats || fee_sats != expected_fee {
+        bail!("the sweep fee does not match its proposal");
     }
     Ok((policy, psbt))
+}
+
+pub const PAIR_SWEEP_KIND: &str = "yubikey-pair-sweep";
+
+/// A sweep of every vault coin by the YubiKey and one other key, signed by that other key and
+/// waiting for the YubiKey.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairSweepPackage {
+    pub version: u8,
+    pub kind: String,
+    /// `phone-yubikey` or `hww-yubikey`.
+    pub path: SweepPath,
+    pub vault_descriptor: String,
+    pub destination: String,
+    pub psbt: String,
+    pub input_count: usize,
+    pub sent_sats: u64,
+    pub fee_sats: u64,
+}
+
+impl PairSweepPackage {
+    fn terms(&self) -> SweepTerms<'_> {
+        SweepTerms {
+            vault_descriptor: &self.vault_descriptor,
+            destination: &self.destination,
+            psbt: &self.psbt,
+            input_count: self.input_count,
+            sent_sats: self.sent_sats,
+            fee_sats: self.fee_sats,
+        }
+    }
+}
+
+/// The key that signs a YubiKey pair sweep first: the phone or the hardware wallet.
+fn pair_partner_key(config: &VaultConfig, path: SweepPath) -> Result<VaultKey> {
+    let key = match path {
+        SweepPath::PhoneYubikey => &config.phone_vault_pubkey,
+        SweepPath::HwwYubikey => &config.hww_vault_pubkey,
+        _ => bail!("only a YubiKey pair sweep can be proposed this way"),
+    };
+    VaultKey::from_str(key).context("invalid configured vault key")
+}
+
+/// Propose a sweep of every confirmed vault coin to `destination` with the YubiKey and one other
+/// key. `partner` (the phone or the hardware wallet, as `path` says) signs it here; the YubiKey
+/// finishes it with [`finalize_pair_sweep`]. No wait applies: two keys are enough at any time.
+pub fn create_pair_sweep(
+    config: &VaultConfig,
+    utxos: &[VaultUtxo],
+    path: SweepPath,
+    destination: &Address,
+    partner: &dyn VaultSigner,
+) -> Result<PairSweepPackage> {
+    if config.yubikey_key()?.is_none() {
+        bail!("this vault has no YubiKey");
+    }
+    if partner.vault_key() != pair_partner_key(config, path)? {
+        bail!("this key is not the vault's {}", partner_name(path));
+    }
+    let plan = prepare_sweep(config, utxos, 0, path, destination)?;
+    let SweepPlan {
+        policy,
+        mut psbt,
+        input_count,
+        sent_sats,
+        fee_sats,
+    } = plan;
+    partner.sign_all_vault_inputs(&mut psbt, &policy, path.policy_path())?;
+    Ok(PairSweepPackage {
+        version: 1,
+        kind: PAIR_SWEEP_KIND.to_owned(),
+        path,
+        vault_descriptor: config.vault_descriptor.clone(),
+        destination: destination.to_string(),
+        psbt: psbt.to_string(),
+        input_count,
+        sent_sats,
+        fee_sats,
+    })
+}
+
+fn partner_name(path: SweepPath) -> &'static str {
+    match path {
+        SweepPath::PhoneYubikey => "phone key",
+        _ => "hardware wallet key",
+    }
+}
+
+/// Check a YubiKey pair sweep and the partner's signature, before the YubiKey signs it.
+pub fn validate_pair_sweep(config: &VaultConfig, package: &PairSweepPackage) -> Result<()> {
+    check_pair_sweep(config, package).map(|_| ())
+}
+
+fn check_pair_sweep(
+    config: &VaultConfig,
+    package: &PairSweepPackage,
+) -> Result<(VaultPolicy, Psbt)> {
+    if package.version != 1 || package.kind != PAIR_SWEEP_KIND {
+        bail!("this is not a YubiKey sweep proposal");
+    }
+    let partner = pair_partner_key(config, package.path)?;
+    let (policy, psbt) = validate_sweep_psbt(config, package.path, &package.terms())?;
+    verify_vault_psbt_signature(&psbt, &policy, package.path.policy_path(), partner).with_context(
+        || {
+            format!(
+                "the proposal is not signed by the vault's {}",
+                partner_name(package.path)
+            )
+        },
+    )?;
+    Ok((policy, psbt))
+}
+
+/// Add the YubiKey's signature to a checked pair sweep and finish the transaction.
+pub fn finalize_pair_sweep(
+    config: &VaultConfig,
+    package: &PairSweepPackage,
+    yubikey: &dyn VaultSigner,
+) -> Result<(Transaction, SweepResult)> {
+    let expected = config.yubikey_key()?.context("this vault has no YubiKey")?;
+    if yubikey.vault_key() != expected {
+        bail!("this YubiKey is not the one the vault names");
+    }
+    let (policy, mut psbt) = check_pair_sweep(config, package)?;
+    yubikey.sign_all_vault_inputs(&mut psbt, &policy, package.path.policy_path())?;
+    let transaction = finalize_vault_psbt(psbt)?;
+    let result = SweepResult {
+        txid: transaction.compute_txid(),
+        input_count: package.input_count,
+        sent_sats: package.sent_sats,
+        fee_sats: package.fee_sats,
+    };
+    Ok((transaction, result))
 }
 
 pub fn validate_phone_rotation(
@@ -332,12 +502,9 @@ pub fn validate_phone_rotation(
     if new_phone.vault_pubkey.to_string() != package.new_phone_vault_pubkey {
         bail!("pending phone key does not match the rotation proposal");
     }
-    let hww_pubkey = crate::core::keys::VaultKey::from_str(&old_config.hww_vault_pubkey)?;
     let phone_pubkey = crate::core::keys::VaultKey::from_str(&package.new_phone_vault_pubkey)?;
-    let policy = VaultPolicy::with_heir(
-        phone_pubkey,
-        hww_pubkey,
-        old_config.heir_key()?,
+    let policy = VaultPolicy::build(
+        &old_config.policy_keys_with_phone(phone_pubkey)?,
         old_config.bitcoin_network()?,
     )?;
     if policy.descriptor_string() != package.new_vault_descriptor
@@ -371,6 +538,8 @@ pub fn rotated_config(
         network: old_config.network.clone(),
         phone_vault_pubkey: new_phone.vault_pubkey.to_string(),
         hww_vault_pubkey: old_config.hww_vault_pubkey.clone(),
+        // The YubiKey stays the same: only the phone key changes.
+        yubikey_vault_pubkey: old_config.yubikey_vault_pubkey.clone(),
         phone_hot_external_descriptor: hot_external,
         phone_hot_internal_descriptor: hot_internal,
         vault_descriptor: new_policy.descriptor_string(),
