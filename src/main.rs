@@ -1223,9 +1223,8 @@ fn phone_set_policy(
     let timestamp = now.unwrap_or_else(|| chrono::Utc::now().timestamp());
     let now = chrono::DateTime::from_timestamp(timestamp, 0)
         .with_context(|| format!("invalid policy timestamp {timestamp}"))?;
-    if let Some((leftover, _)) = hot_wallet::leftovers(data_dir, backend.as_ref())?
-        && leftover >= hot_wallet::MIN_LEFTOVER_RETURN_SATS
-    {
+    let leftover = hot_wallet::leftovers(data_dir, backend.as_ref())?.map_or(0, |(sats, _)| sats);
+    if leftover >= hot_wallet::MIN_LEFTOVER_RETURN_SATS {
         eprintln!(
             "Note: the phone holds {leftover} sats above its buffer. To fold them into the new months, cancel, run `anzen phone return-leftovers`, wait for one confirmation, then start the ceremony again."
         );
