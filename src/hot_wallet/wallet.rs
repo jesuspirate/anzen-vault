@@ -19,6 +19,9 @@ pub struct HotWallet {
     db: Connection,
 }
 
+/// Leftovers smaller than this stay on the phone: returning them would cost a fee for little.
+pub const MIN_LEFTOVER_RETURN_SATS: u64 = 10_000;
+
 impl HotWallet {
     pub fn open_or_create(data_dir: &Path) -> Result<Self> {
         let keys = load_device_keys(data_dir, PHONE_DEVICE_FILE)?;
@@ -282,6 +285,40 @@ impl HotWallet {
         let fee_sats = self.wallet.calculate_fee(&transaction)?.to_sat();
         self.wallet.persist(&mut self.db)?;
         Ok((transaction, fee_sats))
+    }
+
+    pub fn spendable_sats(&self) -> u64 {
+        self.wallet.balance().trusted_spendable().to_sat()
+    }
+
+    /// Send every spendable sat above `keep_sats` back to `vault_script`. The fee comes out of
+    /// the part that stays on the phone, so the vault receives exactly the leftover. Returns the
+    /// transaction, the amount returned and the fee, or `None` when there is nothing worth
+    /// returning.
+    pub fn build_leftover_return(
+        &mut self,
+        keep_sats: u64,
+        vault_script: ScriptBuf,
+    ) -> Result<Option<(Transaction, u64, u64)>> {
+        let spendable = self.spendable_sats();
+        let leftover = spendable.saturating_sub(keep_sats);
+        if leftover < MIN_LEFTOVER_RETURN_SATS {
+            return Ok(None);
+        }
+        let mut builder = self.wallet.build_tx();
+        builder
+            .add_recipient(vault_script, Amount::from_sat(leftover))
+            .fee_rate(FeeRate::from_sat_per_vb(1).expect("1 sat/vB is valid"));
+        let mut psbt = builder
+            .finish()
+            .context("the amount kept on the phone must also cover the fee")?;
+        if !self.wallet.sign(&mut psbt, SignOptions::default())? {
+            anyhow::bail!("BDK could not finalize the leftover return");
+        }
+        let transaction = psbt.extract_tx()?;
+        let fee_sats = self.wallet.calculate_fee(&transaction)?.to_sat();
+        self.wallet.persist(&mut self.db)?;
+        Ok(Some((transaction, leftover, fee_sats)))
     }
 
     /// Move all currently spendable hot coins to the replacement phone. Immature coinbase
