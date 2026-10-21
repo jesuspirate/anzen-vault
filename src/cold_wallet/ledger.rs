@@ -31,7 +31,10 @@ use std::{
     net::TcpStream,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use zeroize::Zeroizing;
 
@@ -349,8 +352,26 @@ struct LedgerDevice {
     client: BitcoinClient<LedgerTransport>,
 }
 
+/// Whether this process holds a Ledger connection. macOS refuses a second USB connection to the
+/// same device, so the emulator path refuses one too, keeping the tests honest.
+static CONNECTED: AtomicBool = AtomicBool::new(false);
+
+impl Drop for LedgerDevice {
+    fn drop(&mut self) {
+        CONNECTED.store(false, Ordering::SeqCst);
+    }
+}
+
 impl LedgerDevice {
     fn connect() -> Result<Self> {
+        ensure!(
+            !CONNECTED.swap(true, Ordering::SeqCst),
+            "Anzen opened the Ledger twice; this is a bug, please report it"
+        );
+        Self::open_transport().inspect_err(|_| CONNECTED.store(false, Ordering::SeqCst))
+    }
+
+    fn open_transport() -> Result<Self> {
         let transport = match std::env::var(LEDGER_TRANSPORT_ENV) {
             Ok(value) if value.starts_with("tcp:") => {
                 LedgerTransport::tcp(value.trim_start_matches("tcp:"))?

@@ -178,6 +178,21 @@ fn approve_policy_for_config(
     config: &VaultConfig,
     batch_dir: &Path,
 ) -> Result<BatchManifest> {
+    let hww = load_hww(data_dir)?;
+    if hww.vault_key().to_string() != config.hww_vault_pubkey {
+        anyhow::bail!("HWW key does not match the configured vault policy");
+    }
+    approve_batch(data_dir, config, batch_dir, &*hww)
+}
+
+/// One connection signs the whole ceremony, renewal included: a USB Ledger cannot be opened a
+/// second time while the first connection is alive.
+fn approve_batch(
+    data_dir: &Path,
+    config: &VaultConfig,
+    batch_dir: &Path,
+    hww: &dyn VaultSigner,
+) -> Result<BatchManifest> {
     let mut manifest = ceremony::load_manifest(batch_dir)?;
     let policy = ceremony::validate_batch(config, &manifest, batch_dir)?;
     // The months' dates are absolute, so a proposal dated in the past would unlock them early.
@@ -198,10 +213,6 @@ fn approve_policy_for_config(
         crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)?,
         config.bitcoin_network()?,
     )?;
-    let hww = load_hww(data_dir)?;
-    if hww.vault_key().to_string() != config.hww_vault_pubkey {
-        anyhow::bail!("HWW key does not match the configured vault policy");
-    }
 
     for transaction in ceremony::manifest_transactions(&manifest) {
         let path = batch_dir.join(&transaction.psbt_file);
@@ -240,7 +251,12 @@ fn approve_policy_for_config(
     record_approved_rungs(data_dir, &ladder::entries_from_manifest(&manifest)?)?;
     // The parent validation above already checked that the renewal spends this epoch's remainder.
     if manifest.has_presigned_renewal {
-        approve_policy_for_config(data_dir, config, &batch_dir.join(ceremony::NEXT_BATCH_DIR))?;
+        approve_batch(
+            data_dir,
+            config,
+            &batch_dir.join(ceremony::NEXT_BATCH_DIR),
+            hww,
+        )?;
     }
     Ok(manifest)
 }
