@@ -11,6 +11,7 @@ pub mod fees;
 pub mod health;
 pub mod keys;
 pub mod kit;
+pub mod ladder;
 pub mod policy;
 pub mod recovery;
 pub mod savings;

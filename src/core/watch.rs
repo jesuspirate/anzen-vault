@@ -17,7 +17,7 @@ use super::{
     PHONE_RECOVERY_BLOCKS,
     ceremony::{BatchManifest, SCHEDULE_FILE, Schedule},
     chain::{Blockchain, WatchActivity, WatchBaseline, WatchCursor},
-    policy::{ControllerPolicy, SavingsPolicy, SpendPath, VaultPolicy},
+    policy::{ControllerPolicy, RungPolicy, SavingsPolicy, SpendPath, VaultPolicy},
     savings::CEREMONY_WARNING_BLOCKS,
     storage::{VaultConfig, parse_network_name, read_json, validate_supported_network, write_json},
     types::VaultUtxo,
@@ -56,7 +56,8 @@ pub enum KnownKind {
     Rollover,
     /// The presigned second-year rollover.
     Renewal,
-    /// A monthly allowance release.
+    /// A monthly allowance release from the presigned chain that the ladder replaced. Kept so
+    /// older watch plans still load.
     Allowance { step: u8 },
     /// Starts the one-week emergency withdrawal.
     EmergencyTrigger,
@@ -83,6 +84,10 @@ pub struct WatchPackage {
     pub savings_descriptors: Vec<String>,
     #[serde(default)]
     pub known: Vec<KnownTransaction>,
+    /// Unlock dates of the allowance months still in play. Their addresses follow from the vault
+    /// keys, so the dates are all the watcher needs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowance_unlocks: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -101,10 +106,6 @@ pub fn known_from_manifest(manifest: &BatchManifest, renewal: bool) -> Vec<Known
             KnownKind::Rollover
         },
     }];
-    known.extend(manifest.allowances.iter().map(|step| KnownTransaction {
-        txid: step.authorization.unsigned_txid.clone(),
-        kind: KnownKind::Allowance { step: step.step },
-    }));
     if let Some(emergency) = &manifest.emergency_access {
         known.push(KnownTransaction {
             txid: emergency.trigger.unsigned_txid.clone(),
@@ -142,12 +143,6 @@ fn known_from_schedule(schedule: &Schedule) -> Vec<KnownTransaction> {
         txid: schedule.rollover_txid.clone(),
         kind: KnownKind::Rollover,
     }];
-    for entry in schedule.entries.iter().chain(&schedule.previous_entries) {
-        known.push(KnownTransaction {
-            txid: entry.authorization_txid.clone(),
-            kind: KnownKind::Allowance { step: entry.step },
-        });
-    }
     if let Some(emergency) = &schedule.emergency_access {
         known.push(KnownTransaction {
             txid: emergency.trigger_txid.clone(),
@@ -182,8 +177,17 @@ impl WatchPackage {
         }
         // Vaults activated before the plan file existed still have their schedule.
         let schedule_path = data_dir.join(SCHEDULE_FILE);
+        let mut allowance_unlocks = Vec::new();
         if schedule_path.is_file() {
-            known.extend(known_from_schedule(&read_json::<Schedule>(&schedule_path)?));
+            let schedule = read_json::<Schedule>(&schedule_path)?;
+            known.extend(known_from_schedule(&schedule));
+            allowance_unlocks.extend(
+                schedule
+                    .previous_entries
+                    .iter()
+                    .chain(&schedule.entries)
+                    .map(|entry| entry.unlock),
+            );
         }
         let mut txids = HashSet::new();
         known.retain(|entry| txids.insert(entry.txid.clone()));
@@ -195,6 +199,7 @@ impl WatchPackage {
             controller_address: controller.address.to_string(),
             savings_descriptors,
             known,
+            allowance_unlocks,
         };
         WatchTargets::new(&package)?;
         Ok(package)
@@ -214,6 +219,10 @@ pub enum Pot {
     Savings {
         unlock: u32,
     },
+    /// One month of the allowance ladder.
+    Allowance {
+        unlock: u32,
+    },
 }
 
 /// A watch plan, parsed and checked.
@@ -222,6 +231,7 @@ pub struct WatchTargets {
     vault: VaultPolicy,
     controller_script: ScriptBuf,
     savings: Vec<SavingsPolicy>,
+    allowance: Vec<RungPolicy>,
     known: HashMap<Txid, KnownKind>,
 }
 
@@ -234,9 +244,15 @@ impl WatchTargets {
         validate_supported_network(network)?;
         let vault = VaultPolicy::from_descriptor_for_network(&package.vault_descriptor, network)
             .context("the watch plan's vault descriptor is not an Anzen vault")?;
-        vault
+        let keys = vault
             .keys(network)
             .context("the watch plan's vault descriptor is not an Anzen vault")?;
+        let allowance = package
+            .allowance_unlocks
+            .iter()
+            .map(|unlock| RungPolicy::new_for_network(keys.phone, keys.hww, *unlock, network))
+            .collect::<Result<Vec<_>>>()
+            .context("an allowance month in the watch plan is invalid")?;
         let controller_script = Address::from_str(&package.controller_address)
             .context("invalid controller address in the watch plan")?
             .require_network(network)?
@@ -258,6 +274,7 @@ impl WatchTargets {
             vault,
             controller_script,
             savings,
+            allowance,
             known,
         })
     }
@@ -268,6 +285,11 @@ impl WatchTargets {
             self.controller_script.clone(),
         ];
         scripts.extend(self.savings.iter().map(|lock| lock.address.script_pubkey()));
+        scripts.extend(
+            self.allowance
+                .iter()
+                .map(|rung| rung.address.script_pubkey()),
+        );
         scripts
     }
 
@@ -286,12 +308,20 @@ impl WatchTargets {
             Some(Pot::Vault)
         } else if script == self.controller_script.as_script() {
             Some(Pot::Controller)
+        } else if let Some(lock) = self
+            .savings
+            .iter()
+            .find(|lock| script == lock.address.script_pubkey().as_script())
+        {
+            Some(Pot::Savings {
+                unlock: lock.unlock,
+            })
         } else {
-            self.savings
+            self.allowance
                 .iter()
-                .find(|lock| script == lock.address.script_pubkey().as_script())
-                .map(|lock| Pot::Savings {
-                    unlock: lock.unlock,
+                .find(|rung| script == rung.address.script_pubkey().as_script())
+                .map(|rung| Pot::Allowance {
+                    unlock: rung.unlock,
                 })
         }
     }
@@ -316,6 +346,12 @@ impl WatchTargets {
                     Some(lock) => lock.leaf(*path),
                     None => return false,
                 },
+                Pot::Allowance { unlock } => {
+                    match self.allowance.iter().find(|r| r.unlock == unlock) {
+                        Some(rung) => rung.leaf(*path),
+                        None => return false,
+                    }
+                }
                 Pot::Controller => return false,
             };
             leaf.is_ok_and(|leaf| leaf.script.as_script() == script)
@@ -515,7 +551,7 @@ fn apply_baseline(
     let watched = |coin: &VaultUtxo| {
         matches!(
             targets.pot(&coin.txout.script_pubkey),
-            Some(Pot::Vault | Pot::Savings { .. })
+            Some(Pot::Vault | Pot::Savings { .. } | Pot::Allowance { .. })
         )
     };
     match reason {
@@ -632,8 +668,9 @@ fn date(unix: u32) -> String {
 fn pot_name(pot: Pot) -> String {
     match pot {
         Pot::Vault => "Vault".to_owned(),
-        Pot::Controller => "Allowance".to_owned(),
+        Pot::Controller => "Emergency access".to_owned(),
         Pot::Savings { unlock } => format!("Savings until {}", date(unlock)),
+        Pot::Allowance { unlock } => format!("Allowance month of {}", date(unlock)),
     }
 }
 
@@ -651,6 +688,8 @@ fn describe(
         .sum::<u64>();
     let mut event = if let Some(kind) = targets.known.get(&txid) {
         describe_known(*kind)
+    } else if let Some(event) = describe_allowance_spend(targets, transaction, spent) {
+        event
     } else if let Some(event) = describe_spend(targets, spent) {
         event
     } else if !spent.is_empty() {
@@ -703,6 +742,72 @@ fn describe_known(kind: KnownKind) -> WatchEvent {
              not expect this, move your remaining coins with your hardware wallet.",
         ),
     }
+}
+
+/// A spend of allowance months only: a claim, a return to the vault or a hardware-wallet rescue.
+fn describe_allowance_spend(
+    targets: &WatchTargets,
+    transaction: &Transaction,
+    spent: &[(&bitcoin::TxIn, VaultUtxo)],
+) -> Option<WatchEvent> {
+    let mut paths = Vec::new();
+    for (input, coin) in spent {
+        let pot @ Pot::Allowance { .. } = targets.pot(&coin.txout.script_pubkey)? else {
+            return None;
+        };
+        paths.push(targets.spend_path(pot, input));
+    }
+    let months = paths.len();
+    if months == 0 {
+        return None;
+    }
+    let to_vault = transaction
+        .output
+        .iter()
+        .all(|output| targets.pot(&output.script_pubkey) == Some(Pot::Vault));
+    let plural = if months == 1 { "" } else { "s" };
+    Some(
+        if paths
+            .iter()
+            .all(|path| *path == Some(SpendPath::HwwRecovery))
+        {
+            WatchEvent::new(
+                Level::Notice,
+                format!("{months} allowance month{plural} moved by the hardware wallet"),
+                "Your hardware wallet pulled allowance months back, which is what the panic button \
+             does. If that was not you, someone has your hardware wallet: move your remaining \
+             coins with your phone.",
+            )
+        } else if paths
+            .iter()
+            .all(|path| *path == Some(SpendPath::PhoneRecovery))
+            && to_vault
+        {
+            WatchEvent::new(
+                Level::Info,
+                format!("{months} unused allowance month{plural} returned to the vault"),
+                "Your phone sent months you did not use back into the vault. Nothing to do.",
+            )
+        } else if paths
+            .iter()
+            .all(|path| *path == Some(SpendPath::PhoneRecovery))
+        {
+            WatchEvent::new(
+                Level::Notice,
+                "Allowance month claimed",
+                "Your phone took this month's allowance. If you did not do this, someone has your \
+             phone: pull the remaining months back with your hardware wallet, \
+             `anzen hww revoke-policy <vault address>`.",
+            )
+        } else {
+            WatchEvent::new(
+                Level::Alert,
+                "Allowance months moved in an unknown way",
+                "The watcher does not recognise how these allowance months were spent. Check your \
+             vault now.",
+            )
+        },
+    )
 }
 
 /// A spend of vault or savings coins that is not in the plan, judged by the leaf it used.
@@ -919,6 +1024,7 @@ mod tests {
     };
 
     const UNLOCK: u32 = 1_924_992_000; // 2031-01-01
+    const ALLOWANCE_UNLOCK: u32 = 1_800_000_000; // 2027-01-15
 
     struct Fixture {
         package: WatchPackage,
@@ -926,6 +1032,7 @@ mod tests {
         savings: SavingsPolicy,
         controller: ScriptBuf,
         trigger: Txid,
+        rung: RungPolicy,
     }
 
     fn fixture() -> Fixture {
@@ -966,6 +1073,7 @@ mod tests {
                 txid: trigger.to_string(),
                 kind: KnownKind::EmergencyTrigger,
             }],
+            allowance_unlocks: vec![ALLOWANCE_UNLOCK],
         };
         Fixture {
             package,
@@ -973,6 +1081,13 @@ mod tests {
             savings,
             controller: controller.address.script_pubkey(),
             trigger,
+            rung: RungPolicy::new_for_network(
+                phone.vault_pubkey,
+                hww.vault_pubkey,
+                ALLOWANCE_UNLOCK,
+                Network::Regtest,
+            )
+            .unwrap(),
         }
     }
 
@@ -1058,6 +1173,42 @@ mod tests {
 
     fn vault_script(f: &Fixture) -> ScriptBuf {
         f.vault.address.script_pubkey()
+    }
+
+    #[test]
+    fn allowance_months_are_watched_and_described() {
+        let f = fixture();
+        let script = f.rung.address.script_pubkey();
+        let cases = [
+            (
+                SpendPath::PhoneRecovery,
+                ScriptBuf::new(),
+                Level::Notice,
+                "Allowance month claimed",
+            ),
+            (
+                SpendPath::PhoneRecovery,
+                vault_script(&f),
+                Level::Info,
+                "1 unused allowance month returned to the vault",
+            ),
+            (
+                SpendPath::HwwRecovery,
+                vault_script(&f),
+                Level::Notice,
+                "1 allowance month moved by the hardware wallet",
+            ),
+        ];
+        for (path, to, level, title) in cases {
+            let (targets, mut state) = state_with(&f, vec![coin(1, &script, 50)]);
+            assert!(targets.scripts().contains(&script));
+            let leaf = f.rung.leaf(path).unwrap().script;
+            let tx = spend(&[coin(1, &script, 50).outpoint], Some(&leaf), &[&to]);
+            let events = apply_activity(&targets, &mut state, activity(vec![(tx, Some(101))]));
+            assert_eq!(events.len(), 1, "{path:?}");
+            assert_eq!(events[0].level, level);
+            assert_eq!(events[0].title, title);
+        }
     }
 
     #[test]

@@ -139,6 +139,126 @@ impl TaprootPolicy for SavingsPolicy {
     }
 }
 
+impl TaprootPolicy for RungPolicy {
+    fn leaf(&self, path: SpendPath) -> Result<VaultLeaf> {
+        RungPolicy::leaf(self, path)
+    }
+
+    fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>> {
+        receive_descriptor(&self.descriptor)
+    }
+
+    fn descriptor(&self) -> &Descriptor<DescriptorPublicKey> {
+        &self.descriptor
+    }
+
+    fn address(&self) -> &Address {
+        &self.address
+    }
+
+    fn wallet_name(&self) -> String {
+        format!("Anzen month {}", format_unlock_date(self.unlock))
+    }
+}
+
+fn format_unlock_date(unlock: u32) -> String {
+    chrono::DateTime::from_timestamp(i64::from(unlock), 0)
+        .map(|time| time.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| unlock.to_string())
+}
+
+/// One month of allowance: the phone alone may spend it once `unlock` has passed, and the HWW
+/// alone may move it at any time, which is how unused or stolen months are rescued.
+///
+/// `tr(NUMS, {and_v(v:pk(phone), after(unlock)), pk(hww)})`, both keys on their recovery branch
+/// so a Ledger sees each key once with its own derivation.
+#[derive(Debug, Clone)]
+pub struct RungPolicy {
+    pub descriptor: Descriptor<DescriptorPublicKey>,
+    pub address: Address,
+    pub unlock: u32,
+    phone: VaultKey,
+    hww: VaultKey,
+}
+
+impl RungPolicy {
+    pub fn new_for_network(
+        phone: VaultKey,
+        hww: VaultKey,
+        unlock: u32,
+        network: Network,
+    ) -> Result<Self> {
+        if unlock < bitcoin::absolute::LOCK_TIME_THRESHOLD {
+            bail!("an allowance month must unlock at a Unix time, not a block height");
+        }
+        if phone.recovery() == hww.recovery() {
+            bail!("phone and HWW keys must differ");
+        }
+        let nums = nums_expression(network);
+        let phone_r = phone.branch_expression(RECOVERY_BRANCH);
+        let hww_r = hww.branch_expression(RECOVERY_BRANCH);
+        let descriptor_text =
+            format!("tr({nums},{{and_v(v:pk({phone_r}),after({unlock})),pk({hww_r})}})");
+        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&descriptor_text)
+            .with_context(|| format!("invalid allowance descriptor: {descriptor_text}"))?;
+        let address = policy_address(&descriptor, network)?;
+        Ok(Self {
+            descriptor,
+            address,
+            unlock,
+            phone,
+            hww,
+        })
+    }
+
+    /// The earliest nLockTime a spend through `path` can use.
+    pub fn earliest_lock_time(&self, path: SpendPath) -> u32 {
+        match path {
+            SpendPath::PhoneRecovery => self.unlock,
+            _ => 0,
+        }
+    }
+
+    /// The phone's leaf is [`SpendPath::PhoneRecovery`] and the HWW's is
+    /// [`SpendPath::HwwRecovery`]; a rung has no other leaves.
+    pub fn leaf(&self, path: SpendPath) -> Result<VaultLeaf> {
+        let wanted = match path {
+            SpendPath::PhoneRecovery => self.phone.recovery(),
+            SpendPath::HwwRecovery => self.hww.recovery(),
+            other => bail!("an allowance month has no {other:?} leaf"),
+        };
+        let tr = taproot_spend(&self.descriptor)?;
+        let spend_info = tr.spend_info();
+        for (depth, miniscript) in tr.iter_scripts() {
+            let keys: Vec<XOnlyPublicKey> = miniscript
+                .iter_pk()
+                .map(|key| key.inner.x_only_public_key().0)
+                .collect();
+            if keys != [wanted] {
+                continue;
+            }
+            let script = miniscript.encode();
+            let leaf_version = LeafVersion::TapScript;
+            let leaf_hash = TapLeafHash::from_script(&script, leaf_version);
+            let control_block = spend_info
+                .control_block(&(script.clone(), leaf_version))
+                .context("allowance leaf has no Taproot control block")?;
+            return Ok(VaultLeaf {
+                path,
+                depth,
+                script,
+                leaf_hash,
+                control_block,
+            });
+        }
+        bail!("allowance descriptor does not contain the requested {path:?} leaf")
+    }
+
+    pub fn descriptor_string(&self) -> String {
+        self.descriptor.to_string()
+    }
+}
+
 impl ControllerPolicy {
     pub fn wallet_name(&self) -> String {
         "Anzen connector".to_owned()

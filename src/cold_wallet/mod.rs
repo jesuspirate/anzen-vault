@@ -6,9 +6,10 @@
 pub mod ledger;
 
 use crate::core::{
-    ceremony::{self, BatchManifest},
+    ceremony::{self, BatchManifest, ScheduleEntry},
     crypto::{self, EncryptedBlob},
     keys::DeviceKeys,
+    ladder,
     policy::{ControllerPath, ControllerPolicy, SpendPath},
     recovery::{
         self, CooperativeSweepPackage, PhoneRecoveryPackage, PhoneRotationPackage, SweepPath,
@@ -33,6 +34,9 @@ use anyhow::{Context, Result};
 use bitcoin::{Address, Network, Transaction, key::Secp256k1};
 use std::path::Path;
 use std::str::FromStr;
+
+/// How far behind this computer's clock a proposal's allowance start may be.
+const LADDER_CLOCK_TOLERANCE_SECONDS: i64 = 86_400;
 
 /// Initialize the simulated HWW. The descriptor-bound cloud backup is created after `anzen init`.
 pub fn initialize(data_dir: &Path, network: Network) -> Result<InitializedDevice> {
@@ -176,6 +180,18 @@ fn approve_policy_for_config(
 ) -> Result<BatchManifest> {
     let mut manifest = ceremony::load_manifest(batch_dir)?;
     let policy = ceremony::validate_batch(config, &manifest, batch_dir)?;
+    // The months' dates are absolute, so a proposal dated in the past would unlock them early.
+    // The HWW checks them against its own clock; a renewal's start follows from its parent.
+    // Regtest runs on mock time.
+    if manifest.renews.is_none()
+        && config.bitcoin_network()? != Network::Regtest
+        && manifest.ladder_start + LADDER_CLOCK_TOLERANCE_SECONDS < chrono::Utc::now().timestamp()
+    {
+        anyhow::bail!(
+            "this proposal's allowance months start in the past; check the phone's clock and \
+             make a new proposal"
+        );
+    }
     let phone_pubkey = crate::core::keys::VaultKey::from_str(&config.phone_vault_pubkey)?;
     let controller = ControllerPolicy::new_for_network(
         phone_pubkey,
@@ -221,6 +237,7 @@ fn approve_policy_for_config(
     }
     manifest.hww_approved = true;
     write_json(&batch_dir.join("manifest.json"), &manifest)?;
+    record_approved_rungs(data_dir, &ladder::entries_from_manifest(&manifest)?)?;
     // The parent validation above already checked that the renewal spends this epoch's remainder.
     if manifest.has_presigned_renewal {
         approve_policy_for_config(data_dir, config, &batch_dir.join(ceremony::NEXT_BATCH_DIR))?;
@@ -321,7 +338,29 @@ pub fn recover_savings(
     )
 }
 
-/// Revoke every currently live policy state with the HWW controller path.
+/// Remember the months this HWW approved, so `revoke_policy` can find them without the phone.
+fn record_approved_rungs(data_dir: &Path, entries: &[ScheduleEntry]) -> Result<()> {
+    let mut known = approved_rungs(data_dir)?;
+    for entry in entries {
+        if !known.iter().any(|known| known.outpoint == entry.outpoint) {
+            known.push(entry.clone());
+        }
+    }
+    write_json(&data_dir.join(ladder::HWW_LADDER_FILE), &known)
+}
+
+/// Every month this HWW has approved, live or not. Months approved under other keys (before a
+/// phone rotation) are included; `rescue_months` skips them.
+pub fn approved_rungs(data_dir: &Path) -> Result<Vec<ScheduleEntry>> {
+    let path = data_dir.join(ladder::HWW_LADDER_FILE);
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    read_json(&path)
+}
+
+/// Revoke the active policy with the HWW alone: spend the policy's controller outputs (the
+/// emergency access connector) to `destination`.
 ///
 /// The destination is explicit because the cold signer does not own a general-purpose wallet.
 /// It should normally be a replacement vault or another independently verified safe address.
@@ -352,6 +391,28 @@ pub fn revoke_policy(
     let indexes = (0..psbt.inputs.len()).collect::<Vec<_>>();
     hww.sign_controller_inputs(&mut psbt, &controller, ControllerPath::Hww, &indexes)?;
     finalize_vault_psbt(psbt)
+}
+
+/// Move allowance months, unlocked or not, to `destination` with the HWW alone. A hardware
+/// wallet reviews one transaction per month.
+pub fn rescue_months(
+    data_dir: &Path,
+    rungs: &[ladder::LiveRung],
+    destination: &Address,
+    fee_rate_sat_vb: u64,
+) -> Result<(Transaction, u64)> {
+    let hww = load_hww(data_dir)?;
+    let spend = ladder::build_rung_spend(
+        rungs,
+        SpendPath::HwwRecovery,
+        vec![bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: destination.script_pubkey(),
+        }],
+        fee_rate_sat_vb,
+    )?;
+    let fee_sats = spend.fee_sats;
+    Ok((ladder::sign_as_hww(spend, rungs, &*hww)?, fee_sats))
 }
 
 pub fn approve_cooperative_sweep(

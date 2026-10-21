@@ -2,8 +2,8 @@ use super::{
     CONNECTOR_VALUE_SATS, DEFAULT_FEE_RATE_SAT_VB, EMERGENCY_ACCESS_DELAY_SECONDS,
     MONTHLY_ALLOWANCE_DELAY_SECONDS, MONTHS_PER_ROLLOVER, PRESIGNED_RENEWAL_DELAY_SECONDS,
     crypto::EncryptedBlob,
-    keys::DeviceKeys,
-    policy::{ControllerPath, ControllerPolicy, SpendPath, VaultPolicy},
+    keys::{DeviceKeys, VaultKey},
+    policy::{ControllerPath, ControllerPolicy, RungPolicy, SpendPath, VaultPolicy},
     storage::{VaultConfig, read_json, write_json, write_private},
     transactions::{
         create_policy_psbt, estimate_policy_vsize, sign_controller_psbt_inputs,
@@ -29,6 +29,8 @@ use std::{
 pub const DEFAULT_BATCH_DIR: &str = "ceremony/active";
 pub const SCHEDULE_FILE: &str = "phone/schedule.json";
 pub const POLICY_PACKAGE_KIND: &str = "vault-policy";
+/// Version 6 replaced the presigned allowance chain with the allowance ladder.
+pub const MANIFEST_VERSION: u8 = 6;
 /// Subdirectory of a ceremony that holds its presigned next-epoch renewal.
 pub const NEXT_BATCH_DIR: &str = "next";
 
@@ -60,16 +62,16 @@ pub struct ConnectorState {
     pub value_sats: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AllowanceStep {
+/// One month of the allowance ladder: a rollover output the phone alone may spend after
+/// `unlock`, and the HWW alone at any time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LadderRung {
     pub step: u8,
-    pub delay_seconds: u32,
-    pub delay_sequence: u32,
-    pub chain_value_sats: u64,
-    pub hot_address: String,
-    pub connector: ConnectorState,
-    pub next_connector: Option<ConnectorState>,
-    pub authorization: BatchTransaction,
+    pub unlock: u32,
+    pub vout: u32,
+    pub value_sats: u64,
+    pub descriptor: String,
+    pub address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,14 +120,15 @@ pub struct BatchManifest {
     pub vault_input_sats: u64,
     pub controller_input_sats: u64,
     pub allowance_count: usize,
+    /// Month `n` of the ladder unlocks `n` allowance delays after this Unix time.
+    pub ladder_start: i64,
     pub rollover: BatchTransaction,
-    pub allowance_vout: Option<u32>,
+    /// Total value of the ladder's months.
     pub allowance_value_sats: u64,
     pub remainder_vout: u32,
     pub remainder_value_sats: u64,
-    pub monthly_connector_vout: Option<u32>,
     pub emergency_connector_vout: Option<u32>,
-    pub allowances: Vec<AllowanceStep>,
+    pub rungs: Vec<LadderRung>,
     #[serde(default)]
     pub emergency_access: Option<EmergencyAccessPolicy>,
     pub phone_approved: bool,
@@ -139,15 +142,6 @@ pub struct BatchManifest {
     /// Whether this ceremony also holds the next epoch's renewal in `NEXT_BATCH_DIR`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_presigned_renewal: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncryptedTransaction {
-    pub version: u8,
-    pub step: u8,
-    pub kind: TransactionKind,
-    pub txid: String,
-    pub encrypted_psbt: EncryptedBlob,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,21 +160,15 @@ pub struct EncryptedEmergencyTransaction {
     pub encrypted_psbt: EncryptedBlob,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TransactionKind {
-    Authorization,
-    Revocation,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A month of the active ladder, as the phone tracks it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleEntry {
     pub step: u8,
-    pub hot_address: String,
-    pub authorization_file: String,
-    pub authorization_txid: String,
-    pub connector: ConnectorState,
-    pub next_connector: Option<ConnectorState>,
+    pub unlock: u32,
+    pub outpoint: OutPoint,
+    pub value_sats: u64,
+    pub descriptor: String,
+    pub address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,14 +192,13 @@ pub struct Schedule {
     pub controller_address: String,
     pub connector_value_sats: u64,
     pub monthly_limit_sats: u64,
-    pub monthly_delay_seconds: u32,
     #[serde(default)]
     pub emergency_access_limit_sats: u64,
     pub entries: Vec<ScheduleEntry>,
     #[serde(default)]
     pub emergency_access: Option<EmergencyAccessSchedule>,
-    /// After a presigned renewal, the previous epoch's allowance steps. Its chain is not swept
-    /// by the renewal, so any unclaimed months stay claimable alongside the new epoch.
+    /// After a presigned renewal, the previous epoch's months. The renewal does not touch them,
+    /// so any unclaimed months stay claimable alongside the new epoch's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previous_entries: Vec<ScheduleEntry>,
 }
@@ -251,7 +238,7 @@ pub fn package_from_batch(batch_dir: &Path) -> Result<PolicyPackage> {
         None
     };
     Ok(PolicyPackage {
-        version: 5,
+        version: MANIFEST_VERSION,
         kind: POLICY_PACKAGE_KIND.to_owned(),
         manifest,
         psbts,
@@ -260,7 +247,7 @@ pub fn package_from_batch(batch_dir: &Path) -> Result<PolicyPackage> {
 }
 
 pub fn is_supported_policy_package(package: &PolicyPackage) -> bool {
-    package.version == 5 && package.kind == POLICY_PACKAGE_KIND
+    package.version == MANIFEST_VERSION && package.kind == POLICY_PACKAGE_KIND
 }
 
 pub fn materialize_policy_package(package: &PolicyPackage, batch_dir: &Path) -> Result<()> {
@@ -330,6 +317,7 @@ pub fn build_policy_proposal_with_connectors(
         controller_utxos,
         None,
         now,
+        now.timestamp(),
         limits,
         batch_dir,
         phone,
@@ -340,12 +328,16 @@ pub fn build_policy_proposal_with_connectors(
 /// Build this epoch's ceremony and, when `presigned_years` is 2, the next epoch's renewal in
 /// `NEXT_BATCH_DIR`. The renewal's rollover spends this epoch's cold remainder after
 /// `PRESIGNED_RENEWAL_DELAY_SECONDS`, so one HWW ceremony covers two years.
+///
+/// Month 1 unlocks one month after `ladder_start`, which is `now` unless months from an earlier
+/// ceremony are still waiting; then the new months follow them instead of doubling up.
 #[allow(clippy::too_many_arguments)]
 pub fn build_policy_proposal_with_renewal(
     config: &VaultConfig,
     vault_utxos: &[VaultUtxo],
     controller_utxos: &[VaultUtxo],
     now: DateTime<Utc>,
+    ladder_start: i64,
     limits: PolicyLimits,
     presigned_years: u8,
     batch_dir: &Path,
@@ -355,12 +347,16 @@ pub fn build_policy_proposal_with_renewal(
     if !(1..=2).contains(&presigned_years) {
         bail!("a ceremony can presign one or two years");
     }
+    if ladder_start < now.timestamp() {
+        bail!("allowance months cannot start before the ceremony");
+    }
     let mut manifest = build_epoch(
         config,
         vault_utxos,
         controller_utxos,
         None,
         now,
+        ladder_start,
         limits,
         batch_dir,
         phone,
@@ -386,6 +382,7 @@ pub fn build_policy_proposal_with_renewal(
         &[],
         Some(&link),
         now,
+        renewal_ladder_start(&manifest),
         limits,
         &batch_dir.join(NEXT_BATCH_DIR),
         phone,
@@ -418,6 +415,7 @@ fn build_epoch(
     controller_utxos: &[VaultUtxo],
     renewal: Option<&RenewalLink>,
     now: DateTime<Utc>,
+    ladder_start: i64,
     limits: PolicyLimits,
     batch_dir: &Path,
     phone: &DeviceKeys,
@@ -523,134 +521,74 @@ fn build_epoch(
             .context("emergency access reserve overflowed")?
     };
 
-    let monthly_delay_sequence = monthly_delay_sequence()?;
-    let (continuing_authorization_fee, final_authorization_fee) = if monthly_limit_sats == 0 {
-        (0, 0)
+    if monthly_limit_sats > 0 && monthly_limit_sats < vault_script.minimal_non_dust().to_sat() {
+        bail!("monthly limit would create a dust allowance month");
+    }
+    let rung_policies = (1..=MONTHS_PER_ROLLOVER)
+        .map(|step| rung_policy(config, rung_unlock(ladder_start, step)?))
+        .collect::<Result<Vec<_>>>()?;
+
+    // The rollover creates one output per funded month (the ladder), then the cold remainder.
+    // Fund as many months as the balance allows, latest months dropped first.
+    let connector_outputs = usize::from(emergency_access_limit_sats > 0);
+    let mut selected = None;
+    let max_count = if monthly_limit_sats > 0 {
+        MONTHS_PER_ROLLOVER
     } else {
-        if monthly_limit_sats < vault_script.minimal_non_dust().to_sat() {
-            bail!("monthly limit would create a dust hot-wallet output");
-        }
-        (
-            authorization_fee(
-                &policy,
-                &controller,
-                OutPoint::null(),
-                monthly_limit_sats,
-                monthly_delay_sequence,
-                vault_script.clone(),
-                true,
-            )?,
-            authorization_fee(
-                &policy,
-                &controller,
-                OutPoint::null(),
-                monthly_limit_sats,
-                monthly_delay_sequence,
-                vault_script.clone(),
-                false,
-            )?,
-        )
+        0
     };
-
-    // The annual rollover creates one allowance-chain output plus one cold remainder. Each
-    // relative-delayed authorization releases one allowance and creates the next chain output.
-    let mut selected_rollover = None;
-    if monthly_limit_sats > 0 {
-        for count in (1..=MONTHS_PER_ROLLOVER).rev() {
-            let allowance_value = allowance_chain_value(
-                count,
-                monthly_limit_sats,
-                continuing_authorization_fee,
-                final_authorization_fee,
-            )?;
-            let template = rollover_template(
-                input_template.clone(),
-                Some(allowance_value),
-                1,
-                vault_script.clone(),
-                controller_script.clone(),
-                true,
-                emergency_access_limit_sats > 0,
-                has_anchor,
-            );
-            let fee = estimate_policy_vsize(
-                &template,
-                &policy,
-                SpendPath::Cooperative,
-                &vault_input_indexes,
-                &controller,
-                ControllerPath::Phone,
-                &controller_input_indexes,
-            )? * DEFAULT_FEE_RATE_SAT_VB;
-            let connector_outputs = 1 + usize::from(emergency_access_limit_sats > 0);
-            let required = fee
-                .checked_add(allowance_value)
-                .and_then(|value| value.checked_add(minimum_remainder_value))
-                .and_then(|value| {
-                    value.checked_add(CONNECTOR_VALUE_SATS * connector_outputs as u64)
-                })
-                .and_then(|value| value.checked_add(anchor_sats))
-                .context("allowance rollover requirement overflowed")?;
-            if total_input_sats >= required {
-                let remainder = total_input_sats
-                    - fee
-                    - allowance_value
-                    - CONNECTOR_VALUE_SATS * connector_outputs as u64
-                    - anchor_sats;
-                selected_rollover = Some((count, allowance_value, fee, remainder));
-                break;
-            }
+    for count in (0..=max_count).rev() {
+        let template = rollover_template(
+            input_template.clone(),
+            &rung_policies[..count],
+            monthly_limit_sats,
+            1,
+            vault_script.clone(),
+            controller_script.clone(),
+            emergency_access_limit_sats > 0,
+            has_anchor,
+        );
+        let fee = estimate_policy_vsize(
+            &template,
+            &policy,
+            SpendPath::Cooperative,
+            &vault_input_indexes,
+            &controller,
+            ControllerPath::Phone,
+            &controller_input_indexes,
+        )? * DEFAULT_FEE_RATE_SAT_VB;
+        let ladder_value = monthly_limit_sats
+            .checked_mul(count as u64)
+            .context("allowance ladder value overflowed")?;
+        let spent = fee
+            .checked_add(ladder_value)
+            .and_then(|value| value.checked_add(CONNECTOR_VALUE_SATS * connector_outputs as u64))
+            .and_then(|value| value.checked_add(anchor_sats))
+            .context("allowance rollover requirement overflowed")?;
+        if let Some(remainder) = total_input_sats
+            .checked_sub(spent)
+            .filter(|remainder| *remainder >= minimum_remainder_value)
+        {
+            selected = Some((count, ladder_value, fee, remainder));
+            break;
         }
     }
-
-    let (allowance_count, allowance_value_sats, rollover_fee, remainder_value_sats) =
-        match selected_rollover {
-            Some(selected) => selected,
-            None => {
-                let template = rollover_template(
-                    input_template.clone(),
-                    None,
-                    1,
-                    vault_script.clone(),
-                    controller_script.clone(),
-                    false,
-                    emergency_access_limit_sats > 0,
-                    has_anchor,
-                );
-                let fee = estimate_policy_vsize(
-                    &template,
-                    &policy,
-                    SpendPath::Cooperative,
-                    &vault_input_indexes,
-                    &controller,
-                    ControllerPath::Phone,
-                    &controller_input_indexes,
-                )? * DEFAULT_FEE_RATE_SAT_VB;
-                let connector_outputs = usize::from(emergency_access_limit_sats > 0);
-                let remainder = total_input_sats
-                    .checked_sub(fee)
-                    .and_then(|value| {
-                        value.checked_sub(CONNECTOR_VALUE_SATS * connector_outputs as u64)
-                    })
-                    .and_then(|value| value.checked_sub(anchor_sats))
-                    .context("vault balance cannot pay the rollover fee")?;
-                (0, 0, fee, remainder)
-            }
-        };
-    if remainder_value_sats < minimum_remainder_value {
-        if emergency_access_limit_sats > 0 {
-            bail!("vault balance cannot fund the configured emergency access amount and fees");
+    let (allowance_count, allowance_value_sats, rollover_fee, remainder_value_sats) = match selected
+    {
+        Some(selected) => selected,
+        None if emergency_access_limit_sats > 0 => {
+            bail!("vault balance cannot fund the configured emergency access amount and fees")
         }
-        bail!("vault balance cannot create a non-dust rollover remainder");
-    }
+        None => bail!("vault balance cannot create a non-dust rollover remainder"),
+    };
 
     let rollover_tx = rollover_template(
         input_template,
-        (allowance_count > 0).then_some(allowance_value_sats),
+        &rung_policies[..allowance_count],
+        monthly_limit_sats,
         remainder_value_sats,
         vault_script.clone(),
         controller_script.clone(),
-        allowance_count > 0,
         emergency_access_limit_sats > 0,
         has_anchor,
     );
@@ -685,119 +623,22 @@ fn build_epoch(
     let rollover_file = "rollover.psbt".to_owned();
     write_psbt(&batch_dir.join(&rollover_file), &rollover_psbt)?;
 
-    let remainder_vout = u32::from(allowance_count > 0);
-    let monthly_connector_vout = (allowance_count > 0).then_some(remainder_vout + 1);
-    let emergency_connector_vout = (emergency_access_limit_sats > 0)
-        .then_some(remainder_vout + 1 + u32::from(allowance_count > 0));
-
-    let mut allowances = Vec::with_capacity(allowance_count);
-    let mut chain_outpoint = (allowance_count > 0).then(|| OutPoint::new(rollover_txid, 0));
-    let mut chain_txout = (allowance_count > 0).then(|| rollover_tx.output[0].clone());
-    let mut connector_state = monthly_connector_vout.map(|vout| ConnectorState {
-        outpoint: OutPoint::new(rollover_txid, vout),
-        value_sats: CONNECTOR_VALUE_SATS,
-    });
-    for index in 0..allowance_count {
-        let step = u8::try_from(index + 1).context("allowance step exceeds u8")?;
-        let has_next = index + 1 < allowance_count;
-        let hot_address = hot.next_receive_address()?;
-        let source_outpoint = chain_outpoint.context("allowance chain source is missing")?;
-        let source_txout = chain_txout
-            .take()
-            .context("allowance chain output is missing")?;
-        let source_connector = connector_state
-            .take()
-            .context("allowance connector is missing")?;
-        let authorization_fee = authorization_fee(
-            &policy,
-            &controller,
-            source_outpoint,
-            monthly_limit_sats,
-            monthly_delay_sequence,
-            hot_address.script_pubkey(),
-            has_next,
-        )?;
-        let next_chain_value = source_txout
-            .value
-            .to_sat()
-            .checked_add(CONNECTOR_VALUE_SATS)
-            .and_then(|value| {
-                if has_next {
-                    value.checked_sub(CONNECTOR_VALUE_SATS)
-                } else {
-                    Some(value)
-                }
+    let remainder_vout = u32::try_from(allowance_count)?;
+    let emergency_connector_vout = (emergency_access_limit_sats > 0).then_some(remainder_vout + 1);
+    let rungs = rung_policies[..allowance_count]
+        .iter()
+        .enumerate()
+        .map(|(index, rung)| {
+            Ok(LadderRung {
+                step: u8::try_from(index + 1)?,
+                unlock: rung.unlock,
+                vout: u32::try_from(index)?,
+                value_sats: monthly_limit_sats,
+                descriptor: rung.descriptor_string(),
+                address: rung.address.to_string(),
             })
-            .and_then(|value| value.checked_sub(monthly_limit_sats))
-            .and_then(|value| value.checked_sub(authorization_fee))
-            .context("allowance chain cannot fund its authorization")?;
-        if has_next && next_chain_value < vault_script.minimal_non_dust().to_sat() {
-            bail!("allowance authorization would create a dust chain output");
-        }
-        if !has_next && next_chain_value != 0 {
-            bail!("final allowance does not exhaust its chain output");
-        }
-        let authorization_tx = authorization_template(
-            source_outpoint,
-            source_connector.outpoint,
-            monthly_limit_sats,
-            monthly_delay_sequence,
-            hot_address.script_pubkey(),
-            has_next.then(|| (next_chain_value, vault_script.clone())),
-            controller_script.clone(),
-        );
-        let next_connector = has_next.then(|| ConnectorState {
-            outpoint: OutPoint::new(authorization_tx.compute_txid(), 2),
-            value_sats: CONNECTOR_VALUE_SATS,
-        });
-        let connector_txout = TxOut {
-            value: Amount::from_sat(CONNECTOR_VALUE_SATS),
-            script_pubkey: controller_script.clone(),
-        };
-        let mut authorization_psbt = create_policy_psbt(
-            authorization_tx.clone(),
-            &[source_txout.clone(), connector_txout],
-            &[0],
-            &[1],
-            &policy,
-            &controller,
-        )?;
-        sign_vault_psbt_inputs(
-            &mut authorization_psbt,
-            &policy,
-            SpendPath::Cooperative,
-            &phone.vault_keypair,
-            &[0],
-        )?;
-        let chain_value_sats = source_txout.value.to_sat();
-
-        let step_dir = format!("allowances/{step:02}");
-        let authorization_file = format!("{step_dir}/authorization.psbt");
-        write_psbt(&batch_dir.join(&authorization_file), &authorization_psbt)?;
-        allowances.push(AllowanceStep {
-            step,
-            delay_seconds: MONTHLY_ALLOWANCE_DELAY_SECONDS,
-            delay_sequence: monthly_delay_sequence.to_consensus_u32(),
-            chain_value_sats,
-            hot_address: hot_address.to_string(),
-            connector: source_connector,
-            next_connector: next_connector.clone(),
-            authorization: BatchTransaction {
-                psbt_file: authorization_file,
-                unsigned_txid: authorization_tx.compute_txid().to_string(),
-                fee_sats: authorization_fee,
-                vault_input_indexes: vec![0],
-                controller_input_indexes: vec![1],
-            },
-        });
-        if has_next {
-            chain_outpoint = Some(OutPoint::new(authorization_tx.compute_txid(), 1));
-            chain_txout = Some(authorization_tx.output[1].clone());
-            connector_state = next_connector;
-        } else {
-            chain_outpoint = None;
-        }
-    }
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let emergency_access = match emergency_hot_address {
         Some(hot_address) => {
@@ -827,7 +668,7 @@ fn build_epoch(
     };
 
     let manifest = BatchManifest {
-        version: 5,
+        version: MANIFEST_VERSION,
         created_at: now.timestamp(),
         network: config.network.clone(),
         vault_descriptor: config.vault_descriptor.clone(),
@@ -842,6 +683,7 @@ fn build_epoch(
         vault_input_sats,
         controller_input_sats,
         allowance_count,
+        ladder_start,
         rollover: BatchTransaction {
             psbt_file: rollover_file,
             unsigned_txid: rollover_txid.to_string(),
@@ -855,13 +697,11 @@ fn build_epoch(
                 .map(|index| *index as u32)
                 .collect(),
         },
-        allowance_vout: (allowance_count > 0).then_some(0),
         allowance_value_sats,
         remainder_vout,
         remainder_value_sats,
-        monthly_connector_vout,
         emergency_connector_vout,
-        allowances,
+        rungs,
         emergency_access,
         phone_approved: true,
         hww_approved: false,
@@ -929,7 +769,7 @@ pub fn validate_batch(
     manifest: &BatchManifest,
     batch_dir: &Path,
 ) -> Result<VaultPolicy> {
-    if manifest.version != 5 || manifest.network != config.network {
+    if manifest.version != MANIFEST_VERSION || manifest.network != config.network {
         bail!("unsupported ceremony manifest or network mismatch");
     }
     for transaction in manifest_transactions(manifest) {
@@ -945,7 +785,7 @@ pub fn validate_batch(
     }
     if (manifest.monthly_limit_sats == 0 && manifest.allowance_count != 0)
         || manifest.allowance_count > MONTHS_PER_ROLLOVER
-        || manifest.allowances.len() != manifest.allowance_count
+        || manifest.rungs.len() != manifest.allowance_count
     {
         bail!("invalid ceremony allowance count");
     }
@@ -986,9 +826,8 @@ pub fn validate_batch(
         None => Sequence::MAX,
     };
     let has_anchor = manifest.renews.is_some();
-    let expected_output_count = usize::from(manifest.allowance_count > 0)
+    let expected_output_count = manifest.allowance_count
         + 1
-        + usize::from(manifest.allowance_count > 0)
         + usize::from(manifest.emergency_access_limit_sats > 0)
         + usize::from(has_anchor);
     let expected_anchor_vout = has_anchor
@@ -1057,25 +896,18 @@ pub fn validate_batch(
         bail!("rollover does not pay the approved fixed fee rate");
     }
 
-    let has_allowances = manifest.allowance_count > 0;
-    let expected_allowance_vout = has_allowances.then_some(0);
-    let expected_remainder_vout = u32::from(has_allowances);
-    let expected_monthly_connector_vout = has_allowances.then_some(expected_remainder_vout + 1);
-    let expected_emergency_connector_vout = (manifest.emergency_access_limit_sats > 0)
-        .then_some(expected_remainder_vout + 1 + u32::from(has_allowances));
-    if manifest.allowance_vout != expected_allowance_vout
-        || manifest.remainder_vout != expected_remainder_vout
-        || manifest.monthly_connector_vout != expected_monthly_connector_vout
+    let expected_remainder_vout = u32::try_from(manifest.allowance_count)?;
+    let expected_emergency_connector_vout =
+        (manifest.emergency_access_limit_sats > 0).then_some(expected_remainder_vout + 1);
+    if manifest.remainder_vout != expected_remainder_vout
         || manifest.emergency_connector_vout != expected_emergency_connector_vout
-        || (!has_allowances && manifest.allowance_value_sats != 0)
+        || manifest.allowance_value_sats
+            != manifest
+                .monthly_limit_sats
+                .checked_mul(manifest.allowance_count as u64)
+                .context("allowance ladder value overflowed")?
     {
         bail!("rollover output indexes do not match the approved policy");
-    }
-    if has_allowances
-        && (rollover_tx.output[0].script_pubkey != vault_script
-            || rollover_tx.output[0].value.to_sat() != manifest.allowance_value_sats)
-    {
-        bail!("rollover allowance-chain output does not match its manifest");
     }
     let remainder = &rollover_tx.output[manifest.remainder_vout as usize];
     if remainder.script_pubkey != vault_script
@@ -1084,13 +916,7 @@ pub fn validate_batch(
     {
         bail!("rollover remainder does not match its manifest");
     }
-    for vout in [
-        manifest.monthly_connector_vout,
-        manifest.emergency_connector_vout,
-    ]
-    .into_iter()
-    .flatten()
-    {
+    if let Some(vout) = manifest.emergency_connector_vout {
         validate_connector_output(
             rollover_tx
                 .output
@@ -1099,8 +925,7 @@ pub fn validate_batch(
             &controller_script,
         )?;
     }
-
-    validate_allowances(config, manifest, batch_dir, &policy, &controller, &rollover)?;
+    validate_ladder(config, manifest, rollover_tx)?;
     validate_connector_emergency(config, manifest, batch_dir, &policy, &controller, &rollover)?;
     if let Some(next) = load_presigned_renewal(manifest, batch_dir)? {
         validate_batch(config, &next, &batch_dir.join(NEXT_BATCH_DIR))?;
@@ -1125,6 +950,7 @@ pub fn load_presigned_renewal(
         || next.has_presigned_renewal
         || next.network != manifest.network
         || next.monthly_limit_sats != manifest.monthly_limit_sats
+        || next.ladder_start != renewal_ladder_start(manifest)
         || next.emergency_access_limit_sats != manifest.emergency_access_limit_sats
         || next.phone_approved != manifest.phone_approved
         || next.hww_approved != manifest.hww_approved
@@ -1134,118 +960,56 @@ pub fn load_presigned_renewal(
     Ok(Some(next))
 }
 
-fn validate_allowances(
+/// Every month of the ladder must pay exactly the monthly limit to the rung policy of the
+/// configured keys, unlocking on schedule. The HWW checks this before signing the rollover.
+fn validate_ladder(
     config: &VaultConfig,
     manifest: &BatchManifest,
-    batch_dir: &Path,
-    policy: &VaultPolicy,
-    controller: &ControllerPolicy,
-    rollover: &Psbt,
+    rollover_tx: &Transaction,
 ) -> Result<()> {
-    let has_allowances = manifest.allowance_count > 0;
-    let vault_script = policy.address.script_pubkey();
-    let controller_script = controller.address.script_pubkey();
-    let mut vault_outpoint = has_allowances.then(|| {
-        OutPoint::new(
-            rollover.unsigned_tx.compute_txid(),
-            manifest.allowance_vout.unwrap(),
-        )
-    });
-    let mut vault_prevout = has_allowances.then(|| rollover.unsigned_tx.output[0].clone());
-    let mut connector = manifest.monthly_connector_vout.map(|vout| ConnectorState {
-        outpoint: OutPoint::new(rollover.unsigned_tx.compute_txid(), vout),
-        value_sats: CONNECTOR_VALUE_SATS,
-    });
-    let expected_delay = monthly_delay_sequence()?;
-
-    for (index, allowance) in manifest.allowances.iter().enumerate() {
-        let step = u8::try_from(index + 1).context("allowance step exceeds u8")?;
-        let has_next = index + 1 < manifest.allowance_count;
-        let source_outpoint = vault_outpoint.context("allowance vault outpoint is missing")?;
-        let source_prevout = vault_prevout
-            .take()
-            .context("allowance vault output is missing")?;
-        let source_connector = connector.take().context("allowance connector is missing")?;
-        if allowance.step != step
-            || allowance.delay_seconds != MONTHLY_ALLOWANCE_DELAY_SECONDS
-            || allowance.delay_sequence != expected_delay.to_consensus_u32()
-            || allowance.chain_value_sats != source_prevout.value.to_sat()
-            || allowance.connector != source_connector
+    for (index, rung) in manifest.rungs.iter().enumerate() {
+        let step = u8::try_from(index + 1).context("allowance month exceeds u8")?;
+        let policy = rung_policy(config, rung_unlock(manifest.ladder_start, step.into())?)?;
+        let output = rollover_tx
+            .output
+            .get(index)
+            .with_context(|| format!("rollover has no output for month {step}"))?;
+        if rung.step != step
+            || rung.unlock != policy.unlock
+            || rung.vout != u32::try_from(index)?
+            || rung.value_sats != manifest.monthly_limit_sats
+            || rung.descriptor != policy.descriptor_string()
+            || rung.address != policy.address.to_string()
+            || output.script_pubkey != policy.address.script_pubkey()
+            || output.value.to_sat() != manifest.monthly_limit_sats
         {
-            bail!("allowance step {step} metadata violates the approved policy");
-        }
-        let hot_script = Address::from_str(&allowance.hot_address)?
-            .require_network(config.bitcoin_network()?)?
-            .script_pubkey();
-        let psbt = read_psbt(&batch_dir.join(&allowance.authorization.psbt_file))?;
-        validate_connector_child(
-            &psbt,
-            &source_prevout,
-            source_outpoint,
-            source_connector.outpoint,
-            &controller_script,
-            &allowance.authorization,
-        )?;
-        let tx = &psbt.unsigned_tx;
-        if tx.version != Version::TWO
-            || tx.lock_time != absolute::LockTime::ZERO
-            || tx.input[0].sequence != expected_delay
-            || tx.input[1].sequence != Sequence::ENABLE_RBF_NO_LOCKTIME
-            || tx.output.len() != if has_next { 3 } else { 1 }
-            || tx.output[0].script_pubkey != hot_script
-            || tx.output[0].value.to_sat() != manifest.monthly_limit_sats
-        {
-            bail!("allowance authorization step {step} violates the approved policy");
-        }
-        if has_next {
-            let next_value = source_prevout
-                .value
-                .to_sat()
-                .checked_sub(manifest.monthly_limit_sats)
-                .and_then(|value| value.checked_sub(allowance.authorization.fee_sats))
-                .context("allowance authorization exceeds its vault input")?;
-            if tx.output[1].script_pubkey != vault_script
-                || tx.output[1].value.to_sat() != next_value
-                || next_value < vault_script.minimal_non_dust().to_sat()
-            {
-                bail!("allowance step {step} does not create the approved next vault hop");
-            }
-            validate_connector_output(&tx.output[2], &controller_script)?;
-            let expected_next_connector = ConnectorState {
-                outpoint: OutPoint::new(tx.compute_txid(), 2),
-                value_sats: CONNECTOR_VALUE_SATS,
-            };
-            if allowance.next_connector.as_ref() != Some(&expected_next_connector) {
-                bail!("allowance step {step} connector metadata is discontinuous");
-            }
-            vault_outpoint = Some(OutPoint::new(tx.compute_txid(), 1));
-            vault_prevout = Some(tx.output[1].clone());
-            connector = Some(expected_next_connector);
-        } else if source_prevout
-            .value
-            .to_sat()
-            .checked_add(CONNECTOR_VALUE_SATS)
-            != manifest
-                .monthly_limit_sats
-                .checked_add(allowance.authorization.fee_sats)
-            || allowance.next_connector.is_some()
-        {
-            bail!("final allowance does not consume its connector without creating another");
-        }
-        let expected_fee = estimate_policy_vsize(
-            tx,
-            policy,
-            SpendPath::Cooperative,
-            &[0],
-            controller,
-            ControllerPath::Phone,
-            &[1],
-        )? * DEFAULT_FEE_RATE_SAT_VB;
-        if allowance.authorization.fee_sats != expected_fee {
-            bail!("allowance transaction does not pay the approved fixed fee rate");
+            bail!("allowance month {step} violates the approved policy");
         }
     }
     Ok(())
+}
+
+/// The policy of the allowance month that unlocks at `unlock`, for this vault's keys.
+pub fn rung_policy(config: &VaultConfig, unlock: u32) -> Result<RungPolicy> {
+    RungPolicy::new_for_network(
+        VaultKey::from_str(&config.phone_vault_pubkey).context("invalid phone vault key")?,
+        VaultKey::from_str(&config.hww_vault_pubkey).context("invalid HWW vault key")?,
+        unlock,
+        config.bitcoin_network()?,
+    )
+}
+
+/// When month `step` of a ladder that starts at `ladder_start` unlocks.
+pub fn rung_unlock(ladder_start: i64, step: usize) -> Result<u32> {
+    let offset = i64::from(MONTHLY_ALLOWANCE_DELAY_SECONDS)
+        .checked_mul(i64::try_from(step)?)
+        .context("allowance month offset overflowed")?;
+    u32::try_from(ladder_start + offset).context("allowance month unlocks outside Unix time")
+}
+
+/// A presigned renewal's ladder continues where the renewed epoch's ends.
+fn renewal_ladder_start(parent: &BatchManifest) -> i64 {
+    parent.ladder_start + i64::from(PRESIGNED_RENEWAL_DELAY_SECONDS)
 }
 
 fn validate_connector_emergency(
@@ -1742,101 +1506,32 @@ fn emergency_withdrawal_template(
     }
 }
 
-fn authorization_fee(
-    policy: &VaultPolicy,
-    controller: &ControllerPolicy,
-    outpoint: OutPoint,
-    monthly_limit: u64,
-    delay_sequence: Sequence,
-    hot_script: ScriptBuf,
-    has_next: bool,
-) -> Result<u64> {
-    let template = authorization_template(
-        outpoint,
-        OutPoint::null(),
-        monthly_limit,
-        delay_sequence,
-        hot_script,
-        has_next.then(|| (1, policy.address.script_pubkey())),
-        controller.address.script_pubkey(),
-    );
-    Ok(estimate_policy_vsize(
-        &template,
-        policy,
-        SpendPath::Cooperative,
-        &[0],
-        controller,
-        ControllerPath::Phone,
-        &[1],
-    )? * DEFAULT_FEE_RATE_SAT_VB)
-}
-
-fn authorization_template(
-    vault_outpoint: OutPoint,
-    connector_outpoint: OutPoint,
-    monthly_limit: u64,
-    delay_sequence: Sequence,
-    hot_script: ScriptBuf,
-    next_chain: Option<(u64, ScriptBuf)>,
-    controller_script: ScriptBuf,
-) -> Transaction {
-    let mut output = vec![TxOut {
-        value: Amount::from_sat(monthly_limit),
-        script_pubkey: hot_script,
-    }];
-    if let Some((value, script_pubkey)) = next_chain {
-        output.push(TxOut {
-            value: Amount::from_sat(value),
-            script_pubkey,
-        });
-        output.push(TxOut {
-            value: Amount::from_sat(CONNECTOR_VALUE_SATS),
-            script_pubkey: controller_script,
-        });
-    }
-    Transaction {
-        version: Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![
-            vault_input(vault_outpoint, delay_sequence),
-            vault_input(connector_outpoint, Sequence::ENABLE_RBF_NO_LOCKTIME),
-        ],
-        output,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn rollover_template(
     inputs: Vec<TxIn>,
-    allowance_value: Option<u64>,
+    rungs: &[RungPolicy],
+    monthly_limit_sats: u64,
     remainder_value: u64,
     vault_script: ScriptBuf,
     controller_script: ScriptBuf,
-    monthly_connector: bool,
     emergency_connector: bool,
     anchor: bool,
 ) -> Transaction {
-    let mut outputs = Vec::with_capacity(
-        usize::from(allowance_value.is_some())
-            + 1
-            + usize::from(monthly_connector)
-            + usize::from(emergency_connector)
-            + usize::from(anchor),
-    );
-    if let Some(value) = allowance_value {
-        outputs.push(TxOut {
-            value: Amount::from_sat(value),
-            script_pubkey: vault_script.clone(),
-        });
-    }
+    let mut outputs = rungs
+        .iter()
+        .map(|rung| TxOut {
+            value: Amount::from_sat(monthly_limit_sats),
+            script_pubkey: rung.address.script_pubkey(),
+        })
+        .collect::<Vec<_>>();
     outputs.push(TxOut {
         value: Amount::from_sat(remainder_value),
         script_pubkey: vault_script,
     });
-    for _ in 0..usize::from(monthly_connector) + usize::from(emergency_connector) {
+    if emergency_connector {
         outputs.push(TxOut {
             value: Amount::from_sat(CONNECTOR_VALUE_SATS),
-            script_pubkey: controller_script.clone(),
+            script_pubkey: controller_script,
         });
     }
     if anchor {
@@ -1861,33 +1556,6 @@ fn renewal_delay_sequence() -> Result<Sequence> {
 fn emergency_delay_sequence() -> Result<Sequence> {
     Sequence::from_seconds_ceil(EMERGENCY_ACCESS_DELAY_SECONDS)
         .context("emergency access delay cannot be represented by BIP68")
-}
-
-fn monthly_delay_sequence() -> Result<Sequence> {
-    Sequence::from_seconds_ceil(MONTHLY_ALLOWANCE_DELAY_SECONDS)
-        .context("monthly allowance delay cannot be represented by BIP68")
-}
-
-fn allowance_chain_value(
-    count: usize,
-    monthly_limit_sats: u64,
-    continuing_authorization_fee_sats: u64,
-    final_authorization_fee_sats: u64,
-) -> Result<u64> {
-    if count == 0 {
-        return Ok(0);
-    }
-    let allowances = monthly_limit_sats
-        .checked_mul(u64::try_from(count).context("allowance count exceeds u64")?)
-        .context("allowance chain value overflowed")?;
-    let continuing_fees = continuing_authorization_fee_sats
-        .checked_mul(u64::try_from(count - 1).context("allowance count exceeds u64")?)
-        .context("allowance chain fees overflowed")?;
-    allowances
-        .checked_add(continuing_fees)
-        .and_then(|value| value.checked_add(final_authorization_fee_sats))
-        .and_then(|value| value.checked_sub(CONNECTOR_VALUE_SATS))
-        .context("allowance chain value overflowed")
 }
 
 fn vault_input(outpoint: OutPoint, sequence: Sequence) -> TxIn {
@@ -1924,11 +1592,8 @@ pub fn read_psbt(path: &Path) -> Result<Psbt> {
 }
 
 pub fn manifest_transactions(manifest: &BatchManifest) -> Vec<&BatchTransaction> {
-    let mut transactions = Vec::with_capacity(3 + manifest.allowances.len());
+    let mut transactions = Vec::with_capacity(3);
     transactions.push(&manifest.rollover);
-    for allowance in &manifest.allowances {
-        transactions.push(&allowance.authorization);
-    }
     if let Some(emergency) = &manifest.emergency_access {
         transactions.push(&emergency.trigger);
         transactions.push(&emergency.withdrawal);
@@ -2031,6 +1696,9 @@ mod tests {
             &[fake_utxo(config, 400_000_000)],
             &[],
             Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0)
+                .unwrap()
+                .timestamp(),
             PolicyLimits {
                 monthly_limit_sats: 10_000_000,
                 emergency_access_limit_sats: 50_000_000,
@@ -2141,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    fn two_btc_creates_twelve_step_relative_allowance_chain_and_one_remainder() {
+    fn two_btc_creates_twelve_monthly_rungs_and_one_remainder() {
         let dir = tempfile::tempdir().unwrap();
         let initialized = initialize(dir.path()).unwrap();
         let batch = dir.path().join("batch");
@@ -2156,65 +1824,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.allowance_count, 12);
-        assert_eq!(manifest.allowances.first().unwrap().step, 1);
-        assert_eq!(manifest.allowances.last().unwrap().step, 12);
+        assert_eq!(manifest.rungs.len(), 12);
+        assert_eq!(manifest.ladder_start, now.timestamp());
+        assert_eq!(manifest.allowance_value_sats, 12 * 10_000_000);
         let rollover = read_psbt(&batch.join(&manifest.rollover.psbt_file)).unwrap();
-        assert_eq!(rollover.unsigned_tx.output.len(), 3);
-        assert!(!batch.join("split.psbt").exists());
-        assert_eq!(manifest.allowance_vout, Some(0));
-        assert_eq!(
-            rollover.unsigned_tx.output[0].value.to_sat(),
-            manifest.allowance_value_sats
-        );
-
-        let delay = monthly_delay_sequence().unwrap();
-        let mut expected_outpoint = OutPoint::new(rollover.unsigned_tx.compute_txid(), 0);
-        let mut expected_connector = OutPoint::new(
-            rollover.unsigned_tx.compute_txid(),
-            manifest.monthly_connector_vout.unwrap(),
-        );
-        let mut expected_value = manifest.allowance_value_sats;
-        for (index, allowance) in manifest.allowances.iter().enumerate() {
-            let authorization = read_psbt(&batch.join(&allowance.authorization.psbt_file)).unwrap();
-            assert_eq!(allowance.step as usize, index + 1);
-            assert_eq!(allowance.delay_seconds, MONTHLY_ALLOWANCE_DELAY_SECONDS);
-            assert_eq!(allowance.delay_sequence, delay.to_consensus_u32());
-            assert_eq!(allowance.chain_value_sats, expected_value);
+        // Twelve months and the remainder; nothing else is presigned.
+        assert_eq!(rollover.unsigned_tx.output.len(), 13);
+        assert_eq!(manifest.remainder_vout, 12);
+        assert_eq!(manifest_transactions(&manifest).len(), 1);
+        let mut addresses = std::collections::HashSet::new();
+        for (index, rung) in manifest.rungs.iter().enumerate() {
+            assert_eq!(rung.step as usize, index + 1);
+            assert_eq!(rung.vout as usize, index);
             assert_eq!(
-                authorization.unsigned_tx.lock_time,
-                absolute::LockTime::ZERO
+                rung.unlock,
+                rung_unlock(manifest.ladder_start, index + 1).unwrap()
             );
-            assert_eq!(authorization.unsigned_tx.input[0].sequence, delay);
             assert_eq!(
-                authorization.unsigned_tx.input[0].previous_output,
-                expected_outpoint
+                i64::from(rung.unlock) - now.timestamp(),
+                (index as i64 + 1) * i64::from(MONTHLY_ALLOWANCE_DELAY_SECONDS)
             );
-            assert_eq!(authorization.unsigned_tx.input.len(), 2);
-            assert_eq!(
-                authorization.unsigned_tx.input[1].previous_output,
-                expected_connector
-            );
-            assert!(authorization.inputs[1].tap_script_sigs.is_empty());
-            assert_eq!(
-                authorization.unsigned_tx.output[0].value.to_sat(),
-                10_000_000
-            );
-            if index + 1 < manifest.allowance_count {
-                assert_eq!(authorization.unsigned_tx.output.len(), 3);
-                expected_value = authorization.unsigned_tx.output[1].value.to_sat();
-                expected_outpoint = OutPoint::new(authorization.unsigned_tx.compute_txid(), 1);
-                expected_connector = OutPoint::new(authorization.unsigned_tx.compute_txid(), 2);
-                assert_eq!(
-                    authorization.unsigned_tx.output[2].value.to_sat(),
-                    CONNECTOR_VALUE_SATS
-                );
-            } else {
-                assert_eq!(authorization.unsigned_tx.output.len(), 1);
-                assert_eq!(
-                    expected_value + CONNECTOR_VALUE_SATS,
-                    manifest.monthly_limit_sats + allowance.authorization.fee_sats
-                );
-            }
+            let output = &rollover.unsigned_tx.output[index];
+            assert_eq!(output.value.to_sat(), 10_000_000);
+            let policy = rung_policy(&initialized.config, rung.unlock).unwrap();
+            assert_eq!(output.script_pubkey, policy.address.script_pubkey());
+            assert_eq!(rung.address, policy.address.to_string());
+            assert!(addresses.insert(rung.address.clone()));
         }
         assert_eq!(
             rollover.unsigned_tx.output[manifest.remainder_vout as usize]
@@ -2223,6 +1858,24 @@ mod tests {
             manifest.remainder_value_sats
         );
         validate_batch(&initialized.config, &manifest, &batch).unwrap();
+    }
+
+    #[test]
+    fn a_tampered_rung_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let initialized = initialize(dir.path()).unwrap();
+        let batch = dir.path().join("batch");
+        let mut manifest = prepare_from_utxos(
+            dir.path(),
+            &initialized.config,
+            &[fake_utxo(&initialized.config, 200_000_000)],
+            Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap(),
+            10_000_000,
+            &batch,
+        )
+        .unwrap();
+        manifest.rungs[3].unlock -= 86_400;
+        assert!(validate_batch(&initialized.config, &manifest, &batch).is_err());
     }
 
     #[test]
@@ -2239,7 +1892,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.allowance_count, 3);
-        assert_eq!(manifest.allowances.len(), 3);
+        assert_eq!(manifest.rungs.len(), 3);
     }
 
     #[test]
@@ -2258,7 +1911,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest.allowance_count, 12);
-        assert_eq!(manifest_transactions(&manifest).len(), 15);
+        // The rollover plus the emergency pair; the months need no presigned transactions.
+        assert_eq!(manifest_transactions(&manifest).len(), 3);
         let emergency = manifest.emergency_access.as_ref().unwrap();
         assert_eq!(emergency.amount_sats, 50_000_000);
         assert_eq!(emergency.delay_seconds, EMERGENCY_ACCESS_DELAY_SECONDS);
@@ -2415,7 +2069,8 @@ mod tests {
                 .iter()
                 .filter(|output| output.script_pubkey == controller_script)
                 .count(),
-            2
+            // Only the emergency connector: the months carry no controller state.
+            1
         );
 
         let approved = cold_wallet::approve_policy(dir.path(), &batch).unwrap();
@@ -2461,7 +2116,7 @@ mod tests {
         .unwrap();
         assert_eq!(manifest.monthly_limit_sats, 10_000_000);
         assert_eq!(manifest.allowance_count, 0);
-        assert!(manifest.allowances.is_empty());
+        assert!(manifest.rungs.is_empty());
         assert_eq!(
             manifest.emergency_access.as_ref().unwrap().amount_sats,
             20_000_000
@@ -2542,7 +2197,7 @@ mod tests {
             &batch,
         )
         .unwrap();
-        let path = batch.join(&manifest.allowances.last().unwrap().authorization.psbt_file);
+        let path = batch.join(&manifest.rollover.psbt_file);
         let mut psbt = read_psbt(&path).unwrap();
         psbt.inputs[0].sighash_type = Some(bitcoin::sighash::TapSighashType::All.into());
         write_psbt(&path, &psbt).unwrap();
@@ -2562,7 +2217,7 @@ mod tests {
     }
 
     #[test]
-    fn hww_rejects_a_tampered_allowance_limit_output() {
+    fn hww_rejects_a_month_redirected_away_from_its_rung() {
         let dir = tempfile::tempdir().unwrap();
         let initialized = initialize(dir.path()).unwrap();
         let batch = dir.path().join("batch");
@@ -2575,30 +2230,12 @@ mod tests {
             &batch,
         )
         .unwrap();
-        let path = batch.join(&manifest.allowances[0].authorization.psbt_file);
+        // A compromised computer swaps month 1's address for month 12's (unlocks a year early
+        // for the wrong month) and keeps the manifest unchanged.
+        let path = batch.join(&manifest.rollover.psbt_file);
         let mut psbt = read_psbt(&path).unwrap();
-        psbt.unsigned_tx.output[0].value = Amount::from_sat(10_000_001);
-        write_psbt(&path, &psbt).unwrap();
-        assert!(cold_wallet::approve_policy(dir.path(), &batch).is_err());
-    }
-
-    #[test]
-    fn hww_rejects_a_tampered_allowance_relative_delay() {
-        let dir = tempfile::tempdir().unwrap();
-        let initialized = initialize(dir.path()).unwrap();
-        let batch = dir.path().join("batch");
-        let manifest = prepare_from_utxos(
-            dir.path(),
-            &initialized.config,
-            &[fake_utxo(&initialized.config, 200_000_000)],
-            Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap(),
-            10_000_000,
-            &batch,
-        )
-        .unwrap();
-        let path = batch.join(&manifest.allowances[0].authorization.psbt_file);
-        let mut psbt = read_psbt(&path).unwrap();
-        psbt.unsigned_tx.input[0].sequence = Sequence::from_height(1);
+        psbt.unsigned_tx.output[0].script_pubkey =
+            psbt.unsigned_tx.output[11].script_pubkey.clone();
         write_psbt(&path, &psbt).unwrap();
         assert!(cold_wallet::approve_policy(dir.path(), &batch).is_err());
     }
@@ -2625,48 +2262,6 @@ mod tests {
     }
 
     #[test]
-    fn hww_rejects_a_tampered_allowance_connector_outpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let initialized = initialize(dir.path()).unwrap();
-        let batch = dir.path().join("batch");
-        let manifest = prepare_from_utxos(
-            dir.path(),
-            &initialized.config,
-            &[fake_utxo(&initialized.config, 200_000_000)],
-            Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap(),
-            10_000_000,
-            &batch,
-        )
-        .unwrap();
-        let path = batch.join(&manifest.allowances[0].authorization.psbt_file);
-        let mut psbt = read_psbt(&path).unwrap();
-        psbt.unsigned_tx.input[1].previous_output = OutPoint::null();
-        write_psbt(&path, &psbt).unwrap();
-        assert!(cold_wallet::approve_policy(dir.path(), &batch).is_err());
-    }
-
-    #[test]
-    fn hww_rejects_a_tampered_next_connector_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let initialized = initialize(dir.path()).unwrap();
-        let batch = dir.path().join("batch");
-        let manifest = prepare_from_utxos(
-            dir.path(),
-            &initialized.config,
-            &[fake_utxo(&initialized.config, 200_000_000)],
-            Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap(),
-            10_000_000,
-            &batch,
-        )
-        .unwrap();
-        let path = batch.join(&manifest.allowances[0].authorization.psbt_file);
-        let mut psbt = read_psbt(&path).unwrap();
-        psbt.unsigned_tx.output[2].value += Amount::from_sat(1);
-        write_psbt(&path, &psbt).unwrap();
-        assert!(cold_wallet::approve_policy(dir.path(), &batch).is_err());
-    }
-
-    #[test]
     fn zero_monthly_limit_creates_only_a_cold_rollover() {
         let dir = tempfile::tempdir().unwrap();
         let initialized = initialize(dir.path()).unwrap();
@@ -2682,7 +2277,7 @@ mod tests {
         .unwrap();
         assert_eq!(manifest.monthly_limit_sats, 0);
         assert_eq!(manifest.allowance_count, 0);
-        assert!(manifest.allowances.is_empty());
+        assert!(manifest.rungs.is_empty());
         validate_batch(&initialized.config, &manifest, &batch).unwrap();
     }
 
@@ -2696,7 +2291,7 @@ mod tests {
             dir.path(),
             &initialized.config,
             &[utxo],
-            Utc.with_ymd_and_hms(2026, 8, 4, 0, 0, 0).unwrap(),
+            Utc::now(),
             10_000_000,
             &batch,
         )
@@ -2704,12 +2299,30 @@ mod tests {
         assert_eq!(manifest.network, "mainnet");
         assert!(
             manifest
-                .allowances
+                .rungs
                 .iter()
-                .all(|allowance| allowance.hot_address.starts_with("bc1p"))
+                .all(|rung| rung.address.starts_with("bc1p"))
         );
         let approved = cold_wallet::approve_policy(dir.path(), &batch).unwrap();
         assert!(approved.hww_approved);
+    }
+
+    #[test]
+    fn hww_rejects_months_dated_in_the_past_on_a_real_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let initialized = initialize_for_network(dir.path(), Network::Bitcoin).unwrap();
+        let batch = dir.path().join("stale-batch");
+        prepare_from_utxos(
+            dir.path(),
+            &initialized.config,
+            &[fake_utxo(&initialized.config, 200_000_000)],
+            Utc::now() - chrono::Duration::days(3),
+            10_000_000,
+            &batch,
+        )
+        .unwrap();
+        let error = cold_wallet::approve_policy(dir.path(), &batch).unwrap_err();
+        assert!(error.to_string().contains("start in the past"));
     }
 
     #[test]
@@ -2731,8 +2344,8 @@ mod tests {
         let imported = dir.path().join("imported");
         materialize_policy_package(&package, &imported).unwrap();
         validate_batch(&initialized.config, &package.manifest, &imported).unwrap();
-        assert_eq!(package.version, 5);
-        assert_eq!(package.psbts.len(), 13);
+        assert_eq!(package.version, MANIFEST_VERSION);
+        assert_eq!(package.psbts.len(), 1);
 
         let mut legacy = package.clone();
         legacy.version = 3;

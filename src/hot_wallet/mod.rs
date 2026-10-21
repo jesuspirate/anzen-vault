@@ -12,11 +12,6 @@ pub use rotation::{
 pub use wallet::HotWallet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MonthlyBroadcastResult {
-    pub transaction_txid: Txid,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmergencyBroadcastResult {
     pub transaction_txid: Txid,
 }
@@ -55,8 +50,8 @@ pub fn open_approved_policy(data_dir: &Path, input: ApprovedPolicyInput) -> Resu
 use crate::core::{
     ceremony::{
         self, BatchManifest, EmergencyAccessSchedule, EmergencyTransactionKind,
-        EncryptedEmergencyTransaction, EncryptedTransaction, HotAddressProvider, PolicyLimits,
-        PolicyPackage, SCHEDULE_FILE, Schedule, ScheduleEntry, TransactionKind,
+        EncryptedEmergencyTransaction, HotAddressProvider, PolicyLimits, PolicyPackage,
+        SCHEDULE_FILE, Schedule,
     },
     chain::{BitcoinCoreBackend, Blockchain, ElectrumBackend},
     policy::{ControllerPath, ControllerPolicy, SpendPath, VaultAddressTemplate},
@@ -65,7 +60,7 @@ use crate::core::{
     savings_spend::{self, SavingsSpendPackage},
 };
 use anyhow::{Context, Result, bail};
-use bitcoin::{Address, Amount, Network, OutPoint, Psbt, Transaction, TxOut, Txid, key::Secp256k1};
+use bitcoin::{Address, Amount, Network, Psbt, Transaction, TxOut, Txid, key::Secp256k1};
 use chrono::{DateTime, Utc};
 use std::{
     fs,
@@ -82,6 +77,7 @@ use std::{
 use crate::core::{
     DEFAULT_FEE_RATE_SAT_VB,
     keys::DeviceKeys,
+    ladder,
     storage::{
         DeviceFile, HWW_PUBLIC_FILE, InitializedDevice, PHONE_DEVICE_FILE, VaultConfig,
         load_config, load_device_keys, load_public_device, network_name, read_json,
@@ -406,11 +402,21 @@ pub fn propose_policy(
     let connectors = backend.scan_connectors(&config)?;
     let phone = load_device_keys(data_dir, PHONE_DEVICE_FILE)?;
     let mut wallet = HotWallet::open_or_create(data_dir)?;
+    // Months from an earlier ceremony that are still waiting keep their dates; the new months
+    // start after the last of them, so the monthly limit never doubles.
+    let mut ladder_start = now.timestamp();
+    if data_dir.join(SCHEDULE_FILE).is_file() {
+        let schedule = load_schedule(data_dir)?;
+        for rung in live_rungs_for(&config, backend, &schedule)? {
+            ladder_start = ladder_start.max(i64::from(rung.entry.unlock));
+        }
+    }
     ceremony::build_policy_proposal_with_renewal(
         &config,
         &utxos,
         &connectors,
         now,
+        ladder_start,
         PolicyLimits {
             monthly_limit_sats,
             emergency_access_limit_sats,
@@ -490,27 +496,11 @@ pub fn activate_policy(
         )?,
     )?;
     write_json(&epoch_dir.join("rollover.json"), &rollover)?;
-    let mut entries = Vec::with_capacity(manifest.allowances.len());
-    for allowance in &manifest.allowances {
-        let authorization = read_psbt(&batch_dir.join(&allowance.authorization.psbt_file))?;
-        let authorization_path =
-            encrypted_transaction_path(&epoch_dir, allowance.step, TransactionKind::Authorization);
-        write_encrypted_transaction(
-            &authorization_path,
-            &phone.seed,
-            allowance.step,
-            TransactionKind::Authorization,
-            &authorization,
-        )?;
-        entries.push(ScheduleEntry {
-            step: allowance.step,
-            hot_address: allowance.hot_address.clone(),
-            authorization_file: relative_to(data_dir, &authorization_path)?,
-            authorization_txid: authorization.unsigned_tx.compute_txid().to_string(),
-            connector: allowance.connector.clone(),
-            next_connector: allowance.next_connector.clone(),
-        });
+    if manifest.rollover.unsigned_txid != rollover.compute_txid().to_string() {
+        bail!("approved rollover does not match its manifest");
     }
+    let entries = ladder::entries_from_manifest(&manifest)?;
+    let rollover_txid = rollover.compute_txid();
     let emergency_access = manifest
         .emergency_access
         .as_ref()
@@ -552,23 +542,29 @@ pub fn activate_policy(
             })
         })
         .transpose()?;
-    // A presigned renewal leaves the previous allowance chain in place, so keep its steps.
+    // A new rollover does not touch earlier months, so keep the ones still waiting.
     let previous_entries = match (&manifest.renews, previous_epoch) {
-        (Some(link), Some(previous)) if link.parent_rollover_txid == previous.to_string() => {
-            load_schedule(data_dir)?.entries
+        (Some(link), Some(previous)) if link.parent_rollover_txid != previous.to_string() => {
+            bail!("presigned renewal does not renew the active policy")
         }
-        (Some(_), _) => bail!("presigned renewal does not renew the active policy"),
-        (None, _) => Vec::new(),
+        (Some(_), None) => bail!("presigned renewal does not renew the active policy"),
+        (_, Some(previous)) if previous != rollover_txid => {
+            live_rungs_for(&config, backend, &load_schedule(data_dir)?)?
+                .into_iter()
+                .map(|rung| rung.entry)
+                .collect()
+        }
+        (_, Some(_)) => load_schedule(data_dir)?.previous_entries,
+        (None, None) => Vec::new(),
     };
     let schedule = Schedule {
         previous_entries,
-        version: 5,
+        version: 6,
         rollover_txid: rollover.compute_txid().to_string(),
         controller_descriptor: manifest.controller_descriptor.clone(),
         controller_address: manifest.controller_address.clone(),
         connector_value_sats: manifest.connector_value_sats,
         monthly_limit_sats: manifest.monthly_limit_sats,
-        monthly_delay_seconds: crate::core::MONTHLY_ALLOWANCE_DELAY_SECONDS,
         emergency_access_limit_sats: manifest.emergency_access_limit_sats,
         entries,
         emergency_access,
@@ -739,82 +735,185 @@ fn broadcast_emergency_transaction(
     Ok(txid)
 }
 
-pub fn broadcast_monthly(
+/// Every month of the active policy that is still unspent at its rung address, with the
+/// previous epoch's months first. A month whose rollover has not confirmed yet is not listed.
+pub fn live_rungs(
     data_dir: &Path,
     backend: &dyn HotWalletBackend,
-    step: u8,
-    kind: TransactionKind,
-) -> Result<MonthlyBroadcastResult> {
-    broadcast_monthly_entry(data_dir, backend, step, kind, false)
-}
-
-/// Like `broadcast_monthly`, for a step of the epoch that a presigned renewal replaced.
-pub fn broadcast_previous_monthly(
-    data_dir: &Path,
-    backend: &dyn HotWalletBackend,
-    step: u8,
-    kind: TransactionKind,
-) -> Result<MonthlyBroadcastResult> {
-    broadcast_monthly_entry(data_dir, backend, step, kind, true)
-}
-
-fn broadcast_monthly_entry(
-    data_dir: &Path,
-    backend: &dyn HotWalletBackend,
-    step: u8,
-    kind: TransactionKind,
-    previous: bool,
-) -> Result<MonthlyBroadcastResult> {
+) -> Result<Vec<ladder::LiveRung>> {
     let schedule = load_schedule(data_dir)?;
+    let config = load_config(data_dir)?;
+    ensure_backend_network(backend, &config)?;
+    live_rungs_for(&config, backend, &schedule)
+}
+
+pub fn live_rungs_for<B: Blockchain + ?Sized>(
+    config: &VaultConfig,
+    backend: &B,
+    schedule: &Schedule,
+) -> Result<Vec<ladder::LiveRung>> {
+    let mut live = Vec::new();
+    for entry in schedule.previous_entries.iter().chain(&schedule.entries) {
+        let rung = ladder::LiveRung::new(config, entry)?;
+        let coins = backend.scan_savings(&rung.policy.address)?;
+        if coins.iter().any(|coin| {
+            coin.outpoint == entry.outpoint && coin.txout.value.to_sat() == entry.value_sats
+        }) {
+            live.push(rung);
+        }
+    }
+    Ok(live)
+}
+
+fn vault_script(config: &VaultConfig) -> Result<bitcoin::ScriptBuf> {
+    Ok(config
+        .vault_address
+        .parse::<Address<_>>()?
+        .require_network(config.bitcoin_network()?)?
+        .script_pubkey())
+}
+
+fn current_fee_rate<B: Blockchain + ?Sized>(backend: &B) -> Result<u64> {
+    Ok(backend
+        .estimate_fee_rate(crate::core::fees::DEFAULT_CONFIRMATION_TARGET)?
+        .unwrap_or(DEFAULT_FEE_RATE_SAT_VB))
+}
+
+fn broadcast_rung_spend<B: Blockchain + ?Sized>(
+    backend: &B,
+    transaction: &Transaction,
+) -> Result<Txid> {
+    let txid = backend
+        .broadcast(transaction)
+        .context("failed to broadcast the allowance transaction")?;
+    if txid != transaction.compute_txid() {
+        bail!("chain backend returned an unexpected allowance transaction ID");
+    }
+    Ok(txid)
+}
+
+/// Move one unlocked month to the phone's hot wallet. With `soft_limit_sats`, only that much
+/// comes to the phone and the rest of the month goes back to the vault. The fee comes out of the
+/// phone's share.
+pub fn claim_month(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+    step: u8,
+    previous: bool,
+    soft_limit_sats: Option<u64>,
+) -> Result<ladder::RungSpendResult> {
+    let schedule = load_schedule(data_dir)?;
+    let config = load_config(data_dir)?;
+    ensure_backend_network(backend, &config)?;
     let entries = if previous {
         &schedule.previous_entries
     } else {
         &schedule.entries
     };
+    // Earlier months can come from more than one ceremony; take the oldest of that number.
     let entry = entries
         .iter()
-        .find(|entry| entry.step == step)
-        .with_context(|| format!("no allowance exists for step {step}"))?;
+        .filter(|entry| entry.step == step)
+        .min_by_key(|entry| entry.unlock)
+        .with_context(|| format!("no allowance exists for month {step}"))?;
+    let median_time = backend.chain_tip()?.median_time;
+    if !ladder::is_unlocked(entry, median_time) {
+        bail!(
+            "month {step} unlocks after {}",
+            ladder::unlock_date(entry.unlock)
+        );
+    }
+    let rung = live_rungs_for(&config, backend, &schedule)?
+        .into_iter()
+        .find(|rung| rung.outpoint() == entry.outpoint)
+        .with_context(|| {
+            format!("month {step} is not available: it was already claimed, returned or rescued")
+        })?;
+    let phone = load_device_keys(data_dir, PHONE_DEVICE_FILE)?;
+    let mut wallet = HotWallet::open_or_create(data_dir)?;
+    let hot_script = wallet.next_receive_address()?.script_pubkey();
+    let mut outputs = Vec::new();
+    let mut returned_sats = 0;
+    if let Some(limit) = soft_limit_sats.filter(|limit| *limit < entry.value_sats) {
+        returned_sats = entry.value_sats - limit;
+        outputs.push(TxOut {
+            value: Amount::from_sat(returned_sats),
+            script_pubkey: vault_script(&config)?,
+        });
+    }
+    outputs.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: hot_script,
+    });
+    let rungs = [rung];
+    let spend = ladder::build_rung_spend(
+        &rungs,
+        SpendPath::PhoneRecovery,
+        outputs,
+        current_fee_rate(backend)?,
+    )?;
+    let fee_sats = spend.fee_sats;
+    let transaction = ladder::sign_as_phone(spend, &rungs, &phone)?;
+    let sent_sats = transaction
+        .output
+        .last()
+        .map(|output| output.value.to_sat())
+        .unwrap_or_default();
+    let txid = broadcast_rung_spend(backend, &transaction)?;
+    Ok(ladder::RungSpendResult {
+        txid,
+        month_count: 1,
+        sent_sats,
+        returned_sats,
+        fee_sats,
+    })
+}
+
+/// Send unclaimed months back to the vault, so they cannot pile up on a phone that might be
+/// stolen. By default a month goes back once the month after it has unlocked; `all` also returns
+/// the current month. Returns `None` when there is nothing to return.
+pub fn return_unclaimed_months(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+    all: bool,
+) -> Result<Option<ladder::RungSpendResult>> {
+    let schedule = load_schedule(data_dir)?;
     let config = load_config(data_dir)?;
     ensure_backend_network(backend, &config)?;
+    let median_time = backend.chain_tip()?.median_time;
+    let grace = if all {
+        0
+    } else {
+        u64::from(crate::core::MONTHLY_ALLOWANCE_DELAY_SECONDS)
+    };
+    let rungs: Vec<_> = live_rungs_for(&config, backend, &schedule)?
+        .into_iter()
+        .filter(|rung| median_time > u64::from(rung.entry.unlock) + grace)
+        .collect();
+    if rungs.is_empty() {
+        return Ok(None);
+    }
     let phone = load_device_keys(data_dir, PHONE_DEVICE_FILE)?;
-    if kind == TransactionKind::Revocation {
-        let transaction_txid =
-            revoke_connector_to_phone(data_dir, backend, &config, &phone, &entry.connector)?;
-        return Ok(MonthlyBroadcastResult { transaction_txid });
-    }
-    let artifact: EncryptedTransaction = read_json(&data_dir.join(&entry.authorization_file))?;
-    if artifact.version != 3
-        || artifact.step != step
-        || artifact.kind != kind
-        || artifact.txid != entry.authorization_txid
-    {
-        bail!("encrypted allowance transaction metadata does not match the requested action");
-    }
-    let purpose = transaction_purpose(step, kind, &artifact.txid);
-    let plaintext = crate::core::crypto::decrypt(&phone.seed, &purpose, &artifact.encrypted_psbt)?;
-    let mut psbt = Psbt::from_str(
-        std::str::from_utf8(&plaintext).context("decrypted allowance PSBT was not UTF-8")?,
-    )
-    .context("decrypted allowance PSBT was invalid")?;
-    if psbt.unsigned_tx.compute_txid().to_string() != artifact.txid {
-        bail!("decrypted allowance PSBT ID does not match its metadata");
-    }
-    ensure_connector_input(&psbt, &entry.connector)?;
-    let controller = controller_policy(&config)?;
-    validate_schedule_controller(&schedule, &controller)?;
-    sign_controller_psbt_inputs(
-        &mut psbt,
-        &controller,
-        ControllerPath::Phone,
-        &phone.vault_keypair.cooperative,
-        &[1],
+    let spend = ladder::build_rung_spend(
+        &rungs,
+        SpendPath::PhoneRecovery,
+        vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: vault_script(&config)?,
+        }],
+        current_fee_rate(backend)?,
     )?;
-    let parent_fee = psbt_fee(&psbt)?;
-    let transaction = finalize_vault_psbt(psbt)?;
-    let transaction_txid = broadcast_with_fee_bump(data_dir, backend, &transaction, parent_fee, 0)
-        .with_context(|| format!("failed to broadcast {kind:?} for allowance step {step}"))?;
-    Ok(MonthlyBroadcastResult { transaction_txid })
+    let fee_sats = spend.fee_sats;
+    let transaction = ladder::sign_as_phone(spend, &rungs, &phone)?;
+    let returned_sats = transaction.output[0].value.to_sat();
+    let txid = broadcast_rung_spend(backend, &transaction)?;
+    Ok(Some(ladder::RungSpendResult {
+        txid,
+        month_count: rungs.len(),
+        sent_sats: 0,
+        returned_sats,
+        fee_sats,
+    }))
 }
 
 /// Fee paid by a fully described PSBT: inputs (from `witness_utxo`) minus outputs.
@@ -1020,46 +1119,10 @@ fn validate_schedule_controller(schedule: &Schedule, controller: &ControllerPoli
 
 pub fn load_schedule(data_dir: &Path) -> Result<Schedule> {
     let schedule: Schedule = read_json(&data_dir.join(SCHEDULE_FILE))?;
-    if schedule.version != 5 {
+    if schedule.version != 6 {
         bail!("unsupported active policy version; approve a new vault policy");
     }
     Ok(schedule)
-}
-
-pub fn apply_soft_limit(
-    data_dir: &Path,
-    backend: &dyn HotWalletBackend,
-    step: u8,
-    soft_limit_sats: u64,
-) -> Result<Option<Txid>> {
-    let schedule = load_schedule(data_dir)?;
-    let config = load_config(data_dir)?;
-    ensure_backend_network(backend, &config)?;
-    let entry = schedule
-        .entries
-        .iter()
-        .find(|entry| entry.step == step)
-        .with_context(|| format!("no allowance exists for step {step}"))?;
-    let authorization_txid = entry.authorization_txid.parse()?;
-    let mut wallet = HotWallet::open_or_create(data_dir)?;
-    backend.sync_hot_wallet(&mut wallet)?;
-    let transaction = wallet.build_soft_limit_return(
-        OutPoint::new(authorization_txid, 0),
-        schedule.monthly_limit_sats,
-        soft_limit_sats,
-        config
-            .vault_address
-            .parse::<Address<_>>()?
-            .require_network(config.bitcoin_network()?)?
-            .script_pubkey(),
-    )?;
-    transaction
-        .map(|transaction| {
-            backend
-                .broadcast(&transaction)
-                .context("failed to broadcast soft-limit cold-return transaction")
-        })
-        .transpose()
 }
 
 pub fn restore_phone(data_dir: &Path, package: &PhoneRecoveryPackage) -> Result<String> {
@@ -1325,17 +1388,6 @@ fn read_psbt(path: &Path) -> Result<Psbt> {
     Psbt::from_str(text.trim()).with_context(|| format!("invalid PSBT in {}", path.display()))
 }
 
-fn encrypted_transaction_path(
-    epoch_dir: &Path,
-    step: u8,
-    kind: TransactionKind,
-) -> std::path::PathBuf {
-    epoch_dir.join(format!(
-        "allowance-{step:02}-{}.json",
-        transaction_kind_name(kind)
-    ))
-}
-
 fn emergency_transaction_path(
     epoch_dir: &Path,
     kind: EmergencyTransactionKind,
@@ -1345,29 +1397,6 @@ fn emergency_transaction_path(
         "emergency-{}-{txid}.json",
         emergency_transaction_kind_name(kind)
     ))
-}
-
-fn write_encrypted_transaction(
-    path: &Path,
-    phone_seed: &[u8],
-    step: u8,
-    kind: TransactionKind,
-    psbt: &Psbt,
-) -> Result<()> {
-    let txid = psbt.unsigned_tx.compute_txid().to_string();
-    let purpose = transaction_purpose(step, kind, &txid);
-    let encrypted_psbt =
-        crate::core::crypto::encrypt(phone_seed, &purpose, psbt.to_string().as_bytes())?;
-    write_json(
-        path,
-        &EncryptedTransaction {
-            version: 3,
-            step,
-            kind,
-            txid,
-            encrypted_psbt,
-        },
-    )
 }
 
 fn write_encrypted_emergency_transaction(
@@ -1400,17 +1429,6 @@ fn emergency_transaction_kind_name(kind: EmergencyTransactionKind) -> &'static s
         EmergencyTransactionKind::Trigger => "trigger",
         EmergencyTransactionKind::Withdrawal => "withdrawal",
         EmergencyTransactionKind::Cancellation => "cancellation",
-    }
-}
-
-fn transaction_purpose(step: u8, kind: TransactionKind, txid: &str) -> String {
-    format!("allowance/{step}/{}/{txid}", transaction_kind_name(kind))
-}
-
-fn transaction_kind_name(kind: TransactionKind) -> &'static str {
-    match kind {
-        TransactionKind::Authorization => "authorization",
-        TransactionKind::Revocation => "revocation",
     }
 }
 

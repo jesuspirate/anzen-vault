@@ -134,6 +134,20 @@ fn load_rotation_context(
 ) -> Result<RotationContext> {
     let old_config = load_config(data_dir)?;
     ensure_backend_network(backend, &old_config)?;
+    // Allowance months are committed to the old phone key. Bring them back into the vault first,
+    // so the sweep below moves them to the replacement key with everything else.
+    if data_dir.join(SCHEDULE_FILE).is_file() {
+        let schedule = super::load_schedule(data_dir)?;
+        let live = super::live_rungs_for(&old_config, backend, &schedule)?;
+        if !live.is_empty() {
+            bail!(
+                "{} allowance month(s) are still outside the vault. Return them first with the HWW: \
+                 anzen hww revoke-policy {}",
+                live.len(),
+                old_config.vault_address
+            );
+        }
+    }
     let utxos = backend.scan_vault(&old_config)?;
     let old_phone = load_device_keys(data_dir, PHONE_DEVICE_FILE)?;
     Ok(RotationContext {
@@ -373,11 +387,6 @@ pub fn activate_phone_rotation(
                 "renewed emergency access does not match the new phone address sequence"
             );
         }
-        for allowance in &policy.manifest.allowances {
-            if hot.next_receive_address()?.to_string() != allowance.hot_address {
-                bail!("renewed allowance policy does not match the new phone address sequence");
-            }
-        }
     }
     let renewed_schedule = package
         .renewed_policy
@@ -446,11 +455,6 @@ fn validate_rotation_hot_addresses(new_phone: &DeviceKeys, renewed: &PolicyPacka
             addresses.next_receive_address()?.to_string() == emergency.hot_address,
             "renewed emergency access does not use the new phone's address sequence"
         );
-    }
-    for allowance in &renewed.manifest.allowances {
-        if addresses.next_receive_address()?.to_string() != allowance.hot_address {
-            bail!("renewed allowance policy does not use the new phone's address sequence");
-        }
     }
     Ok(())
 }
@@ -638,7 +642,7 @@ mod tests {
         assert_eq!(first.package.emergency_access_limit_sats, 50_000_000);
         let renewed = first.package.renewed_policy.as_ref().unwrap();
         assert_eq!(renewed.manifest.monthly_limit_sats, 10_000_000);
-        assert_eq!(renewed.manifest.allowances.len(), 12);
+        assert_eq!(renewed.manifest.rungs.len(), 12);
         assert_eq!(renewed.manifest.emergency_access_limit_sats, 50_000_000);
         assert!(renewed.manifest.emergency_access.is_some());
 
