@@ -255,6 +255,20 @@ enum PhoneCommand {
     ActivatePolicy { approved_policy: PathBuf },
     /// Broadcast the presigned second-year renewal once it unlocks (360 days after the rollover).
     Renew,
+    /// Show or choose how much to keep on the phone for bills and emergencies. Anything above it
+    /// goes back to the vault before the next ceremony.
+    Buffer {
+        /// The amount to keep, in sats.
+        #[arg(long)]
+        set: Option<u64>,
+    },
+    /// Send everything above the buffer back to the vault. Run it just before a ceremony so the
+    /// returned coins join the new months.
+    ReturnLeftovers {
+        /// Keep this many sats instead of the saved buffer.
+        #[arg(long)]
+        keep: Option<u64>,
+    },
     /// List the allowance months: when each unlocks and whether it is still available.
     Allowance,
     /// Move one unlocked allowance month to this phone's wallet.
@@ -670,6 +684,42 @@ fn run_phone(
             let schedule = hot_wallet::activate_presigned_renewal(data_dir, backend.as_ref())?;
             println!("Presigned renewal broadcast: {}", schedule.rollover_txid);
             println!("Allowance steps scheduled: {}", schedule.entries.len());
+        }
+        PhoneCommand::Buffer { set } => {
+            if let Some(keep) = set {
+                hot_wallet::set_buffer(data_dir, keep)?;
+            }
+            match hot_wallet::buffer(data_dir)? {
+                Some(keep) => {
+                    println!("Kept on the phone: {keep} sats");
+                    let backend = rpc_args.connect_hot(data_dir)?;
+                    if let Some((leftover, _)) = hot_wallet::leftovers(data_dir, backend.as_ref())?
+                    {
+                        println!("Above the buffer now: {leftover} sats");
+                    }
+                }
+                None => println!(
+                    "No buffer chosen yet: anzen phone buffer --set SATS (for example one month's spending)"
+                ),
+            }
+        }
+        PhoneCommand::ReturnLeftovers { keep } => {
+            let backend = rpc_args.connect_hot(data_dir)?;
+            match hot_wallet::return_leftovers(data_dir, backend.as_ref(), keep)? {
+                Some(result) => {
+                    println!("Leftovers returned to the vault: {}", result.txid);
+                    println!("Returned: {} sats", result.returned_sats);
+                    println!("Fee: {} sats (1 sat/vB)", result.fee_sats);
+                    println!("Kept on the phone: {} sats", result.kept_sats);
+                    println!(
+                        "Once it confirms, run the ceremony (phone set-policy) so it joins the new months."
+                    );
+                }
+                None => println!(
+                    "Nothing to return: the phone holds no more than its buffer (amounts under {} sats stay).",
+                    hot_wallet::MIN_LEFTOVER_RETURN_SATS
+                ),
+            }
         }
         PhoneCommand::Allowance => print_allowance(data_dir, rpc_args)?,
         PhoneCommand::Authorize {
@@ -1218,6 +1268,12 @@ fn phone_set_policy(
                  this ceremony. To include them, first run: anzen phone return-unused --all"
             );
         }
+    }
+    let leftover = hot_wallet::leftovers(data_dir, backend.as_ref())?.map_or(0, |(sats, _)| sats);
+    if leftover >= hot_wallet::MIN_LEFTOVER_RETURN_SATS {
+        eprintln!(
+            "Note: the phone holds {leftover} sats above its buffer. To fold them into the new months, cancel, run `anzen phone return-leftovers`, wait for one confirmation, then start the ceremony again."
+        );
     }
     let workspace = data_dir.join("phone/policy-proposal");
     reset_workspace(&workspace)?;

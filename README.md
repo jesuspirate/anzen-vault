@@ -89,6 +89,8 @@ Month `i` unlocks at the ladder start plus `i` × 2,592,256 seconds (about 30 da
 
 Nothing per month is presigned. Every spend of a month is built when it is needed, at that day's fee rate: the phone claims an unlocked month to its hot wallet, the phone returns unclaimed months to the vault, or the HWW pulls months back, locked or not. The HWW keeps its own record of the months it approved (`hww/ladder.json`), so it can pull them back without the phone.
 
+Months are collected in order; skipping one only delays the later ones, and nothing expires. What the phone does not spend can go back to the vault: choose a buffer to keep for bills and emergencies with `anzen phone buffer --set SATS`, and just before a ceremony run `anzen phone return-leftovers`. It sends everything above the buffer to the vault (the fee comes out of the buffer), and once it confirms, the ceremony's rollover folds it into the new months. `phone set-policy` reminds you when the phone holds more than its buffer. Returned coins need two keys again as soon as they land, but they are not part of the current presigned months, which is why the return belongs right before a ceremony.
+
 #### Emergency access
 
 ![Emergency access trigger, delayed withdrawal, and connector-only cancellation](media/emergency-access-chain.svg)

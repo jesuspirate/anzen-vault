@@ -367,14 +367,17 @@ impl LedgerDevice {
 
     /// Mainnet needs the "Bitcoin" app; every test network needs "Bitcoin Test".
     fn check_app(&self, network: Network) -> Result<()> {
-        let (name, version, _) = self.client.get_version().map_err(|error| {
-            anyhow!("open the Bitcoin app on the Ledger and try again ({error:?})")
-        })?;
         let expected = if network == Network::Bitcoin {
             "Bitcoin"
         } else {
             "Bitcoin Test"
         };
+        // On the home screen the device answers as its OS ("BOLOS"), which the client rejects.
+        let (name, version, _) = self.client.get_version().map_err(|error| {
+            anyhow!(
+                "no app is open on the Ledger: unlock it and open the \"{expected}\" app ({error:?})"
+            )
+        })?;
         ensure!(
             name == expected,
             "open the \"{expected}\" app on the Ledger (it is running \"{name}\")"

@@ -9,7 +9,7 @@ pub use rotation::{
     VanityPhoneRotation, activate_phone_rotation, create_phone_rotation,
     create_vanity_phone_rotation,
 };
-pub use wallet::HotWallet;
+pub use wallet::{HotWallet, MIN_LEFTOVER_RETURN_SATS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmergencyBroadcastResult {
@@ -88,6 +88,100 @@ use crate::core::{
     },
     types::VaultUtxo,
 };
+
+/// How much the owner keeps on the phone after each cycle, for bills and emergencies.
+pub const PHONE_BUFFER_FILE: &str = "phone/buffer.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PhoneBuffer {
+    pub version: u8,
+    pub keep_sats: u64,
+}
+
+pub fn set_buffer(data_dir: &Path, keep_sats: u64) -> Result<()> {
+    load_config(data_dir)?;
+    write_json(
+        &data_dir.join(PHONE_BUFFER_FILE),
+        &PhoneBuffer {
+            version: 1,
+            keep_sats,
+        },
+    )
+}
+
+/// The buffer the owner chose, if any.
+pub fn buffer(data_dir: &Path) -> Result<Option<u64>> {
+    let path = data_dir.join(PHONE_BUFFER_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let buffer: PhoneBuffer = read_json(&path)?;
+    if buffer.version != 1 {
+        bail!("unsupported phone buffer file");
+    }
+    Ok(Some(buffer.keep_sats))
+}
+
+/// What the phone holds above its buffer: the part that should go back to the vault before a
+/// ceremony, so it joins the new months. `None` when no buffer is set.
+pub fn leftovers(data_dir: &Path, backend: &dyn HotWalletBackend) -> Result<Option<(u64, u64)>> {
+    let Some(keep_sats) = buffer(data_dir)? else {
+        return Ok(None);
+    };
+    let config = load_config(data_dir)?;
+    ensure_backend_network(backend, &config)?;
+    let mut wallet = HotWallet::open_or_create(data_dir)?;
+    backend.sync_hot_wallet(&mut wallet)?;
+    let spendable = wallet.spendable_sats();
+    Ok(Some((spendable.saturating_sub(keep_sats), keep_sats)))
+}
+
+#[derive(Debug, Clone)]
+pub struct LeftoverReturn {
+    pub txid: Txid,
+    pub returned_sats: u64,
+    pub fee_sats: u64,
+    pub kept_sats: u64,
+}
+
+/// Send everything above the buffer back to the vault, where it needs two keys again. Run it just
+/// before a ceremony: the ceremony's rollover then folds it into the new months. Returned coins
+/// are not in the current presigned months, and each starts its own recovery clock.
+pub fn return_leftovers(
+    data_dir: &Path,
+    backend: &dyn HotWalletBackend,
+    keep_override: Option<u64>,
+) -> Result<Option<LeftoverReturn>> {
+    let keep_sats = match keep_override {
+        Some(keep) => keep,
+        None => buffer(data_dir)?
+            .context("choose how much to keep on the phone first: anzen phone buffer --set SATS")?,
+    };
+    let config = load_config(data_dir)?;
+    ensure_backend_network(backend, &config)?;
+    let vault_script = config
+        .vault_address
+        .parse::<Address<_>>()?
+        .require_network(config.bitcoin_network()?)?
+        .script_pubkey();
+    let mut wallet = HotWallet::open_or_create(data_dir)?;
+    backend.sync_hot_wallet(&mut wallet)?;
+    let Some((transaction, returned_sats, fee_sats)) =
+        wallet.build_leftover_return(keep_sats, vault_script)?
+    else {
+        return Ok(None);
+    };
+    let txid = backend
+        .broadcast(&transaction)
+        .context("failed to broadcast the leftover return")?;
+    Ok(Some(LeftoverReturn {
+        txid,
+        returned_sats,
+        fee_sats,
+        // The fee comes out of the buffer.
+        kept_sats: keep_sats.saturating_sub(fee_sats),
+    }))
+}
 
 /// Initialize the phone key material and its BDK wallet state.
 pub fn initialize(data_dir: &Path, network: Network) -> Result<InitializedDevice> {

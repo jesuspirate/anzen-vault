@@ -44,6 +44,7 @@ readonly TESTS=(
     heir-claim
     watch-alerts
     yubikey-recovery
+    leftover-return
 )
 
 list_tests() {
@@ -1371,6 +1372,56 @@ test_yubikey_recovery() {
     success "Lost phone or lost hardware wallet: the YubiKey and the other key move everything."
 }
 
+vault_utxo_count() {
+    command anzen --data-dir "$MAIN" status | awk '/^Vault UTXOs:/ {print $3}'
+}
+
+# Keep a buffer on the phone and send the rest back to the vault before the next ceremony.
+test_leftover_return() {
+    local captured returned before after
+    setup_vault
+
+    step "First ceremony and the first month's collection"
+    ceremony "$NOW"
+    confirm_transaction "Confirming the rollover"
+    advance_mtp_to "$(month_unlock 1)" "Fast-forward to the first month"
+    anzen "$MAIN" phone authorize 1
+    confirm_transaction "Confirming the first month"
+    success "The first month is on the phone."
+
+    step "Choose what stays on the phone"
+    expect_failure "a buffer must be chosen first" "$MAIN" phone return-leftovers
+    anzen "$MAIN" phone buffer --set 20000000
+    success "0.2 BTC stays on the phone for bills and emergencies."
+
+    step "Return everything above the buffer to the vault before the next ceremony"
+    before=$(vault_balance_sats)
+    anzen_capture captured "$MAIN" phone return-leftovers
+    returned=$(printf '%s\n' "$captured" | awk '/^Returned:/ {print $2}')
+    confirm_transaction "Confirming the leftover return"
+    after=$(vault_balance_sats)
+    if [[ $((after - before)) != "$returned" ]]; then
+        printf 'ERROR: the vault grew by %s sats, not the %s returned\n' "$((after - before))" "$returned" >&2
+        exit 1
+    fi
+    anzen "$MAIN" phone buffer
+    if [[ $(vault_utxo_count) != 2 ]]; then
+        printf 'ERROR: expected the returned coin next to the ceremony remainder\n' >&2
+        exit 1
+    fi
+    success "The leftovers are back in the vault, needing two keys again."
+
+    step "The next ceremony folds the returned coins into the new months"
+    ceremony "$(node_mtp)"
+    confirm_transaction "Confirming the new rollover"
+    status_compact
+    if [[ $(vault_utxo_count) != 1 ]]; then
+        printf 'ERROR: the new ceremony did not fold the returned coin in\n' >&2
+        exit 1
+    fi
+    success "Leftovers joined the new months."
+}
+
 # Run the watcher and fail unless its output contains every given line fragment.
 watch_expect() {
     local data_dir=$1
@@ -1510,6 +1561,7 @@ case "$E2E_TEST" in
     heir-claim) test_heir_claim ;;
     watch-alerts) test_watch_alerts ;;
     yubikey-recovery) test_yubikey_recovery ;;
+    leftover-return) test_leftover_return ;;
     *)
         printf 'ERROR: test %s is listed but has no case here\n' "$E2E_TEST" >&2
         exit 1
