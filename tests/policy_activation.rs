@@ -48,6 +48,32 @@ impl Blockchain for Backend {
     fn scan_connectors(&self, _: &VaultConfig) -> Result<Vec<VaultUtxo>> {
         Ok(Vec::new())
     }
+    /// Unspent outputs of the transactions broadcast so far that pay `address`.
+    fn scan_savings(&self, address: &Address) -> Result<Vec<VaultUtxo>> {
+        let broadcasts = self.broadcasts.borrow();
+        let spent = broadcasts
+            .iter()
+            .flat_map(|tx| tx.input.iter().map(|input| input.previous_output))
+            .collect::<Vec<_>>();
+        Ok(broadcasts
+            .iter()
+            .flat_map(|tx| {
+                let txid = tx.compute_txid();
+                tx.output
+                    .iter()
+                    .enumerate()
+                    .map(move |(vout, txout)| VaultUtxo {
+                        outpoint: OutPoint::new(txid, vout as u32),
+                        txout: txout.clone(),
+                        confirmation_height: 101,
+                    })
+            })
+            .filter(|coin| {
+                coin.txout.script_pubkey == address.script_pubkey()
+                    && !spent.contains(&coin.outpoint)
+            })
+            .collect())
+    }
     fn broadcast(&self, transaction: &Transaction) -> Result<Txid> {
         if self.reject.get() {
             bail!("test rollover rejected");
@@ -98,12 +124,6 @@ fn approved_batch(dir: &Path, backend: &Backend, name: &str, limit: u64) -> Path
 
 fn active_files(dir: &Path, schedule: &Schedule) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut names = vec![SCHEDULE_FILE.to_owned(), CONFIG_FILE.to_owned()];
-    names.extend(
-        schedule
-            .entries
-            .iter()
-            .map(|entry| entry.authorization_file.clone()),
-    );
     if let Some(emergency) = &schedule.emergency_access {
         names.extend([
             emergency.trigger_file.clone(),
@@ -138,10 +158,10 @@ fn rejected_rollover_preserves_active_schedule_limits_and_encrypted_transactions
         load_config(dir.path()).unwrap().monthly_limit_sats,
         5_000_000
     );
-    for entry in old_schedule.entries {
-        let path = dir.path().join(entry.authorization_file);
-        assert_eq!(fs::read(&path).unwrap(), before[&path]);
-    }
+    let old_trigger = dir
+        .path()
+        .join(&old_schedule.emergency_access.as_ref().unwrap().trigger_file);
+    assert_eq!(fs::read(&old_trigger).unwrap(), before[&old_trigger]);
     // A later replay of an old, already-confirmed policy must not replace the current schedule.
     assert!(
         hot_wallet::activate_policy(dir.path(), &backend, &old)
@@ -273,7 +293,14 @@ fn future_vault_inputs_must_be_finalizable_without_signing_their_connectors() {
     let (dir, backend) = setup();
     let batch = approved_batch(dir.path(), &backend, "proposal", 10_000_000);
     let manifest = ceremony::load_manifest(&batch).unwrap();
-    let path = batch.join(&manifest.allowances[0].authorization.psbt_file);
+    let path = batch.join(
+        &manifest
+            .emergency_access
+            .as_ref()
+            .unwrap()
+            .trigger
+            .psbt_file,
+    );
     let original = ceremony::read_psbt(&path).unwrap();
     let mut missing_script = original.clone();
     missing_script.inputs[0].tap_scripts.clear();
@@ -292,9 +319,10 @@ fn future_vault_inputs_must_be_finalizable_without_signing_their_connectors() {
     let phone =
         anzen::core::storage::load_device_keys(dir.path(), anzen::core::storage::PHONE_DEVICE_FILE)
             .unwrap();
-    for entry in schedule.entries {
-        let artifact: ceremony::EncryptedTransaction =
-            anzen::core::storage::read_json(&dir.path().join(entry.authorization_file)).unwrap();
+    {
+        let emergency = schedule.emergency_access.unwrap();
+        let artifact: ceremony::EncryptedEmergencyTransaction =
+            anzen::core::storage::read_json(&dir.path().join(emergency.trigger_file)).unwrap();
         let blob = &artifact.encrypted_psbt;
         let plaintext = anzen::core::crypto::decrypt(&phone.seed, &blob.purpose, blob).unwrap();
         let psbt = bitcoin::Psbt::from_str(std::str::from_utf8(&plaintext).unwrap()).unwrap();
@@ -371,7 +399,7 @@ fn presigned_renewal_spends_the_first_year_remainder_and_replaces_the_schedule()
         schedule
             .previous_entries
             .iter()
-            .map(|entry| entry.authorization_txid.clone())
+            .map(|entry| entry.outpoint)
             .collect::<Vec<_>>()
     };
     assert_eq!(
@@ -379,7 +407,7 @@ fn presigned_renewal_spends_the_first_year_remainder_and_replaces_the_schedule()
         first
             .entries
             .iter()
-            .map(|entry| entry.authorization_txid.clone())
+            .map(|entry| entry.outpoint)
             .collect::<Vec<_>>(),
         "unclaimed first-year months stay claimable"
     );

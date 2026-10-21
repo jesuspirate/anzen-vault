@@ -1,14 +1,13 @@
 use anzen::{
     core::{
-        DEFAULT_FEE_RATE_SAT_VB, EMERGENCY_ACCESS_DELAY_SECONDS, HWW_RECOVERY_BLOCKS,
-        MONTHLY_ALLOWANCE_DELAY_SECONDS, PHONE_RECOVERY_BLOCKS,
+        EMERGENCY_ACCESS_DELAY_SECONDS, HWW_RECOVERY_BLOCKS, MONTHLY_ALLOWANCE_DELAY_SECONDS,
+        PHONE_RECOVERY_BLOCKS,
         ceremony::{
             BatchTransaction, PolicyLimits, build_policy_proposal, read_psbt, validate_batch,
         },
         keys::DeviceKeys,
-        policy::{ControllerPolicy, VaultPolicy},
+        policy::VaultPolicy,
         storage::VaultConfig,
-        transactions::build_controller_revocation_psbt,
         types::VaultUtxo,
     },
     hot_wallet::HotWallet,
@@ -226,29 +225,16 @@ fn vault_output_graph_matches_checked_in_json_vector() {
         "rollover",
         &manifest.rollover,
         &batch,
-        vec![
-            "allowance-chain:step-1".to_owned(),
-            "vault-remainder".to_owned(),
-            "monthly-controller:state-1".to_owned(),
-            "emergency-controller:trigger".to_owned(),
-        ],
+        manifest
+            .rungs
+            .iter()
+            .map(|rung| format!("allowance-month:{}:unlocks-{}", rung.step, rung.unlock))
+            .chain([
+                "vault-remainder".to_owned(),
+                "emergency-controller:trigger".to_owned(),
+            ])
+            .collect(),
     )];
-    for (index, allowance) in manifest.allowances.iter().enumerate() {
-        let mut authorization_outputs = vec![format!(
-            "hot-wallet-monthly-allowance:step-{}",
-            allowance.step
-        )];
-        if index + 1 < manifest.allowance_count {
-            authorization_outputs.push(format!("allowance-chain:step-{}", allowance.step + 1));
-            authorization_outputs.push(format!("monthly-controller:state-{}", allowance.step + 1));
-        }
-        transactions.push(vector_transaction(
-            &format!("allowance:step-{}:authorization", allowance.step),
-            &allowance.authorization,
-            &batch,
-            authorization_outputs,
-        ));
-    }
     transactions.extend([
         vector_transaction(
             "emergency:trigger",
@@ -269,41 +255,9 @@ fn vault_output_graph_matches_checked_in_json_vector() {
         ),
     ]);
 
-    let controller = ControllerPolicy::new(phone.vault_pubkey, hww.vault_pubkey).unwrap();
-    let monthly_connector = VaultUtxo {
-        outpoint: manifest.allowances[0].connector.outpoint,
-        txout: TxOut {
-            value: Amount::from_sat(manifest.connector_value_sats),
-            script_pubkey: controller.address.script_pubkey(),
-        },
-        confirmation_height: 1,
-    };
-    let monthly_revoke_destination = hot.next_change_address().unwrap().script_pubkey();
-    let (monthly_revoke, monthly_revoke_fee) = build_controller_revocation_psbt(
-        &[monthly_connector],
-        monthly_revoke_destination,
-        DEFAULT_FEE_RATE_SAT_VB,
-        &controller,
-    )
-    .unwrap();
-    let monthly_revoke_meta = BatchTransaction {
-        psbt_file: "dynamic-monthly-revocation.psbt".to_owned(),
-        unsigned_txid: monthly_revoke.unsigned_tx.compute_txid().to_string(),
-        fee_sats: monthly_revoke_fee,
-        vault_input_indexes: vec![],
-        controller_input_indexes: vec![0],
-    };
-    anzen::core::ceremony::write_psbt(&batch.join(&monthly_revoke_meta.psbt_file), &monthly_revoke)
-        .unwrap();
-    transactions.push(vector_transaction(
-        "dynamic-revocation:monthly-state-1",
-        &monthly_revoke_meta,
-        &batch,
-        vec!["phone-wallet-change".to_owned()],
-    ));
     let vector = VaultOutputGraphVector {
         format: "anzen-vault-output-graph",
-        version: 3,
+        version: 4,
         network: manifest.network.clone(),
         scenario: VectorScenario {
             created_at: now.to_rfc3339(),

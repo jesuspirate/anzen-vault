@@ -268,15 +268,18 @@ fn real_regtest_enforces_both_recovery_delays_and_rotates_the_phone_epoch() {
     let renewed_utxos = rpc.scan_vault(&new_config).unwrap();
     assert_eq!(
         renewed_utxos.len(),
-        2,
-        "the renewed rollover must create one allowance-chain head and one remainder"
+        1,
+        "the renewed rollover returns one remainder to the vault; the months sit at their own addresses"
     );
     assert!(renewed_utxos.iter().any(|utxo| {
-        utxo.outpoint.txid.to_string() == renewed_schedule.rollover_txid && utxo.outpoint.vout == 0
+        utxo.outpoint.txid.to_string() == renewed_schedule.rollover_txid && utxo.outpoint.vout == 12
     }));
-    assert!(renewed_utxos.iter().any(|utxo| {
-        utxo.outpoint.txid.to_string() == renewed_schedule.rollover_txid && utxo.outpoint.vout == 1
-    }));
+    assert_eq!(
+        hot_wallet::live_rungs(rotation_dir.path(), &rpc)
+            .unwrap()
+            .len(),
+        12
+    );
 
     let replacement = HotWallet::open_or_create(rotation_dir.path()).unwrap();
     let expected = replacement

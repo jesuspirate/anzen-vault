@@ -96,15 +96,25 @@ fn phone_cli_exposes_the_complete_emergency_access_lifecycle() {
 
 #[test]
 fn phone_cli_addresses_allowances_by_sequential_step() {
-    for command in ["authorize", "revoke", "apply-soft-limit"] {
-        Command::cargo_bin("anzen")
-            .unwrap()
-            .args(["phone", command, "--help"])
-            .assert()
-            .success()
-            .stdout(predicate::str::contains("<STEP>"))
-            .stdout(predicate::str::contains("<MONTH>").not());
-    }
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["phone", "authorize", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<STEP>"))
+        .stdout(predicate::str::contains("--limit"))
+        .stdout(predicate::str::contains("<MONTH>").not());
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["phone", "return-unused", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--all"));
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["phone", "allowance", "--help"])
+        .assert()
+        .success();
 }
 
 #[test]

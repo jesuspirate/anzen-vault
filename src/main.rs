@@ -255,13 +255,6 @@ enum PhoneCommand {
     ActivatePolicy { approved_policy: PathBuf },
     /// Broadcast the presigned second-year renewal once it unlocks (360 days after the rollover).
     Renew,
-    /// Broadcast the next presigned allowance authorization after its relative delay.
-    Authorize {
-        step: u8,
-        /// Use the epoch a presigned renewal replaced, for its unclaimed months.
-        #[arg(long)]
-        previous: bool,
-    },
     /// Show or choose how much to keep on the phone for bills and emergencies. Anything above it
     /// goes back to the vault before the next ceremony.
     Buffer {
@@ -276,18 +269,23 @@ enum PhoneCommand {
         #[arg(long)]
         keep: Option<u64>,
     },
-    /// Return the difference between an authorization and a lower soft limit.
-    ApplySoftLimit {
+    /// List the allowance months: when each unlocks and whether it is still available.
+    Allowance,
+    /// Move one unlocked allowance month to this phone's wallet.
+    Authorize {
         step: u8,
-        #[arg(long)]
-        limit: u64,
-    },
-    /// Revoke this allowance step and every later step in its chain.
-    Revoke {
-        step: u8,
-        /// Use the epoch a presigned renewal replaced.
+        /// Use the epoch a presigned renewal replaced, for its unclaimed months.
         #[arg(long)]
         previous: bool,
+        /// Take only this many sats and send the rest of the month back to the vault.
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+    /// Send unclaimed allowance months back to the vault. By default a month goes back once the
+    /// next month has unlocked; `--all` also returns the current month.
+    ReturnUnused {
+        #[arg(long)]
+        all: bool,
     },
     /// Execute or cancel the epoch's presigned emergency-access package.
     Emergency {
@@ -392,9 +390,9 @@ enum HwwCommand {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Immediately invalidate every live programmable-policy state.
+    /// Panic button: pull every allowance month back (locked or not) and cancel emergency access.
     RevokePolicy {
-        /// Verified safe destination for the small controller-output remainder.
+        /// Safe destination for the months, normally the vault address.
         destination: String,
         #[arg(long)]
         yes: bool,
@@ -685,16 +683,7 @@ fn run_phone(
             let backend = rpc_args.connect_hot(data_dir)?;
             let schedule = hot_wallet::activate_presigned_renewal(data_dir, backend.as_ref())?;
             println!("Presigned renewal broadcast: {}", schedule.rollover_txid);
-            println!("Allowance steps scheduled: {}", schedule.entries.len());
-        }
-        PhoneCommand::Authorize { step, previous } => {
-            broadcast_monthly(
-                data_dir,
-                rpc_args,
-                step,
-                core::ceremony::TransactionKind::Authorization,
-                previous,
-            )?;
+            println!("Allowance months scheduled: {}", schedule.entries.len());
         }
         PhoneCommand::Buffer { set } => {
             if let Some(keep) = set {
@@ -732,25 +721,35 @@ fn run_phone(
                 ),
             }
         }
-        PhoneCommand::ApplySoftLimit { step, limit } => {
+        PhoneCommand::Allowance => print_allowance(data_dir, rpc_args)?,
+        PhoneCommand::Authorize {
+            step,
+            previous,
+            limit,
+        } => {
             let backend = rpc_args.connect_hot(data_dir)?;
-            match hot_wallet::apply_soft_limit(data_dir, backend.as_ref(), step, limit)? {
-                Some(txid) => println!(
-                    "Soft limit applied for allowance step {step}: retained at most {limit} sats hot; cold-return txid={txid}"
-                ),
-                None => println!(
-                    "Soft limit equals the monthly limit for allowance step {step}; no cold-return transaction required"
-                ),
+            let result =
+                hot_wallet::claim_month(data_dir, backend.as_ref(), step, previous, limit)?;
+            println!("Allowance month {step} claimed: {}", result.txid);
+            println!("To this phone: {} sats", result.sent_sats);
+            if result.returned_sats > 0 {
+                println!("Back to the vault: {} sats", result.returned_sats);
             }
+            println!("Fee: {} sats", result.fee_sats);
         }
-        PhoneCommand::Revoke { step, previous } => {
-            broadcast_monthly(
-                data_dir,
-                rpc_args,
-                step,
-                core::ceremony::TransactionKind::Revocation,
-                previous,
-            )?;
+        PhoneCommand::ReturnUnused { all } => {
+            let backend = rpc_args.connect_hot(data_dir)?;
+            match hot_wallet::return_unclaimed_months(data_dir, backend.as_ref(), all)? {
+                Some(result) => {
+                    println!(
+                        "Returned {} unused allowance month(s) to the vault: {}",
+                        result.month_count, result.txid
+                    );
+                    println!("Back to the vault: {} sats", result.returned_sats);
+                    println!("Fee: {} sats", result.fee_sats);
+                }
+                None => println!("No unused allowance months to return"),
+            }
         }
         PhoneCommand::Emergency { command } => {
             let backend = rpc_args.connect_hot(data_dir)?;
@@ -913,10 +912,7 @@ fn run_phone(
                         schedule.monthly_limit_sats
                     );
                     println!("Policy rollover broadcast: {}", schedule.rollover_txid);
-                    println!(
-                        "Encrypted allowance authorizations: {}",
-                        schedule.entries.len()
-                    );
+                    println!("Allowance months: {}", schedule.entries.len());
                     if let Some(emergency) = &schedule.emergency_access {
                         println!("Emergency access preserved: {} sats", emergency.amount_sats);
                     }
@@ -963,7 +959,7 @@ fn run_hww(
                 format!("failed to read friend public key {}", public_key.display())
             })?;
             let proposed_fingerprint = core::social::friend_fingerprint(&key)?;
-            eprintln!("SIMULATED HWW — ADD RECOVERY FRIEND");
+            hww_banner(data_dir, "ADD RECOVERY FRIEND");
             eprintln!("OpenPGP fingerprint: {proposed_fingerprint}");
             eprintln!(
                 "This friend gains the phone key and descriptor if they obtain the cloud backup"
@@ -1007,23 +1003,59 @@ fn run_hww(
             let config = core::storage::load_config(data_dir)?;
             let backend = rpc_args.connect_chain(data_dir)?;
             let connectors = backend.scan_connectors(&config)?;
-            if connectors.is_empty() {
-                bail!("no live policy controller outputs are available to revoke");
+            let months = hww_live_months(data_dir, &config, backend.as_ref())?;
+            if connectors.is_empty() && months.is_empty() {
+                bail!("no allowance months or emergency access are left to revoke");
             }
-            eprintln!("SIMULATED HWW — REVOKE ACTIVE VAULT POLICY");
-            eprintln!("Controller outputs: {}", connectors.len());
-            eprintln!("Change destination: {destination}");
-            eprintln!("All policy transactions committed to these states will be invalidated");
+            hww_banner(data_dir, "PULL ALLOWANCE BACK AND REVOKE EMERGENCY ACCESS");
+            eprintln!("Allowance months to pull back: {}", months.len());
+            for rung in &months {
+                eprintln!(
+                    "  Month {:>2}  {}  {} sats",
+                    rung.entry.step,
+                    core::ladder::unlock_date(rung.entry.unlock),
+                    rung.entry.value_sats
+                );
+            }
+            if !connectors.is_empty() {
+                eprintln!("Emergency access will be cancelled");
+            }
+            eprintln!("Destination: {destination}");
+            if !months.is_empty() && cold_wallet::ledger::is_ledger_hww(data_dir) {
+                eprintln!(
+                    "Your Ledger reviews each month on its own: {} review(s).",
+                    months.len()
+                );
+            }
             require_hww_approval(yes, Path::new("controller-revocation"), "policy revocation")?;
-            let transaction =
-                cold_wallet::revoke_policy(data_dir, &config, &connectors, &destination)?;
-            let expected_txid = transaction.compute_txid();
-            let txid = backend.broadcast(&transaction)?;
-            if txid != expected_txid {
-                bail!("chain backend returned an unexpected policy revocation transaction ID");
+            if !months.is_empty() {
+                let fee_rate = backend
+                    .estimate_fee_rate(core::fees::DEFAULT_CONFIRMATION_TARGET)?
+                    .unwrap_or(core::DEFAULT_FEE_RATE_SAT_VB);
+                let (transaction, fee_sats) =
+                    cold_wallet::rescue_months(data_dir, &months, &destination, fee_rate)?;
+                let expected_txid = transaction.compute_txid();
+                let txid = backend.broadcast(&transaction)?;
+                if txid != expected_txid {
+                    bail!("chain backend returned an unexpected allowance rescue transaction ID");
+                }
+                println!(
+                    "HWW pulled back {} allowance month(s): {txid}",
+                    months.len()
+                );
+                println!("Fee: {fee_sats} sats");
             }
-            println!("HWW policy revocation broadcast: {txid}");
-            println!("Revoked controller outputs: {}", connectors.len());
+            if !connectors.is_empty() {
+                let transaction =
+                    cold_wallet::revoke_policy(data_dir, &config, &connectors, &destination)?;
+                let expected_txid = transaction.compute_txid();
+                let txid = backend.broadcast(&transaction)?;
+                if txid != expected_txid {
+                    bail!("chain backend returned an unexpected policy revocation transaction ID");
+                }
+                println!("HWW policy revocation broadcast: {txid}");
+                println!("Revoked controller outputs: {}", connectors.len());
+            }
         }
         HwwCommand::ConfirmSavingsSpend {
             proposal,
@@ -1223,6 +1255,20 @@ fn phone_set_policy(
     let timestamp = now.unwrap_or_else(|| chrono::Utc::now().timestamp());
     let now = chrono::DateTime::from_timestamp(timestamp, 0)
         .with_context(|| format!("invalid policy timestamp {timestamp}"))?;
+    if let Ok(schedule) = hot_wallet::load_schedule(data_dir) {
+        let config = core::storage::load_config(data_dir)?;
+        let median_time = backend.chain_tip()?.median_time;
+        let unlocked = hot_wallet::live_rungs_for(&config, backend.as_ref(), &schedule)?
+            .iter()
+            .filter(|rung| core::ladder::is_unlocked(&rung.entry, median_time))
+            .count();
+        if unlocked > 0 {
+            eprintln!(
+                "Note: {unlocked} unused allowance month(s) are outside the vault and not part of \
+                 this ceremony. To include them, first run: anzen phone return-unused --all"
+            );
+        }
+    }
     let leftover = hot_wallet::leftovers(data_dir, backend.as_ref())?.map_or(0, |(sats, _)| sats);
     if leftover >= hot_wallet::MIN_LEFTOVER_RETURN_SATS {
         eprintln!(
@@ -1249,8 +1295,18 @@ fn phone_set_policy(
 
 fn hww_confirm_policy(data_dir: &Path, proposal: &Path, output: &Path, yes: bool) -> Result<()> {
     let package: core::ceremony::PolicyPackage = read_artifact(proposal)?;
-    eprintln!("SIMULATED HWW — ONE HIGH-LEVEL POLICY APPROVAL");
+    hww_banner(data_dir, "YEARLY POLICY APPROVAL");
     print_manifest(&package.manifest, true)?;
+    if cold_wallet::ledger::is_ledger_hww(data_dir) {
+        let reviews = core::ceremony::manifest_transactions(&package.manifest).len()
+            + package.next.as_ref().map_or(0, |next| {
+                core::ceremony::manifest_transactions(&next.manifest).len()
+            });
+        eprintln!(
+            "Your Ledger will ask you to review {reviews} transaction(s). The first sends the \
+             months above out of the vault; check that its amounts match this list."
+        );
+    }
     require_hww_approval(yes, proposal, "complete vault policy")?;
     let workspace = data_dir.join("hww/policy-review");
     reset_workspace(&workspace)?;
@@ -1279,10 +1335,13 @@ fn phone_activate_policy(data_dir: &Path, rpc_args: &ChainArgs, approved: &Path)
     let schedule = hot_wallet::activate_policy(data_dir, backend.as_ref(), &workspace)?;
     println!("Rollover broadcast: {}", schedule.rollover_txid);
     println!("Active monthly limit: {} sats", schedule.monthly_limit_sats);
-    println!(
-        "Encrypted allowance authorizations: {}",
-        schedule.entries.len()
-    );
+    println!("Allowance months: {}", schedule.entries.len());
+    if let Some(first) = schedule.entries.first() {
+        println!(
+            "First month unlocks: {}",
+            core::ladder::unlock_date(first.unlock)
+        );
+    }
     match &schedule.emergency_access {
         Some(emergency) => {
             println!("Active emergency access: {} sats", emergency.amount_sats);
@@ -1317,27 +1376,38 @@ fn print_hww_sweep_prompt(
     require_hww_approval(yes, proposal, "cooperative sweep")
 }
 
-fn broadcast_monthly(
-    data_dir: &Path,
-    rpc_args: &ChainArgs,
-    step: u8,
-    kind: core::ceremony::TransactionKind,
-    previous: bool,
-) -> Result<()> {
+fn print_allowance(data_dir: &Path, rpc_args: &ChainArgs) -> Result<()> {
+    let schedule = hot_wallet::load_schedule(data_dir)?;
     let backend = rpc_args.connect_hot(data_dir)?;
-    let result = if previous {
-        hot_wallet::broadcast_previous_monthly(data_dir, backend.as_ref(), step, kind)?
-    } else {
-        hot_wallet::broadcast_monthly(data_dir, backend.as_ref(), step, kind)?
+    let live = hot_wallet::live_rungs(data_dir, backend.as_ref())?;
+    let median_time = backend.chain_tip()?.median_time;
+    let print_epoch = |title: &str, entries: &[core::ceremony::ScheduleEntry], flag: &str| {
+        if entries.is_empty() {
+            return;
+        }
+        println!("{title}");
+        for entry in entries {
+            let state = if !live.iter().any(|rung| rung.outpoint() == entry.outpoint) {
+                "used".to_owned()
+            } else if core::ladder::is_unlocked(entry, median_time) {
+                format!("available: anzen phone authorize {}{flag}", entry.step)
+            } else {
+                "locked".to_owned()
+            };
+            println!(
+                "  Month {:>2}  {}  {} sats  {state}",
+                entry.step,
+                core::ladder::unlock_date(entry.unlock),
+                entry.value_sats
+            );
+        }
     };
-    let action = match kind {
-        core::ceremony::TransactionKind::Authorization => "Authorization",
-        core::ceremony::TransactionKind::Revocation => "Revocation",
-    };
-    println!(
-        "Broadcast {action} for allowance step {step}: {}",
-        result.transaction_txid
+    print_epoch(
+        "Previous year's months:",
+        &schedule.previous_entries,
+        " --previous",
     );
+    print_epoch("Allowance months:", &schedule.entries, "");
     Ok(())
 }
 
@@ -1371,7 +1441,7 @@ fn print_active_policy(data_dir: &Path) -> Result<()> {
     println!("Vault address: {}", config.vault_address);
     println!("Policy controller address: {}", controller.address);
     println!(
-        "Policy controller reserve: {} sats per active chain",
+        "Emergency connector reserve: {} sats",
         core::CONNECTOR_VALUE_SATS
     );
     println!(
@@ -1387,14 +1457,17 @@ fn print_active_policy(data_dir: &Path) -> Result<()> {
     } else {
         println!("Monthly limit: {} sats", config.monthly_limit_sats);
         if let Ok(schedule) = hot_wallet::load_schedule(data_dir) {
-            println!(
-                "Presigned allowance authorizations: {}",
-                schedule.entries.len()
-            );
-            println!(
-                "Allowance hop delay: {} seconds (~30 days)",
-                schedule.monthly_delay_seconds
-            );
+            println!("Allowance months: {}", schedule.entries.len());
+            if let (Some(first), Some(last)) = (schedule.entries.first(), schedule.entries.last()) {
+                println!(
+                    "First month unlocks: {}",
+                    core::ladder::unlock_date(first.unlock)
+                );
+                println!(
+                    "Last month unlocks:  {}",
+                    core::ladder::unlock_date(last.unlock)
+                );
+            }
         }
     }
     if config.emergency_access_limit_sats == 0 {
@@ -1970,6 +2043,19 @@ fn print_status(data_dir: &Path, rpc_args: &ChainArgs) -> Result<()> {
     println!("Vault UTXOs: {}", utxos.len());
     println!("Vault balance: {} sats", balance);
     println!("Live policy controller outputs: {}", connectors.len());
+    if let Ok(schedule) = hot_wallet::load_schedule(data_dir) {
+        let months = hot_wallet::live_rungs_for(&config, backend.as_ref(), &schedule)?;
+        let unlocked = months
+            .iter()
+            .filter(|rung| core::ladder::is_unlocked(&rung.entry, tip.median_time))
+            .count();
+        println!(
+            "Allowance months waiting: {} ({} unlocked, {} sats)",
+            months.len(),
+            unlocked,
+            months.iter().map(|rung| rung.entry.value_sats).sum::<u64>()
+        );
+    }
     println!(
         "Monthly spending: {}",
         if config.monthly_limit_sats == 0 {
@@ -2063,7 +2149,7 @@ fn print_manifest(manifest: &core::ceremony::BatchManifest, stderr: bool) -> Res
     )?;
     writeln!(
         output,
-        "Policy controller reserve: {} sats per active chain",
+        "Emergency connector reserve: {} sats",
         manifest.connector_value_sats
     )?;
     if manifest.monthly_limit_sats == 0 {
@@ -2091,12 +2177,15 @@ fn print_manifest(manifest: &core::ceremony::BatchManifest, stderr: bool) -> Res
     }
     writeln!(output, "Fee rate: {} sat/vB", manifest.fee_rate_sat_vb)?;
     writeln!(output, "Total input: {} sats", manifest.total_input_sats)?;
-    writeln!(output, "Allowance steps: {}", manifest.allowance_count)?;
-    if manifest.monthly_limit_sats > 0 {
+    writeln!(output, "Allowance months: {}", manifest.allowance_count)?;
+    for rung in &manifest.rungs {
         writeln!(
             output,
-            "Allowance hop delay: {} seconds (~30 days)",
-            core::MONTHLY_ALLOWANCE_DELAY_SECONDS
+            "  Month {:>2}  unlocks {}  {} sats  {}",
+            rung.step,
+            core::ladder::unlock_date(rung.unlock),
+            rung.value_sats,
+            rung.address
         )?;
     }
     if manifest.allowance_count < core::MONTHS_PER_ROLLOVER && manifest.monthly_limit_sats > 0 {
@@ -2119,12 +2208,12 @@ fn print_manifest(manifest: &core::ceremony::BatchManifest, stderr: bool) -> Res
     if manifest.allowance_count > 0 {
         writeln!(
             output,
-            "Initial allowance-chain UTXO: {} sats",
+            "Allowance total: {} sats",
             manifest.allowance_value_sats
         )?;
         writeln!(
             output,
-            "Rollover remainder: {} sats",
+            "Back to the vault: {} sats",
             manifest.remainder_value_sats
         )?;
     }
@@ -2246,12 +2335,12 @@ fn report_rotation(package: &core::recovery::PhoneRotationPackage, stderr: bool)
         )?;
         writeln!(
             output,
-            "Renewed allowance steps: {}",
+            "Renewed allowance months: {}",
             policy.manifest.allowance_count
         )?;
         writeln!(
             output,
-            "Renewed policy PSBTs: {}",
+            "Renewed policy transactions: {}",
             core::ceremony::manifest_transactions(&policy.manifest).len()
         )?;
         if policy.manifest.emergency_access_limit_sats > 0 {
@@ -2265,6 +2354,51 @@ fn report_rotation(package: &core::recovery::PhoneRotationPackage, stderr: bool)
         writeln!(output, "Programmable vault policy remains disabled")?;
     }
     Ok(())
+}
+
+/// The allowance months the HWW can still pull back: those it approved, plus any the phone's
+/// schedule in this folder lists, that are still unspent and belong to the current keys.
+fn hww_live_months(
+    data_dir: &Path,
+    config: &core::storage::VaultConfig,
+    backend: &dyn core::chain::Blockchain,
+) -> Result<Vec<core::ladder::LiveRung>> {
+    let mut entries = cold_wallet::approved_rungs(data_dir)?;
+    let schedule_path = data_dir.join(core::ceremony::SCHEDULE_FILE);
+    if let Ok(schedule) = core::storage::read_json::<core::ceremony::Schedule>(&schedule_path) {
+        for entry in schedule
+            .previous_entries
+            .into_iter()
+            .chain(schedule.entries)
+        {
+            if !entries.iter().any(|known| known.outpoint == entry.outpoint) {
+                entries.push(entry);
+            }
+        }
+    }
+    let mut live = Vec::new();
+    for entry in &entries {
+        // Months approved under an earlier phone key cannot match this vault's keys.
+        let Ok(rung) = core::ladder::LiveRung::new(config, entry) else {
+            continue;
+        };
+        if backend
+            .scan_savings(&rung.policy.address)?
+            .iter()
+            .any(|coin| coin.outpoint == entry.outpoint)
+        {
+            live.push(rung);
+        }
+    }
+    Ok(live)
+}
+
+fn hww_banner(data_dir: &Path, title: &str) {
+    if cold_wallet::ledger::is_ledger_hww(data_dir) {
+        eprintln!("LEDGER — {title}");
+    } else {
+        eprintln!("SIMULATED HWW — {title}");
+    }
 }
 
 fn require_hww_approval(yes: bool, input: &Path, description: &str) -> Result<()> {
