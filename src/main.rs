@@ -683,7 +683,7 @@ fn run_phone(
             let backend = rpc_args.connect_hot(data_dir)?;
             let schedule = hot_wallet::activate_presigned_renewal(data_dir, backend.as_ref())?;
             println!("Presigned renewal broadcast: {}", schedule.rollover_txid);
-            println!("Allowance steps scheduled: {}", schedule.entries.len());
+            println!("Allowance months scheduled: {}", schedule.entries.len());
         }
         PhoneCommand::Buffer { set } => {
             if let Some(keep) = set {

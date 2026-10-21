@@ -1153,7 +1153,8 @@ test_presigned_renewal() {
     anzen "$MAIN" phone renew
     confirm_transaction "Confirming the presigned second-year rollover"
     require_live_controllers 0
-    require_waiting_months 24
+    # Year one's unused months stay out; year two gets as many months as its remainder funds.
+    require_waiting_months "$((12 + $(jq '.entries | length' "$MAIN/phone/schedule.json")))"
     success "Second year started without the HWW."
 
     step "Claim an unclaimed first-year month after the renewal"
