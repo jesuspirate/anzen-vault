@@ -53,6 +53,13 @@ pub struct VaultConfig {
     /// coins; see `VaultPolicy::build`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yubikey_vault_pubkey: Option<String>,
+    /// How this vault's policies write their unspendable internal key. Vaults created before
+    /// this field existed have none and keep `Legacy`; new vaults use `Provable`.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::core::policy::InternalKey::is_legacy"
+    )]
+    pub internal_key: crate::core::policy::InternalKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +102,7 @@ impl VaultConfig {
                 .context("invalid configured HWW key")?,
             yubikey: self.yubikey_key()?,
             heir: self.heir_key()?,
+            internal_key: self.internal_key,
         })
     }
 
@@ -248,6 +256,8 @@ pub fn initialize_vault_for_network(data_dir: &Path, network: Network) -> Result
             hww: hww_vault_key,
             yubikey,
             heir: heir_key,
+            // New vaults write the internal key so a BitBox02 can show it is unspendable.
+            internal_key: crate::core::policy::InternalKey::Provable,
         },
         network,
     )?;
@@ -268,6 +278,7 @@ pub fn initialize_vault_for_network(data_dir: &Path, network: Network) -> Result
         savings_locks: Vec::new(),
         heir,
         yubikey_vault_pubkey: yubikey.map(|key| key.to_string()),
+        internal_key: crate::core::policy::InternalKey::Provable,
     };
     write_json(&data_dir.join(CONFIG_FILE), &config)?;
 
@@ -305,6 +316,7 @@ pub fn restore_public_config(
             hww_vault_pubkey: lock_keys.hww.to_string(),
             yubikey_vault_pubkey: lock_keys.yubikey.map(|key| key.to_string()),
             heir_vault_pubkey: lock_keys.heir.map(|key| key.to_string()),
+            internal_key: lock_keys.internal_key,
             address: policy.address.to_string(),
             default_deposit: false,
         });
@@ -326,6 +338,7 @@ pub fn restore_public_config(
         savings_locks,
         heir,
         yubikey_vault_pubkey: keys.yubikey.map(|key| key.to_string()),
+        internal_key: keys.internal_key,
     })
 }
 

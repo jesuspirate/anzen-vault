@@ -756,7 +756,7 @@ fn controller_policy(config: &VaultConfig) -> Result<ControllerPolicy> {
         .context("invalid configured phone vault key")?;
     let hww = crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)
         .context("invalid configured HWW vault key")?;
-    ControllerPolicy::new_for_network(phone, hww, config.bitcoin_network()?)
+    ControllerPolicy::new_for_network(phone, hww, config.internal_key, config.bitcoin_network()?)
 }
 
 #[cfg(test)]

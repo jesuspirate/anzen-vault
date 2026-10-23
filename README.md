@@ -48,10 +48,10 @@ tr(
 )
 ```
 
-Every key is a BIP388 key expression, so a stock hardware wallet (tested with the Ledger Bitcoin app 2.5.1) can register and sign these policies as written:
+Every key is a BIP388 key expression, so a stock hardware wallet (tested with the Ledger Bitcoin app 2.5.1 and BitBox02 firmware 9.26) can register and sign these policies as written:
 
 - `phone` and `hww` are each device's account xpub at `m/86'/coin'/100'/0/index`, with its `[fingerprint/path]` origin.
-- `NUMS` is BIP341's point H as an xpub with chain code `sha256(H)`. Every child of H is unspendable, and Ledger labels it "Dummy key".
+- `NUMS` is BIP341's point H as an xpub. Every child of H is unspendable. New vaults set its chain code to the SHA256 of the policy's other keys in order, the convention that lets a BitBox02 prove the key is unspendable and label it "Provably unspendable"; Ledger labels it "Dummy key". Vaults made before this change keep chain code `sha256(H)` and their addresses.
 - The cooperative leaf and the connector policy use each key at `/<0;1>/*`; the single-key recovery leaves and the allowance-month leaves use `/<2;3>/*`. Ledger refuses a policy that reuses a key with the same derivation in two leaves.
 - Anzen uses the receive branch at index 0, so each policy still has one fixed address.
 
@@ -99,7 +99,7 @@ The immediate trigger spends the vault remainder and emergency connector, then c
 
 Connector change never returns to the controller address: phone cancellation sends it to a fresh hot-wallet change address, while HWW revocation requires an explicitly displayed destination. A later annual rollover spends every live vault and connector output, resets recovery delays, creates only the renewed policy's connector, and invalidates the old emergency transactions. Allowance months that already exist stay at their own addresses until they are claimed, returned or pulled back.
 
-By default one HWW ceremony presigns two years (`phone set-policy --years 2`). The second year's rollover spends the first year's vault remainder and carries a BIP68 delay of 360 days, so it cannot be broadcast early; the HWW checks that link before signing. It creates the second year's twelve months, dated 360 days after the first year's, and a pay-to-anchor output. After the delay, `anzen phone renew` broadcasts it from the phone alone (bumping its fee through the anchor), which resets the recovery delays well before the first year's single-key recovery opens after about 425 days. A monthly-only policy is therefore two HWW-signed transactions for two years. The renewal does not touch the first year's months, so unclaimed first-year months stay claimable with `phone authorize <step> --previous`. Deposits made after the ceremony are not covered by the renewal and need a new ceremony. `--years 1` keeps the yearly ceremony.
+By default one HWW ceremony presigns two years (`phone set-policy --years 2`). The second year's rollover spends the first year's vault remainder and carries a BIP68 delay of 360 days, so it cannot be broadcast early; the HWW checks that link before signing. It creates the second year's twelve months, dated 360 days after the first year's, and a 330-sat fee-bump output paid to a fixed address of the phone's own wallet (rather than a pay-to-anchor output, which no BitBox02 firmware can sign). After the delay, `anzen phone renew` broadcasts it from the phone alone (spending that output, plus phone coins if needed, to bring the fee up to today's rate), which resets the recovery delays well before the first year's single-key recovery opens after about 425 days. A monthly-only policy is therefore two HWW-signed transactions for two years. The renewal does not touch the first year's months, so unclaimed first-year months stay claimable with `phone authorize <step> --previous`. Deposits made after the ceremony are not covered by the renewal and need a new ceremony. `--years 1` keeps the yearly ceremony.
 
 ### Hard-locked savings
 
@@ -262,6 +262,25 @@ $ anzen --signet hww init --ledger
 ```
 
 The Ledger keeps its key. On first use of each policy the device asks you to register it ("Register account") and shows the vault address so you can compare it. Every later HWW step asks you to review a transaction or, to unlock the encrypted cloud backup, to sign the fixed message "Anzen: unlock the vault recovery backup (v1)". Ceremony transactions spend coins from outside the vault, so the Ledger warns about external inputs; that is expected.
+
+### Use a BitBox02 as the HWW
+
+A BitBox02 (the Bitcoin-only edition or the multi edition) with firmware 9.21 or later can replace the simulated HWW. Build with USB support, and point `ANZEN_BITBOX` at the device:
+
+```console
+$ cargo build --release --features bitbox-usb   # needs libudev-dev on Linux
+$ export ANZEN_BITBOX=usb                        # or tcp:127.0.0.1:15423 for the BitBox02 simulator
+$ anzen --signet hww init --bitbox
+```
+
+The BitBox02 keeps its key. The first time a computer talks to it, both show a pairing code; check that they match and confirm on the device. Setup reads the vault key at `m/86'/coin'/100'/0/0`, which the BitBox02 calls an unusual keypath: approve it once. On first use of each policy the device shows every key and spending path for you to register, then shows the vault address so you can compare it. New vaults use a "provably unspendable" internal key, which the BitBox02 recognizes and labels as such. Every later HWW step is a transaction review, or, to unlock the encrypted cloud backup, a confirmation of a key that is never used to hold coins.
+
+The BitBox02 signs one policy per transaction, so two things differ from a Ledger:
+
+- `anzen hww revoke-policy` pulls each month back in its own transaction, one review per month.
+- Emergency access is not supported yet: its yearly transactions mix the vault with the emergency connector. Leave `--emergency-access-limit` at 0; the HWW refuses such a policy with a clear message rather than signing part of it.
+
+The recovery kit asks for the hardware wallet's 24 secret words. If you set up the BitBox02 with a microSD backup, also write down its words (BitBoxApp: Device settings, Show recovery words). A Ledger's 24 words restored onto a BitBox02, or the reverse, give the same vault key.
 
 ### Set or replace the vault policy
 
