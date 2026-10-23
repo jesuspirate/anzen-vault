@@ -3,7 +3,9 @@
 //! Keep this module deliberately small and readable. It may depend on `crate::core`, but never on
 //! `crate::hot_wallet`.
 
+pub mod bitbox;
 pub mod ledger;
+pub mod wallet_policy;
 
 use crate::core::{
     ceremony::{self, BatchManifest, ScheduleEntry},
@@ -90,6 +92,19 @@ pub fn initialize(data_dir: &Path, network: Network) -> Result<InitializedDevice
 
 /// Use a Ledger as the HWW. Only its public vault key is stored.
 pub fn initialize_ledger(data_dir: &Path, network: Network) -> Result<crate::core::keys::VaultKey> {
+    initialize_hardware(data_dir, network, ledger::initialize)
+}
+
+/// Use a BitBox02 as the HWW. Only its public vault key is stored.
+pub fn initialize_bitbox(data_dir: &Path, network: Network) -> Result<crate::core::keys::VaultKey> {
+    initialize_hardware(data_dir, network, bitbox::initialize)
+}
+
+fn initialize_hardware(
+    data_dir: &Path,
+    network: Network,
+    initialize: impl FnOnce(&Path, Network, u32) -> Result<crate::core::keys::VaultKey>,
+) -> Result<crate::core::keys::VaultKey> {
     validate_supported_network(network)?;
     for existing in [HWW_DEVICE_FILE, HWW_PUBLIC_FILE] {
         if data_dir.join(existing).exists() {
@@ -104,7 +119,7 @@ pub fn initialize_ledger(data_dir: &Path, network: Network) -> Result<crate::cor
     {
         anyhow::bail!("initialize the HWW for the same network as the phone");
     }
-    let vault_key = ledger::initialize(data_dir, network, 0)?;
+    let vault_key = initialize(data_dir, network, 0)?;
     write_json(
         &data_dir.join(HWW_PUBLIC_FILE),
         &PublicDeviceFile {
@@ -412,25 +427,37 @@ pub fn revoke_policy(
 }
 
 /// Move allowance months, unlocked or not, to `destination` with the HWW alone. A hardware
-/// wallet reviews one transaction per month.
+/// wallet reviews one signature per month. Usually that is one transaction; a BitBox02 signs
+/// only one policy per transaction, so it gets one transaction per month. Each transaction
+/// comes with its fee.
 pub fn rescue_months(
     data_dir: &Path,
     rungs: &[ladder::LiveRung],
     destination: &Address,
     fee_rate_sat_vb: u64,
-) -> Result<(Transaction, u64)> {
+) -> Result<Vec<(Transaction, u64)>> {
     let hww = load_hww(data_dir)?;
-    let spend = ladder::build_rung_spend(
-        rungs,
-        SpendPath::HwwRecovery,
-        vec![bitcoin::TxOut {
-            value: bitcoin::Amount::ZERO,
-            script_pubkey: destination.script_pubkey(),
-        }],
-        fee_rate_sat_vb,
-    )?;
-    let fee_sats = spend.fee_sats;
-    Ok((ladder::sign_as_hww(spend, rungs, &*hww)?, fee_sats))
+    let groups: Vec<&[ladder::LiveRung]> = if hww.one_policy_per_transaction() {
+        rungs.chunks(1).collect()
+    } else {
+        vec![rungs]
+    };
+    groups
+        .into_iter()
+        .map(|rungs| {
+            let spend = ladder::build_rung_spend(
+                rungs,
+                SpendPath::HwwRecovery,
+                vec![bitcoin::TxOut {
+                    value: bitcoin::Amount::ZERO,
+                    script_pubkey: destination.script_pubkey(),
+                }],
+                fee_rate_sat_vb,
+            )?;
+            let fee_sats = spend.fee_sats;
+            Ok((ladder::sign_as_hww(spend, rungs, &*hww)?, fee_sats))
+        })
+        .collect()
 }
 
 pub fn approve_cooperative_sweep(
@@ -526,11 +553,14 @@ fn load_or_migrate_cloud_backup(
     Ok(migrated)
 }
 
-/// The vault's HWW: a Ledger when one was set up with `hww init --ledger`, otherwise the
-/// software stand-in.
+/// The vault's HWW: a Ledger or BitBox02 when one was set up with `hww init --ledger` or
+/// `--bitbox`, otherwise the software stand-in.
 pub fn load_hww(data_dir: &Path) -> Result<Box<dyn VaultSigner>> {
     if ledger::is_ledger_hww(data_dir) {
         return Ok(Box::new(ledger::LedgerHww::open(data_dir)?));
+    }
+    if bitbox::is_bitbox_hww(data_dir) {
+        return Ok(Box::new(bitbox::BitBoxHww::open(data_dir)?));
     }
     Ok(Box::new(load_device_keys(data_dir, HWW_DEVICE_FILE)?))
 }

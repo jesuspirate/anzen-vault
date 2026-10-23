@@ -352,12 +352,16 @@ enum EmergencyCommand {
 
 #[derive(Debug, Subcommand)]
 enum HwwCommand {
-    /// Create the simulated HWW key, or with --ledger use a Ledger's key.
+    /// Create the simulated HWW key, or with --ledger or --bitbox use a hardware wallet's key.
     Init {
         /// Use a Ledger running the Bitcoin app (Bitcoin Test on signet and regtest) instead of
         /// the simulated HWW. Set ANZEN_LEDGER=tcp:HOST:PORT to use Ledger's emulator.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "bitbox")]
         ledger: bool,
+        /// Use a BitBox02 (firmware 9.21 or newer) instead of the simulated HWW. Set
+        /// ANZEN_BITBOX=tcp:HOST:PORT to use the BitBox02 simulator.
+        #[arg(long)]
+        bitbox: bool,
     },
     /// Validate one high-level policy and sign its complete PSBT batch.
     ConfirmPolicy {
@@ -931,13 +935,19 @@ fn run_hww(
     network: Network,
 ) -> Result<()> {
     match command {
-        HwwCommand::Init { ledger: true } => {
+        HwwCommand::Init { ledger: true, .. } => {
             let key = cold_wallet::initialize_ledger(data_dir, network)?;
             println!("Ledger set up as the HWW ({})", network_label(network));
             println!("HWW vault key: {key}");
             println!("The Ledger keeps its key; nothing secret was written to disk");
         }
-        HwwCommand::Init { ledger: false } => {
+        HwwCommand::Init { bitbox: true, .. } => {
+            let key = cold_wallet::initialize_bitbox(data_dir, network)?;
+            println!("BitBox02 set up as the HWW ({})", network_label(network));
+            println!("HWW vault key: {key}");
+            println!("The BitBox02 keeps its key; nothing secret was written to disk");
+        }
+        HwwCommand::Init { .. } => {
             let hww = cold_wallet::initialize(data_dir, network)?;
             println!("Simulated HWW initialized ({})", network_label(network));
             println!("HWW mnemonic: {}", hww.mnemonic);
@@ -1027,23 +1037,31 @@ fn run_hww(
                     months.len()
                 );
             }
+            if !months.is_empty() && cold_wallet::bitbox::is_bitbox_hww(data_dir) {
+                eprintln!(
+                    "Your BitBox02 signs each month as its own transaction: {} review(s).",
+                    months.len()
+                );
+            }
             require_hww_approval(yes, Path::new("controller-revocation"), "policy revocation")?;
             if !months.is_empty() {
                 let fee_rate = backend
                     .estimate_fee_rate(core::fees::DEFAULT_CONFIRMATION_TARGET)?
                     .unwrap_or(core::DEFAULT_FEE_RATE_SAT_VB);
-                let (transaction, fee_sats) =
+                let rescues =
                     cold_wallet::rescue_months(data_dir, &months, &destination, fee_rate)?;
-                let expected_txid = transaction.compute_txid();
-                let txid = backend.broadcast(&transaction)?;
-                if txid != expected_txid {
-                    bail!("chain backend returned an unexpected allowance rescue transaction ID");
+                let months_per_transaction = months.len() / rescues.len();
+                for (transaction, fee_sats) in rescues {
+                    let expected_txid = transaction.compute_txid();
+                    let txid = backend.broadcast(&transaction)?;
+                    if txid != expected_txid {
+                        bail!(
+                            "chain backend returned an unexpected allowance rescue transaction ID"
+                        );
+                    }
+                    println!("HWW pulled back {months_per_transaction} allowance month(s): {txid}");
+                    println!("Fee: {fee_sats} sats");
                 }
-                println!(
-                    "HWW pulled back {} allowance month(s): {txid}",
-                    months.len()
-                );
-                println!("Fee: {fee_sats} sats");
             }
             if !connectors.is_empty() {
                 let transaction =
@@ -1305,6 +1323,26 @@ fn hww_confirm_policy(data_dir: &Path, proposal: &Path, output: &Path, yes: bool
         eprintln!(
             "Your Ledger will ask you to review {reviews} transaction(s). The first sends the \
              months above out of the vault; check that its amounts match this list."
+        );
+    }
+    if cold_wallet::bitbox::is_bitbox_hww(data_dir) {
+        if package.manifest.emergency_access_limit_sats > 0 {
+            bail!(
+                "emergency access is not available with a BitBox02 yet: its transactions spend the \
+                 vault together with the emergency connector, and a BitBox02 signs only coins of \
+                 one policy at a time. Ask the phone for a new proposal with \
+                 --emergency-access-limit 0"
+            );
+        }
+        let reviews = core::ceremony::manifest_transactions(&package.manifest).len()
+            + package.next.as_ref().map_or(0, |next| {
+                core::ceremony::manifest_transactions(&next.manifest).len()
+            });
+        eprintln!(
+            "Your BitBox02 will ask you to review {reviews} transaction(s). The first sends the \
+             months above out of the vault; check that its amounts match this list. The small \
+             330-sat output of a presigned renewal goes to your phone's wallet, to raise its fee \
+             later."
         );
     }
     require_hww_approval(yes, proposal, "complete vault policy")?;

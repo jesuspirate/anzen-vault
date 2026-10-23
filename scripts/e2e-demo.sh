@@ -80,6 +80,13 @@ case " ${TESTS[*]} " in
 esac
 
 MAIN="$DEMO_ROOT/$E2E_TEST"
+# The HWW's file in the vault folder. Removing it stands for losing the device.
+HWW_DEVICE_FILE=hww/device.json
+if [[ -n ${ANZEN_LEDGER:-} ]]; then
+    HWW_DEVICE_FILE=hww/ledger.json
+elif [[ -n ${ANZEN_BITBOX:-} ]]; then
+    HWW_DEVICE_FILE=hww/bitbox02.json
+fi
 MINING_ADDRESS=
 NOW=
 FUNDING_HEIGHT=
@@ -359,6 +366,11 @@ init_vault() {
         anzen_filtered '
             /^(Ledger set up|HWW vault key:)/ { print }
         ' "$MAIN" hww init --ledger
+    elif [[ -n ${ANZEN_BITBOX:-} ]]; then
+        # Run the HWW side on a BitBox02 (or its simulator) instead of the simulated HWW.
+        anzen_filtered '
+            /^(BitBox02 set up|HWW vault key:)/ { print }
+        ' "$MAIN" hww init --bitbox
     else
         anzen_filtered '
             /^(Simulated HWW initialized|HWW mnemonic:|HWW vault key:|HWW ready)/ { print }
@@ -742,8 +754,8 @@ test_stolen_phone() {
     step "Simulate theft of the phone key and hot-wallet state"
     show_file_command cp -a "$MAIN" "$attacker_dir"
     cp -a "$MAIN" "$attacker_dir"
-    show_file_command rm -- "$attacker_dir/hww/device.json"
-    rm -- "$attacker_dir/hww/device.json"
+    show_file_command rm -- "$attacker_dir/$HWW_DEVICE_FILE"
+    rm -- "$attacker_dir/$HWW_DEVICE_FILE"
     anzen "$attacker_dir" phone send "$attacker_address" 500000
     anzen "$attacker_dir" phone create-sweep "$attacker_address" \
         --output "${E2E_TEST}-attacker-sweep.json"
@@ -772,8 +784,8 @@ test_lost_hww() {
     ceremony "$NOW"
     confirm_transaction "Confirming the annual rollover"
     unlock=$(month_unlock 1)
-    show_file_command rm -- "$MAIN/hww/device.json"
-    rm -- "$MAIN/hww/device.json"
+    show_file_command rm -- "$MAIN/$HWW_DEVICE_FILE"
+    rm -- "$MAIN/$HWW_DEVICE_FILE"
     success "Annual schedule presigned before HWW loss."
 
     advance_mtp_to "$unlock" "Fast-forward through the first allowance delay"
@@ -810,8 +822,8 @@ test_stolen_hww() {
     cp -a "$MAIN" "$attacker_dir"
     show_file_command rm -- "$attacker_dir/phone/device.json"
     rm -- "$attacker_dir/phone/device.json"
-    show_file_command rm -- "$MAIN/hww/device.json"
-    rm -- "$MAIN/hww/device.json"
+    show_file_command rm -- "$MAIN/$HWW_DEVICE_FILE"
+    rm -- "$MAIN/$HWW_DEVICE_FILE"
     expect_failure "HWW recovery is still inside the phone-priority window" \
         "$attacker_dir" hww recover "$attacker_address"
     success "Stolen HWW blocked during phone-priority window."
@@ -861,8 +873,8 @@ test_both_lost() {
     make_receiver recovery_address "Replacement owner"
 
     step "Simulate losing both devices while encrypted cloud data survives"
-    show_file_command rm -- "$MAIN/phone/device.json" "$MAIN/hww/device.json"
-    rm -- "$MAIN/phone/device.json" "$MAIN/hww/device.json"
+    show_file_command rm -- "$MAIN/phone/device.json" "$MAIN/$HWW_DEVICE_FILE"
+    rm -- "$MAIN/phone/device.json" "$MAIN/$HWW_DEVICE_FILE"
     expect_failure "the backup cannot be decrypted without the HWW" \
         "$MAIN" hww decrypt-phone-backup "$MAIN/cloud/phone-seed-backup.json" \
         --output "${E2E_TEST}-missing-hww-recovery.json"
@@ -917,8 +929,8 @@ test_social_recovery() {
     success "Phone key and descriptor protected for HWW and recovery friend."
 
     step "Lose both devices and decrypt the cloud backup with the friend key"
-    show_file_command rm -- "$MAIN/phone/device.json" "$MAIN/hww/device.json"
-    rm -- "$MAIN/phone/device.json" "$MAIN/hww/device.json"
+    show_file_command rm -- "$MAIN/phone/device.json" "$MAIN/$HWW_DEVICE_FILE"
+    rm -- "$MAIN/phone/device.json" "$MAIN/$HWW_DEVICE_FILE"
     anzen "$MAIN" social decrypt-backup "$MAIN/cloud/phone-seed-backup.json" \
         --private-key "$friend_private" --output "$recovery_package"
     expect_failure "social recovery reconstructs M but cannot bypass its on-chain delay" \
@@ -1225,8 +1237,8 @@ test_heir_claim() {
     success "The move started the heir's clock again."
 
     step "The owner disappears with both devices"
-    show_file_command rm -- "$MAIN/phone/device.json" "$MAIN/hww/device.json"
-    rm -- "$MAIN/phone/device.json" "$MAIN/hww/device.json"
+    show_file_command rm -- "$MAIN/phone/device.json" "$MAIN/$HWW_DEVICE_FILE"
+    rm -- "$MAIN/phone/device.json" "$MAIN/$HWW_DEVICE_FILE"
     anzen "$MAIN" recovery-kit --output "$DEMO_ROOT/${E2E_TEST}-kit.html" --owner Jet
     success "Only the printed recovery kit is left."
 
@@ -1322,8 +1334,8 @@ test_yubikey_recovery() {
     success "Vault funded."
 
     step "The hardware wallet is lost (its 24 words are still on paper)"
-    show_file_command mv -- "$MAIN/hww/device.json" "$hww_words"
-    mv -- "$MAIN/hww/device.json" "$hww_words"
+    show_file_command mv -- "$MAIN/$HWW_DEVICE_FILE" "$hww_words"
+    mv -- "$MAIN/$HWW_DEVICE_FILE" "$hww_words"
     expect_failure "the phone alone waits months" "$MAIN" phone recover "$MINING_ADDRESS"
     success "The phone alone cannot move the coins yet."
 
@@ -1352,8 +1364,8 @@ test_yubikey_recovery() {
     success "Two of three keys moved the whole vault at once."
 
     step "Later: the hardware wallet is restored from its words, then the phone is lost"
-    show_file_command mv -- "$hww_words" "$MAIN/hww/device.json"
-    mv -- "$hww_words" "$MAIN/hww/device.json"
+    show_file_command mv -- "$hww_words" "$MAIN/$HWW_DEVICE_FILE"
+    mv -- "$hww_words" "$MAIN/$HWW_DEVICE_FILE"
     anzen "$MAIN" phone send "$vault_address" "$DEFAULT_FUNDING_SATS"
     confirm_transaction "Confirming a new vault deposit"
     show_file_command rm -- "$MAIN/phone/device.json"
