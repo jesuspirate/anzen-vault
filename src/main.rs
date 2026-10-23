@@ -1435,6 +1435,7 @@ fn print_active_policy(data_dir: &Path) -> Result<()> {
     let controller = core::policy::ControllerPolicy::new_for_network(
         config.phone_vault_pubkey.parse()?,
         config.hww_vault_pubkey.parse()?,
+        config.internal_key,
         config.bitcoin_network()?,
     )?;
     println!("Cold storage descriptor: {}", config.vault_descriptor);

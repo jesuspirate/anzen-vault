@@ -211,6 +211,7 @@ fn approve_batch(
     let controller = ControllerPolicy::new_for_network(
         phone_pubkey,
         crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)?,
+        config.internal_key,
         config.bitcoin_network()?,
     )?;
 
@@ -394,6 +395,7 @@ pub fn revoke_policy(
     let controller = ControllerPolicy::new_for_network(
         phone_pubkey,
         hww.vault_key(),
+        config.internal_key,
         config.bitcoin_network()?,
     )?;
     // TODO(production): obtain a current feerate and support explicit fee inputs/RBF/CPFP. The

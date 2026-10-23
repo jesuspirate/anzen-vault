@@ -323,7 +323,12 @@ where
     // Public derivation is enough to test candidates; the winner is re-derived privately below.
     let parent = base_phone.vault_parent(&Secp256k1::new())?;
     let template = Arc::new(VaultAddressTemplate::with_keys(
-        hww_pubkey, yubikey, heir, network,
+        hww_pubkey,
+        yubikey,
+        heir,
+        // A new vault: see `storage::initialize_vault_for_network`.
+        crate::core::policy::InternalKey::Provable,
+        network,
     )?);
     let stopped = Arc::new(AtomicBool::new(false));
     let attempts = Arc::new(AtomicU64::new(0));
@@ -1198,7 +1203,7 @@ fn controller_policy(config: &VaultConfig) -> Result<ControllerPolicy> {
         .context("invalid configured phone vault key")?;
     let hww = crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)
         .context("invalid configured HWW vault key")?;
-    ControllerPolicy::new_for_network(phone, hww, config.bitcoin_network()?)
+    ControllerPolicy::new_for_network(phone, hww, config.internal_key, config.bitcoin_network()?)
 }
 
 fn validate_schedule_controller(schedule: &Schedule, controller: &ControllerPolicy) -> Result<()> {

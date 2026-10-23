@@ -112,6 +112,8 @@ fn fixed_config(phone: &DeviceKeys, hww: &DeviceKeys) -> VaultConfig {
         emergency_access_limit_sats: 0,
         savings_locks: Vec::new(),
         heir: None,
+        // The canonical vectors were fixed before new vaults switched internal key style.
+        internal_key: Default::default(),
     }
 }
 

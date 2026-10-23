@@ -326,6 +326,7 @@ pub fn activate_phone_rotation(
         let controller = ControllerPolicy::new_for_network(
             phone_pubkey,
             hww_pubkey,
+            old_config.internal_key,
             old_config.bitcoin_network()?,
         )?;
         // TODO(production): use a current feerate and allow explicit fee inputs/RBF/CPFP.

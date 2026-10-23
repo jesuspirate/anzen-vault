@@ -995,6 +995,7 @@ pub fn rung_policy(config: &VaultConfig, unlock: u32) -> Result<RungPolicy> {
         VaultKey::from_str(&config.phone_vault_pubkey).context("invalid phone vault key")?,
         VaultKey::from_str(&config.hww_vault_pubkey).context("invalid HWW vault key")?,
         unlock,
+        config.internal_key,
         config.bitcoin_network()?,
     )
 }
@@ -1255,7 +1256,7 @@ fn controller_policy(config: &VaultConfig) -> Result<ControllerPolicy> {
         .context("invalid configured phone vault key")?;
     let hww = crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)
         .context("invalid configured HWW vault key")?;
-    ControllerPolicy::new_for_network(phone, hww, config.bitcoin_network()?)
+    ControllerPolicy::new_for_network(phone, hww, config.internal_key, config.bitcoin_network()?)
 }
 
 #[allow(clippy::too_many_arguments)]
