@@ -2435,6 +2435,8 @@ fn hww_live_months(
 fn hww_banner(data_dir: &Path, title: &str) {
     if cold_wallet::ledger::is_ledger_hww(data_dir) {
         eprintln!("LEDGER — {title}");
+    } else if cold_wallet::bitbox::is_bitbox_hww(data_dir) {
+        eprintln!("BITBOX02 — {title}");
     } else {
         eprintln!("SIMULATED HWW — {title}");
     }
