@@ -266,14 +266,16 @@ fn real_regtest_hww_pulls_back_every_month_and_revokes_emergency_access() {
         .iter()
         .map(|entry| ladder::LiveRung::new(&config, entry).unwrap())
         .collect::<Vec<_>>();
-    let (rescue, _fee) =
-        cold_wallet::rescue_months(dir.path(), &months, &vault_address, 1).unwrap();
+    let rescues = cold_wallet::rescue_months(dir.path(), &months, &vault_address, 1).unwrap();
+    // The software HWW signs every month in one transaction.
+    assert_eq!(rescues.len(), 1);
+    let (rescue, _fee) = &rescues[0];
     assert_eq!(rescue.output.len(), 1);
     assert_eq!(
         rescue.output[0].script_pubkey,
         vault_address.script_pubkey()
     );
-    rpc.broadcast(&rescue).unwrap();
+    rpc.broadcast(rescue).unwrap();
     let revocation =
         cold_wallet::revoke_policy(dir.path(), &config, &controllers, &safe_destination).unwrap();
     assert_eq!(revocation.output.len(), 1);

@@ -323,7 +323,12 @@ where
     // Public derivation is enough to test candidates; the winner is re-derived privately below.
     let parent = base_phone.vault_parent(&Secp256k1::new())?;
     let template = Arc::new(VaultAddressTemplate::with_keys(
-        hww_pubkey, yubikey, heir, network,
+        hww_pubkey,
+        yubikey,
+        heir,
+        // A new vault: see `storage::initialize_vault_for_network`.
+        crate::core::policy::InternalKey::Provable,
+        network,
     )?);
     let stopped = Arc::new(AtomicBool::new(false));
     let attempts = Arc::new(AtomicU64::new(0));
@@ -1078,8 +1083,9 @@ fn broadcast_with_fee_bump(
     Ok(txid)
 }
 
-/// Broadcast a presigned `parent` that carries a pay-to-anchor output, bumping it with a child
-/// funded by hot-wallet coins when the parent's frozen fee is below today's rate.
+/// Broadcast a presigned `parent` that carries a fee-bump output (pay-to-anchor, or a renewal's
+/// phone-owned output), bumping it with a child funded by hot-wallet coins when the parent's
+/// frozen fee is below today's rate.
 fn broadcast_with_anchor_bump(
     data_dir: &Path,
     backend: &dyn HotWalletBackend,
@@ -1105,24 +1111,35 @@ fn broadcast_with_anchor_bump(
         return Ok(txid);
     }
     let mut wallet = HotWallet::open_or_create(data_dir)?;
-    let mut child =
-        match wallet.build_anchor_child(parent, anchor_vout, Amount::from_sat(child_fee)) {
-            Ok(child) => child,
-            // An empty phone wallet must never block emergency access: send the trigger at its
-            // presigned fee and let the user bump it later once the phone holds coins.
-            Err(error) => {
-                eprintln!("warning: broadcasting without a fee bump: {error:#}");
-                let broadcast = backend.broadcast(parent)?;
-                if broadcast != txid {
-                    bail!("chain backend returned an unexpected transaction ID");
-                }
-                return Ok(txid);
+    // Renewals signed before the phone-owned fee-bump output carry a P2A output instead.
+    let is_p2a = parent
+        .output
+        .get(anchor_vout as usize)
+        .is_some_and(|anchor| anchor.script_pubkey == bitcoin::ScriptBuf::new_p2a());
+    let build = |wallet: &mut HotWallet, fee: u64| {
+        if is_p2a {
+            wallet.build_anchor_child(parent, anchor_vout, Amount::from_sat(fee))
+        } else {
+            wallet.build_owned_anchor_child(parent, anchor_vout, Amount::from_sat(fee))
+        }
+    };
+    let mut child = match build(&mut wallet, child_fee) {
+        Ok(child) => child,
+        // An empty phone wallet must never block emergency access: send the trigger at its
+        // presigned fee and let the user bump it later once the phone holds coins.
+        Err(error) => {
+            eprintln!("warning: broadcasting without a fee bump: {error:#}");
+            let broadcast = backend.broadcast(parent)?;
+            if broadcast != txid {
+                bail!("chain backend returned an unexpected transaction ID");
             }
-        };
+            return Ok(txid);
+        }
+    };
     let actual_vsize = child.vsize() as u64;
     if actual_vsize > CHILD_VSIZE_ESTIMATE {
         let fee = fees::cpfp_child_fee(parent_vsize, parent_fee, actual_vsize, target)?;
-        child = wallet.build_anchor_child(parent, anchor_vout, Amount::from_sat(fee))?;
+        child = build(&mut wallet, fee)?;
     }
     backend.broadcast_package(parent, &child)?;
     Ok(txid)
@@ -1198,7 +1215,7 @@ fn controller_policy(config: &VaultConfig) -> Result<ControllerPolicy> {
         .context("invalid configured phone vault key")?;
     let hww = crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)
         .context("invalid configured HWW vault key")?;
-    ControllerPolicy::new_for_network(phone, hww, config.bitcoin_network()?)
+    ControllerPolicy::new_for_network(phone, hww, config.internal_key, config.bitcoin_network()?)
 }
 
 fn validate_schedule_controller(schedule: &Schedule, controller: &ControllerPolicy) -> Result<()> {

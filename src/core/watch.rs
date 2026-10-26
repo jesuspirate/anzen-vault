@@ -163,6 +163,7 @@ impl WatchPackage {
         let controller = ControllerPolicy::new_for_network(
             FromStr::from_str(&config.phone_vault_pubkey)?,
             FromStr::from_str(&config.hww_vault_pubkey)?,
+            config.internal_key,
             network,
         )?;
         let savings_descriptors = config
@@ -250,7 +251,15 @@ impl WatchTargets {
         let allowance = package
             .allowance_unlocks
             .iter()
-            .map(|unlock| RungPolicy::new_for_network(keys.phone, keys.hww, *unlock, network))
+            .map(|unlock| {
+                RungPolicy::new_for_network(
+                    keys.phone,
+                    keys.hww,
+                    *unlock,
+                    keys.internal_key,
+                    network,
+                )
+            })
             .collect::<Result<Vec<_>>>()
             .context("an allowance month in the watch plan is invalid")?;
         let controller_script = Address::from_str(&package.controller_address)
@@ -1058,6 +1067,7 @@ mod tests {
         let controller = ControllerPolicy::new_for_network(
             phone.vault_pubkey,
             hww.vault_pubkey,
+            crate::core::policy::InternalKey::Legacy,
             Network::Regtest,
         )
         .unwrap();
@@ -1085,6 +1095,7 @@ mod tests {
                 phone.vault_pubkey,
                 hww.vault_pubkey,
                 ALLOWANCE_UNLOCK,
+                crate::core::policy::InternalKey::Legacy,
                 Network::Regtest,
             )
             .unwrap(),

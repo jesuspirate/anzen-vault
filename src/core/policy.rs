@@ -47,6 +47,105 @@ fn nums_expression(network: Network) -> String {
     format!("{}/<0;1>/*", nums_xpub(network))
 }
 
+/// How a policy writes its unspendable internal key. Both are BIP341's NUMS point H, so the key
+/// path is unspendable either way; they differ only in H's chain code, which changes the address.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InternalKey {
+    /// Chain code `sha256(H)`. Every vault made before BitBox02 support uses this, and keeps it.
+    #[default]
+    Legacy,
+    /// Chain code `sha256` of every leaf key's account public key, in leaf order. A BitBox02
+    /// recognizes this as "Provably unspendable" when it registers the policy, instead of
+    /// showing an unknown key. See https://delvingbitcoin.org/t/unspendable-keys-in-descriptors/304/21
+    Provable,
+}
+
+impl InternalKey {
+    pub fn is_legacy(&self) -> bool {
+        *self == Self::Legacy
+    }
+
+    /// The style of an Anzen descriptor's internal key. A chain code that is neither style is
+    /// read as `Provable` and then fails the caller's rebuild-and-compare check.
+    fn of(descriptor: &Descriptor<DescriptorPublicKey>) -> Self {
+        let Descriptor::Tr(tr) = descriptor else {
+            return Self::Legacy;
+        };
+        match tr.internal_key() {
+            DescriptorPublicKey::MultiXPub(key)
+                if key.xkey.chain_code == nums_xpub(Network::Regtest).chain_code =>
+            {
+                Self::Legacy
+            }
+            _ => Self::Provable,
+        }
+    }
+}
+
+/// The x-only internal key a policy uses: `nums/0/ADDRESS_INDEX`.
+fn nums_child<C: Verification>(secp: &Secp256k1<C>, nums: Xpub) -> Result<XOnlyPublicKey> {
+    Ok(nums
+        .derive_pub(
+            secp,
+            &[
+                ChildNumber::from_normal_idx(0)?,
+                ChildNumber::from_normal_idx(super::keys::ADDRESS_INDEX)?,
+            ],
+        )?
+        .public_key
+        .x_only_public_key()
+        .0)
+}
+
+/// H as an extended key with the given chain code.
+fn nums_xpub_with_chain_code(network: Network, chain_code: ChainCode) -> Xpub {
+    Xpub {
+        chain_code,
+        ..nums_xpub(network)
+    }
+}
+
+/// The provably-unspendable chain code: `sha256` of the account public key of every key in the
+/// script tree, leaf by leaf, left to right, repeats included.
+fn provable_chain_code(descriptor: &Descriptor<DescriptorPublicKey>) -> Result<ChainCode> {
+    let Descriptor::Tr(tr) = descriptor else {
+        bail!("descriptor is not Taproot");
+    };
+    let mut engine = sha256::Hash::engine();
+    for (_, miniscript) in tr.iter_scripts() {
+        for key in miniscript.iter_pk() {
+            let DescriptorPublicKey::MultiXPub(key) = key else {
+                bail!("every leaf key must be an extended key with a branch pair");
+            };
+            bitcoin::hashes::HashEngine::input(&mut engine, &key.xkey.public_key.serialize());
+        }
+    }
+    Ok(ChainCode::from(
+        sha256::Hash::from_engine(engine).to_byte_array(),
+    ))
+}
+
+/// `tr(NUMS, tree)` with the internal key written in the given style.
+fn taproot_descriptor(
+    tree: &str,
+    internal: InternalKey,
+    network: Network,
+) -> Result<Descriptor<DescriptorPublicKey>> {
+    let text = format!("tr({},{tree})", nums_expression(network));
+    let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&text)
+        .with_context(|| format!("invalid policy descriptor: {text}"))?;
+    match internal {
+        InternalKey::Legacy => Ok(descriptor),
+        InternalKey::Provable => {
+            let nums = nums_xpub_with_chain_code(network, provable_chain_code(&descriptor)?);
+            let text = format!("tr({nums}/<0;1>/*,{tree})");
+            Descriptor::<DescriptorPublicKey>::from_str(&text)
+                .with_context(|| format!("invalid policy descriptor: {text}"))
+        }
+    }
+}
+
 /// The receive descriptor of a multipath policy, at the single address index Anzen uses.
 fn receive_descriptor(
     descriptor: &Descriptor<DescriptorPublicKey>,
@@ -186,6 +285,7 @@ impl RungPolicy {
         phone: VaultKey,
         hww: VaultKey,
         unlock: u32,
+        internal: InternalKey,
         network: Network,
     ) -> Result<Self> {
         if unlock < bitcoin::absolute::LOCK_TIME_THRESHOLD {
@@ -194,13 +294,14 @@ impl RungPolicy {
         if phone.recovery() == hww.recovery() {
             bail!("phone and HWW keys must differ");
         }
-        let nums = nums_expression(network);
         let phone_r = phone.branch_expression(RECOVERY_BRANCH);
         let hww_r = hww.branch_expression(RECOVERY_BRANCH);
-        let descriptor_text =
-            format!("tr({nums},{{and_v(v:pk({phone_r}),after({unlock})),pk({hww_r})}})");
-        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&descriptor_text)
-            .with_context(|| format!("invalid allowance descriptor: {descriptor_text}"))?;
+        let descriptor = taproot_descriptor(
+            &format!("{{and_v(v:pk({phone_r}),after({unlock})),pk({hww_r})}}"),
+            internal,
+            network,
+        )
+        .context("invalid allowance descriptor")?;
         let address = policy_address(&descriptor, network)?;
         Ok(Self {
             descriptor,
@@ -304,6 +405,8 @@ pub struct PolicyKeys {
     /// A third key the owner holds: any two of phone, HWW and YubiKey can move the coins.
     pub yubikey: Option<VaultKey>,
     pub heir: Option<VaultKey>,
+    /// How the policies write their unspendable internal key. New vaults use `Provable`.
+    pub internal_key: InternalKey,
 }
 
 impl PolicyKeys {
@@ -313,6 +416,7 @@ impl PolicyKeys {
             hww,
             yubikey: None,
             heir: None,
+            internal_key: InternalKey::Legacy,
         }
     }
 
@@ -392,12 +496,17 @@ pub struct ControllerPolicy {
 /// compare this optimized path with the canonical Miniscript descriptor construction.
 #[derive(Debug, Clone)]
 pub struct VaultAddressTemplate {
-    internal_key: XOnlyPublicKey,
+    /// The internal key when it does not depend on the phone key (`InternalKey::Legacy`).
+    legacy_internal_key: Option<XOnlyPublicKey>,
+    network: Network,
+    hww: VaultKey,
+    heir: Option<VaultKey>,
     hww_cooperative: XOnlyPublicKey,
     hww_recovery_node: TapNodeHash,
     heir_node: Option<TapNodeHash>,
-    /// With a YubiKey: its key in the phone pair leaf, and the fixed HWW pair leaf.
-    yubikey: Option<(XOnlyPublicKey, TapNodeHash)>,
+    /// With a YubiKey: its account key, its key in the phone pair leaf, and the fixed HWW pair
+    /// leaf.
+    yubikey: Option<(VaultKey, XOnlyPublicKey, TapNodeHash)>,
 }
 
 impl VaultAddressTemplate {
@@ -406,27 +515,21 @@ impl VaultAddressTemplate {
     }
 
     pub fn with_heir(hww: VaultKey, heir: Option<VaultKey>, network: Network) -> Result<Self> {
-        Self::with_keys(hww, None, heir, network)
+        Self::with_keys(hww, None, heir, InternalKey::Legacy, network)
     }
 
     pub fn with_keys(
         hww: VaultKey,
         yubikey: Option<VaultKey>,
         heir: Option<VaultKey>,
+        internal: InternalKey,
         network: Network,
     ) -> Result<Self> {
         let secp = Secp256k1::verification_only();
-        let internal_key = nums_xpub(network)
-            .derive_pub(
-                &secp,
-                &[
-                    ChildNumber::from_normal_idx(0)?,
-                    ChildNumber::from_normal_idx(super::keys::ADDRESS_INDEX)?,
-                ],
-            )?
-            .public_key
-            .x_only_public_key()
-            .0;
+        let legacy_internal_key = match internal {
+            InternalKey::Legacy => Some(nums_child(&secp, nums_xpub(network))?),
+            InternalKey::Provable => None,
+        };
         let hww_recovery_node = TapNodeHash::from_script(
             &recovery_script(hww.child(&secp, RECOVERY_BRANCH), HWW_RECOVERY_BLOCKS),
             LeafVersion::TapScript,
@@ -445,15 +548,47 @@ impl VaultAddressTemplate {
                 ),
                 LeafVersion::TapScript,
             );
-            (yubikey.child(&secp, PHONE_YUBIKEY_BRANCH), hww_pair)
+            (
+                yubikey,
+                yubikey.child(&secp, PHONE_YUBIKEY_BRANCH),
+                hww_pair,
+            )
         });
         Ok(Self {
-            internal_key,
+            legacy_internal_key,
+            network,
+            hww,
+            heir,
             hww_cooperative: hww.child(&secp, COOPERATIVE_BRANCH),
             hww_recovery_node,
             heir_node,
             yubikey,
         })
+    }
+
+    /// The internal key for this phone key. A provably unspendable key hashes every leaf key in
+    /// the order `VaultPolicy::build` writes the leaves.
+    fn internal_key<C: Verification>(
+        &self,
+        secp: &Secp256k1<C>,
+        phone: VaultKey,
+    ) -> XOnlyPublicKey {
+        if let Some(key) = self.legacy_internal_key {
+            return key;
+        }
+        let mut leaf_keys = vec![phone, self.hww];
+        if let Some((yubikey, _, _)) = self.yubikey {
+            leaf_keys.extend([phone, yubikey, self.hww, yubikey]);
+        }
+        leaf_keys.extend([phone, self.hww]);
+        leaf_keys.extend(self.heir);
+        let mut engine = sha256::Hash::engine();
+        for key in leaf_keys {
+            bitcoin::hashes::HashEngine::input(&mut engine, &key.xpub.public_key.serialize());
+        }
+        let chain_code = ChainCode::from(sha256::Hash::from_engine(engine).to_byte_array());
+        nums_child(secp, nums_xpub_with_chain_code(self.network, chain_code))
+            .expect("unhardened derivation from the NUMS point")
     }
 
     pub fn output_key<C: Verification>(
@@ -474,7 +609,7 @@ impl VaultAddressTemplate {
         if let Some(heir_node) = self.heir_node {
             recovery_node = TapNodeHash::from_node_hashes(recovery_node, heir_node);
         }
-        if let Some((yubikey_phone, hww_pair_node)) = self.yubikey {
+        if let Some((_, yubikey_phone, hww_pair_node)) = self.yubikey {
             let phone_pair_node = TapNodeHash::from_script(
                 &cooperative_script(phone.child(secp, PHONE_YUBIKEY_BRANCH), yubikey_phone),
                 LeafVersion::TapScript,
@@ -483,7 +618,9 @@ impl VaultAddressTemplate {
             recovery_node = TapNodeHash::from_node_hashes(pairs_node, recovery_node);
         }
         let merkle_root = TapNodeHash::from_node_hashes(cooperative_node, recovery_node);
-        self.internal_key.tap_tweak(secp, Some(merkle_root)).0
+        self.internal_key(secp, phone)
+            .tap_tweak(secp, Some(merkle_root))
+            .0
     }
 
     pub fn address<C: Verification>(
@@ -565,6 +702,7 @@ fn policy_keys(descriptor: &Descriptor<DescriptorPublicKey>) -> Result<PolicyKey
         hww: VaultKey::from_str(&cooperative[1])?,
         yubikey: yubikey.as_deref().map(VaultKey::from_str).transpose()?,
         heir: heir.as_deref().map(VaultKey::from_str).transpose()?,
+        internal_key: InternalKey::of(descriptor),
     })
 }
 
@@ -644,7 +782,6 @@ impl VaultPolicy {
         let PolicyKeys {
             phone, hww, heir, ..
         } = *keys;
-        let nums = nums_expression(network);
         let (phone_c, hww_c) = (
             phone.branch_expression(COOPERATIVE_BRANCH),
             hww.branch_expression(COOPERATIVE_BRANCH),
@@ -664,9 +801,12 @@ impl VaultPolicy {
         if let Some(pairs) = keys.pair_branch(|leaf| leaf) {
             recovery = format!("{{{pairs},{recovery}}}");
         }
-        let descriptor_text = format!("tr({nums},{{multi_a(2,{phone_c},{hww_c}),{recovery}}})");
-        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&descriptor_text)
-            .with_context(|| format!("invalid vault descriptor: {descriptor_text}"))?;
+        let descriptor = taproot_descriptor(
+            &format!("{{multi_a(2,{phone_c},{hww_c}),{recovery}}}"),
+            keys.internal_key,
+            network,
+        )
+        .context("invalid vault descriptor")?;
         let address = policy_address(&descriptor, network)?;
         Ok(Self {
             descriptor,
@@ -861,7 +1001,6 @@ impl SavingsPolicy {
         let heir_after = unlock
             .checked_add(SAVINGS_HEIR_RECOVERY_SECS)
             .context("savings unlock too far in the future")?;
-        let nums = nums_expression(network);
         let (phone_c, hww_c) = (
             phone.branch_expression(COOPERATIVE_BRANCH),
             hww.branch_expression(COOPERATIVE_BRANCH),
@@ -880,11 +1019,12 @@ impl SavingsPolicy {
         if let Some(pairs) = keys.pair_branch(|leaf| format!("and_v(v:{leaf},after({unlock}))")) {
             recovery = format!("{{{pairs},{recovery}}}");
         }
-        let descriptor_text = format!(
-            "tr({nums},{{and_v(v:multi_a(2,{phone_c},{hww_c}),after({unlock})),{recovery}}})"
-        );
-        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&descriptor_text)
-            .with_context(|| format!("invalid savings descriptor: {descriptor_text}"))?;
+        let descriptor = taproot_descriptor(
+            &format!("{{and_v(v:multi_a(2,{phone_c},{hww_c}),after({unlock})),{recovery}}}"),
+            keys.internal_key,
+            network,
+        )
+        .context("invalid savings descriptor")?;
         let address = policy_address(&descriptor, network)?;
         Ok(Self {
             descriptor,
@@ -938,6 +1078,7 @@ impl SavingsPolicy {
             hww,
             yubikey,
             heir,
+            ..
         } = self.keys;
         let yubikey = || yubikey.context("this savings lock has no YubiKey");
         // Each leaf is told apart by exactly the keys it holds, in script order.
@@ -981,18 +1122,22 @@ impl SavingsPolicy {
 
 impl ControllerPolicy {
     pub fn new(phone: VaultKey, hww: VaultKey) -> Result<Self> {
-        Self::new_for_network(phone, hww, Network::Regtest)
+        Self::new_for_network(phone, hww, InternalKey::Legacy, Network::Regtest)
     }
 
     /// `tr(NUMS/<0;1>/*, { pk(phone/<0;1>/*), pk(hww/<0;1>/*) })`, signed with the same keys as
     /// the vault's cooperative leaf.
-    pub fn new_for_network(phone: VaultKey, hww: VaultKey, network: Network) -> Result<Self> {
-        let nums = nums_expression(network);
+    pub fn new_for_network(
+        phone: VaultKey,
+        hww: VaultKey,
+        internal: InternalKey,
+        network: Network,
+    ) -> Result<Self> {
         let phone_c = phone.branch_expression(COOPERATIVE_BRANCH);
         let hww_c = hww.branch_expression(COOPERATIVE_BRANCH);
-        let descriptor_text = format!("tr({nums},{{pk({phone_c}),pk({hww_c})}})");
-        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&descriptor_text)
-            .with_context(|| format!("invalid controller descriptor: {descriptor_text}"))?;
+        let descriptor =
+            taproot_descriptor(&format!("{{pk({phone_c}),pk({hww_c})}}"), internal, network)
+                .context("invalid controller descriptor")?;
         let address = policy_address(&descriptor, network)?;
         Ok(Self {
             descriptor,

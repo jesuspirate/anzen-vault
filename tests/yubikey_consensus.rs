@@ -6,7 +6,8 @@ use anzen::core::{
     HWW_RECOVERY_BLOCKS, PHONE_RECOVERY_BLOCKS,
     keys::DeviceKeys,
     policy::{
-        PolicyKeys, SavingsPolicy, SpendPath, TaprootPolicy, VaultAddressTemplate, VaultPolicy,
+        InternalKey, PolicyKeys, SavingsPolicy, SpendPath, TaprootPolicy, VaultAddressTemplate,
+        VaultPolicy,
     },
 };
 use bitcoin::{
@@ -43,10 +44,12 @@ fn keys() -> Keys {
     }
 }
 
+/// YubiKey vaults are new vaults, so these use the provably unspendable internal key.
 fn policy_keys(k: &Keys, heir: bool) -> PolicyKeys {
     PolicyKeys {
         yubikey: Some(k.yubikey.vault_pubkey),
         heir: heir.then_some(k.heir.vault_pubkey),
+        internal_key: InternalKey::Provable,
         ..PolicyKeys::new(k.phone.vault_pubkey, k.hww.vault_pubkey)
     }
 }
@@ -284,6 +287,7 @@ fn a_yubikey_changes_the_vault_address_and_the_vanity_template_agrees() {
         k.hww.vault_pubkey,
         Some(k.yubikey.vault_pubkey),
         None,
+        InternalKey::Provable,
         Network::Regtest,
     )
     .unwrap();

@@ -34,6 +34,12 @@ pub struct SavingsLock {
     /// The owner's YubiKey when the lock was created, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yubikey_vault_pubkey: Option<String>,
+    /// How the lock writes its unspendable internal key; see `VaultConfig::internal_key`.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::core::policy::InternalKey::is_legacy"
+    )]
+    pub internal_key: crate::core::policy::InternalKey,
     pub address: String,
     /// Recurring deposits go here by default.
     #[serde(default)]
@@ -48,6 +54,7 @@ impl SavingsLock {
             hww_vault_pubkey: config.hww_vault_pubkey.clone(),
             heir_vault_pubkey: config.heir.as_ref().map(|heir| heir.vault_pubkey.clone()),
             yubikey_vault_pubkey: config.yubikey_vault_pubkey.clone(),
+            internal_key: config.internal_key,
             address: String::new(),
             default_deposit: false,
         };
@@ -70,6 +77,7 @@ impl SavingsLock {
                 hww: crate::core::keys::VaultKey::from_str(&self.hww_vault_pubkey)?,
                 yubikey: key(&self.yubikey_vault_pubkey)?,
                 heir: key(&self.heir_vault_pubkey)?,
+                internal_key: self.internal_key,
             },
             self.unlock,
             network,

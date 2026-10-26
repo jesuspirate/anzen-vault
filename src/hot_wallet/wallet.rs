@@ -188,6 +188,27 @@ impl HotWallet {
         vout: u32,
         child_fee: Amount,
     ) -> Result<Transaction> {
+        self.build_child(parent, vout, child_fee, true)
+    }
+
+    /// Like [`Self::build_cpfp_child`], but adds other hot-wallet coins when `parent`'s output is
+    /// too small to pay the fee on its own, as a presigned renewal's 330-sat fee-bump output is.
+    pub fn build_owned_anchor_child(
+        &mut self,
+        parent: &Transaction,
+        vout: u32,
+        child_fee: Amount,
+    ) -> Result<Transaction> {
+        self.build_child(parent, vout, child_fee, false)
+    }
+
+    fn build_child(
+        &mut self,
+        parent: &Transaction,
+        vout: u32,
+        child_fee: Amount,
+        parent_output_only: bool,
+    ) -> Result<Transaction> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -202,11 +223,11 @@ impl HotWallet {
         }
         let change_script = self.next_change_address()?.script_pubkey();
         let mut builder = self.wallet.build_tx();
-        builder
-            .add_utxo(outpoint)?
-            .manually_selected_only()
-            .fee_absolute(child_fee)
-            .drain_to(change_script);
+        builder.add_utxo(outpoint)?;
+        if parent_output_only {
+            builder.manually_selected_only();
+        }
+        builder.fee_absolute(child_fee).drain_to(change_script);
         let mut psbt = builder.finish()?;
         if !self.wallet.sign(&mut psbt, SignOptions::default())? {
             anyhow::bail!("BDK could not finalize the fee-bump child");

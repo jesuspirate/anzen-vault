@@ -40,6 +40,12 @@ pub const NEXT_BATCH_DIR: &str = "next";
 pub const ANCHOR_VALUE_SATS: u64 = 240;
 pub const TRIGGER_ANCHOR_VALUE_SATS: u64 = ANCHOR_VALUE_SATS;
 pub const TRIGGER_ANCHOR_VOUT: usize = 3;
+/// A presigned renewal pays its fee-bump output to the phone's hot wallet instead: no BitBox02
+/// firmware can sign a transaction with a P2A output. 330 sats is the P2TR dust threshold.
+/// Renewals signed before this change keep their P2A output and are still accepted.
+pub const RENEWAL_ANCHOR_VALUE_SATS: u64 = 330;
+/// The phone's internal (change) branch index that receives every renewal's fee-bump output.
+pub const RENEWAL_ANCHOR_INDEX: u32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyLimits {
@@ -460,8 +466,9 @@ fn build_epoch(
     let total_input_sats = vault_input_sats
         .checked_add(controller_input_sats)
         .context("policy input total overflowed")?;
-    let has_anchor = renewal.is_some();
-    let anchor_sats = if has_anchor { ANCHOR_VALUE_SATS } else { 0 };
+    let anchor = renewal.map(|_| renewal_anchor_output(config)).transpose()?;
+    let has_anchor = anchor.is_some();
+    let anchor_sats = anchor.as_ref().map_or(0, |anchor| anchor.value.to_sat());
     let vault_sequence = renewal.map_or(Sequence::MAX, |link| {
         Sequence::from_consensus(link.delay_sequence)
     });
@@ -546,7 +553,7 @@ fn build_epoch(
             vault_script.clone(),
             controller_script.clone(),
             emergency_access_limit_sats > 0,
-            has_anchor,
+            anchor.clone(),
         );
         let fee = estimate_policy_vsize(
             &template,
@@ -590,7 +597,7 @@ fn build_epoch(
         vault_script.clone(),
         controller_script.clone(),
         emergency_access_limit_sats > 0,
-        has_anchor,
+        anchor,
     );
     let rollover_txid = rollover_tx.compute_txid();
     let mut prevouts = vault_utxos
@@ -841,9 +848,9 @@ pub fn validate_batch(
             .output
             .get(vout as usize)
             .context("rollover anchor vout is out of range")?;
-        if anchor.script_pubkey != ScriptBuf::new_p2a()
-            || anchor.value.to_sat() != ANCHOR_VALUE_SATS
-        {
+        let legacy_p2a = anchor.script_pubkey == ScriptBuf::new_p2a()
+            && anchor.value.to_sat() == ANCHOR_VALUE_SATS;
+        if !legacy_p2a && *anchor != renewal_anchor_output(config)? {
             bail!("rollover anchor output does not match the approved policy");
         }
     }
@@ -995,6 +1002,7 @@ pub fn rung_policy(config: &VaultConfig, unlock: u32) -> Result<RungPolicy> {
         VaultKey::from_str(&config.phone_vault_pubkey).context("invalid phone vault key")?,
         VaultKey::from_str(&config.hww_vault_pubkey).context("invalid HWW vault key")?,
         unlock,
+        config.internal_key,
         config.bitcoin_network()?,
     )
 }
@@ -1255,7 +1263,7 @@ fn controller_policy(config: &VaultConfig) -> Result<ControllerPolicy> {
         .context("invalid configured phone vault key")?;
     let hww = crate::core::keys::VaultKey::from_str(&config.hww_vault_pubkey)
         .context("invalid configured HWW vault key")?;
-    ControllerPolicy::new_for_network(phone, hww, config.bitcoin_network()?)
+    ControllerPolicy::new_for_network(phone, hww, config.internal_key, config.bitcoin_network()?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1506,6 +1514,22 @@ fn emergency_withdrawal_template(
     }
 }
 
+/// The fee-bump output of a presigned renewal: a fixed address of the phone's hot wallet, so the
+/// phone can spend it in a child that raises the fee when the renewal is broadcast a year later.
+pub fn renewal_anchor_output(config: &VaultConfig) -> Result<TxOut> {
+    let descriptor = miniscript::Descriptor::<miniscript::DescriptorPublicKey>::from_str(
+        &config.phone_hot_internal_descriptor,
+    )
+    .context("the vault has no phone hot-wallet descriptor for the renewal fee-bump output")?;
+    let script_pubkey = descriptor
+        .at_derivation_index(RENEWAL_ANCHOR_INDEX)?
+        .script_pubkey();
+    Ok(TxOut {
+        value: Amount::from_sat(RENEWAL_ANCHOR_VALUE_SATS),
+        script_pubkey,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rollover_template(
     inputs: Vec<TxIn>,
@@ -1515,7 +1539,7 @@ fn rollover_template(
     vault_script: ScriptBuf,
     controller_script: ScriptBuf,
     emergency_connector: bool,
-    anchor: bool,
+    anchor: Option<TxOut>,
 ) -> Transaction {
     let mut outputs = rungs
         .iter()
@@ -1534,12 +1558,7 @@ fn rollover_template(
             script_pubkey: controller_script,
         });
     }
-    if anchor {
-        outputs.push(TxOut {
-            value: Amount::from_sat(ANCHOR_VALUE_SATS),
-            script_pubkey: ScriptBuf::new_p2a(),
-        });
-    }
+    outputs.extend(anchor);
     Transaction {
         version: Version::TWO,
         lock_time: absolute::LockTime::ZERO,
@@ -1745,7 +1764,10 @@ mod tests {
         );
         let anchor_vout = next.rollover_anchor_vout.unwrap() as usize;
         assert_eq!(anchor_vout, tx.output.len() - 1);
-        assert_eq!(tx.output[anchor_vout].script_pubkey, ScriptBuf::new_p2a());
+        assert_eq!(
+            tx.output[anchor_vout],
+            renewal_anchor_output(&initialized.config).unwrap()
+        );
 
         let approved = cold_wallet::approve_policy(dir.path(), &batch).unwrap();
         assert!(approved.hww_approved);

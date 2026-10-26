@@ -553,6 +553,7 @@ pub fn rotated_config(
         savings_locks: old_config.savings_locks.clone(),
         // A new phone key keeps the heir the owner named.
         heir: old_config.heir.clone(),
+        internal_key: old_config.internal_key,
     })
 }
 

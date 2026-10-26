@@ -36,6 +36,13 @@ pub trait VaultSigner {
     /// it, and it is the same every time.
     fn backup_secret(&self) -> Result<Zeroizing<Vec<u8>>>;
 
+    /// Whether this device signs only transactions whose inputs all come from one policy (a
+    /// BitBox02). Callers then split work, such as rescuing several allowance months, into one
+    /// transaction per policy.
+    fn one_policy_per_transaction(&self) -> bool {
+        false
+    }
+
     fn sign_all_vault_inputs(
         &self,
         psbt: &mut Psbt,

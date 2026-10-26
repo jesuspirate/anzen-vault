@@ -269,6 +269,7 @@ mod tests {
             emergency_access_limit_sats: 0,
             savings_locks: Vec::new(),
             heir: None,
+            internal_key: Default::default(),
         }
     }
 
