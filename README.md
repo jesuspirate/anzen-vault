@@ -748,6 +748,23 @@ Sent: 198997378 sats
 Fee: 162 sats (1 sat/vB)
 ```
 
+## Simple mode: one phone, no hardware wallet
+
+Simple mode is a prototype for people who cannot buy a hardware wallet. The phone's 12 words sign everything; they can be the same words a Fedi app shows, since Simple mode uses its own account (`m/86'/coin'/7000'/0/0`) that neither Fedi nor the vault derives. Deposits land in an inbox, and `simple lock` splits them into dated payouts. Bitcoin refuses to move a payout before its date, so savings open one payout at a time.
+
+Each payout is `tr(NUMS, {and_v(v:pk(owner), after(date)), multi_a(2, owner, rescue)})`. The second leaf exists only with a rescue paper: 12 more words, shown once at setup and never stored. With both sets of words, every payout can move at any time, which is how you recover from a stolen phone or graduate to the full vault. The rescue paper alone moves nothing.
+
+```bash
+anzen --signet simple init --rescue-paper --every monthly   # asks for your 12 words
+anzen simple inbox                                          # deposit here
+anzen simple lock --amount 50000                            # 50,000 sats per payout
+anzen simple payouts
+anzen simple claim --to <address>                           # e.g. your Fedi deposit address
+anzen simple rescue --to <safe address>                     # asks for the rescue paper
+```
+
+`lock` refuses when the estimated fees for setting up and claiming the payouts would take more than 2% of the savings a year; for small amounts, ecash in a federation is cheaper. Pass `--accept-high-fees` to lock anyway.
+
 ## Run the end-to-end tests
 
 Docker is the only host dependency:
