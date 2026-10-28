@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use anzen::{cold_wallet, core, heir_wallet, hot_wallet, yubikey_wallet};
+use anzen::{cold_wallet, core, heir_wallet, hot_wallet, simple_wallet, yubikey_wallet};
 use bitcoin::Network;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Serialize, de::DeserializeOwned};
@@ -97,6 +97,11 @@ enum Command {
         /// The owner's name, shown on the cover.
         #[arg(long)]
         owner: Option<String>,
+    },
+    /// Simple mode: one phone, no hardware wallet. Savings open as dated payouts, one at a time.
+    Simple {
+        #[command(subcommand)]
+        command: SimpleCommand,
     },
     /// Regtest-only node controls used by the end-to-end tests.
     Node {
@@ -206,6 +211,47 @@ enum WatchCommand {
 enum HealthDevice {
     Phone,
     Hww,
+}
+
+#[derive(Debug, Subcommand)]
+enum SimpleCommand {
+    /// Set up Simple mode from your 12 words (they can be the words your Fedi app shows).
+    Init {
+        /// The 12 words. Leave out to type them when asked.
+        #[arg(long, env = "ANZEN_SIMPLE_WORDS", hide_env_values = true)]
+        words: Option<String>,
+        /// Also make a rescue paper: 12 more words to write down and keep somewhere else.
+        #[arg(long)]
+        rescue_paper: bool,
+        /// How often a payout opens.
+        #[arg(long, value_enum, default_value_t = simple_wallet::Frequency::Monthly)]
+        every: simple_wallet::Frequency,
+    },
+    /// Show where to deposit and what is waiting there to be locked.
+    Inbox,
+    /// Lock everything in the inbox into dated payouts of this many sats each.
+    Lock {
+        #[arg(long)]
+        amount: u64,
+        /// Lock even when fees would take more than 2% of the savings a year.
+        #[arg(long)]
+        accept_high_fees: bool,
+    },
+    /// List payouts and when each opens.
+    Payouts,
+    /// Send every open payout to an address, for example your Fedi deposit address.
+    Claim {
+        #[arg(long)]
+        to: String,
+    },
+    /// With the rescue paper, move every payout, open or not, to a safe address now.
+    Rescue {
+        #[arg(long)]
+        to: String,
+        /// The rescue paper's words. Leave out to type them when asked.
+        #[arg(long, env = "ANZEN_RESCUE_WORDS", hide_env_values = true)]
+        rescue_words: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -582,6 +628,7 @@ fn main() -> Result<()> {
         Command::Yubikey { command } => run_yubikey(command, &cli.data_dir, &cli.chain, network),
         Command::Watch { command } => run_watch(command, &cli.data_dir, &cli.chain, network),
         Command::RecoveryKit { output, owner } => write_recovery_kit(&cli.data_dir, &output, owner),
+        Command::Simple { command } => run_simple(command, &cli.data_dir, &cli.chain, network),
         Command::Node { command } => run_node(command, &cli.chain, network),
     }
 }
@@ -2137,6 +2184,140 @@ fn print_status(data_dir: &Path, rpc_args: &ChainArgs) -> Result<()> {
     Ok(())
 }
 
+fn ask_words(prompt: &str) -> Result<String> {
+    eprint!("{prompt}: ");
+    io::stderr().flush()?;
+    let mut words = String::new();
+    io::stdin().read_line(&mut words)?;
+    Ok(words.trim().to_owned())
+}
+
+fn run_simple(
+    command: SimpleCommand,
+    data_dir: &Path,
+    rpc_args: &ChainArgs,
+    network: Network,
+) -> Result<()> {
+    if let SimpleCommand::Init {
+        words,
+        rescue_paper,
+        every,
+    } = command
+    {
+        let words = match words {
+            Some(words) => words,
+            None => ask_words("Type your 12 words")?,
+        };
+        let init = simple_wallet::initialize(data_dir, network, &words, rescue_paper, every)?;
+        println!("Simple mode set up ({})", network_label(network));
+        println!("Payouts open {}", every.label());
+        println!("Deposit address: {}", init.inbox);
+        if let Some(rescue) = &init.rescue_words {
+            println!();
+            println!("RESCUE PAPER: write these 12 words on paper now. They are shown only once.");
+            println!("  {rescue}");
+            println!(
+                "Keep the paper somewhere other than your 12 words. With both, you can move every \
+                 payout at any time; the paper alone cannot move anything."
+            );
+        } else {
+            println!(
+                "No rescue paper: someone who copies your 12 words can take each payout as it opens."
+            );
+        }
+        println!();
+        println!(
+            "Your Fedi balance is spending money. These payouts are your savings: nothing, not \
+             even you, can open one before its date."
+        );
+        return Ok(());
+    }
+
+    let config = simple_wallet::load_config(data_dir)?;
+    let backend = rpc_args.connect_chain_for(config.bitcoin_network()?)?;
+    match command {
+        SimpleCommand::Init { .. } => unreachable!("handled above"),
+        SimpleCommand::Inbox => {
+            let coins = simple_wallet::inbox_coins(data_dir, &*backend)?;
+            println!("Deposit address: {}", config.inbox()?.address);
+            println!(
+                "Waiting to be locked: {} sats in {} coin(s)",
+                coins
+                    .iter()
+                    .map(|coin| coin.txout.value.to_sat())
+                    .sum::<u64>(),
+                coins.len()
+            );
+        }
+        SimpleCommand::Lock {
+            amount,
+            accept_high_fees,
+        } => {
+            let median = backend.chain_tip()?.median_time;
+            let now = u32::try_from(chrono::Utc::now().timestamp().max(median as i64))
+                .context("clock is out of range")?;
+            let plan = simple_wallet::lock(data_dir, &*backend, amount, now, accept_high_fees)?;
+            println!(
+                "Locked into {} payout(s): {}",
+                plan.payouts.len(),
+                plan.txid
+            );
+            for (index, payout) in plan.payouts.iter().enumerate() {
+                println!(
+                    "  Payout {:>2}  opens {}  {} sats",
+                    index + 1,
+                    core::ladder::unlock_date(payout.unlock),
+                    payout.value_sats
+                );
+            }
+            println!("Fee: {} sats", plan.fee_sats);
+            println!(
+                "Estimated fees to set up and claim these: about {:.1}% of the savings a year",
+                plan.yearly_fee_percent
+            );
+        }
+        SimpleCommand::Payouts => {
+            let statuses = simple_wallet::payout_statuses(data_dir, &*backend)?;
+            if statuses.is_empty() {
+                println!(
+                    "No payouts yet. Deposit to the inbox, then: anzen simple lock --amount <sats>"
+                );
+            }
+            for status in statuses {
+                let state = match (status.live, status.open) {
+                    (false, _) => "moved",
+                    (true, true) => "open: anzen simple claim --to <address>",
+                    (true, false) => "locked",
+                };
+                println!(
+                    "  {}  {} sats  {state}",
+                    core::ladder::unlock_date(status.payout.unlock),
+                    status.payout.value_sats
+                );
+            }
+        }
+        SimpleCommand::Claim { to } => {
+            let destination = simple_wallet::parse_address(&config, &to)?;
+            let result = simple_wallet::claim(data_dir, &*backend, &destination)?;
+            println!("Claimed {} payout(s): {}", result.payout_count, result.txid);
+            println!("Sent: {} sats to {destination}", result.sent_sats);
+            println!("Fee: {} sats", result.fee_sats);
+        }
+        SimpleCommand::Rescue { to, rescue_words } => {
+            let destination = simple_wallet::parse_address(&config, &to)?;
+            let words = match rescue_words {
+                Some(words) => words,
+                None => ask_words("Type the 12 words on your rescue paper")?,
+            };
+            let result = simple_wallet::rescue(data_dir, &*backend, &words, &destination)?;
+            println!("Rescued {} payout(s): {}", result.payout_count, result.txid);
+            println!("Sent: {} sats to {destination}", result.sent_sats);
+            println!("Fee: {} sats", result.fee_sats);
+        }
+    }
+    Ok(())
+}
+
 fn run_node(command: NodeCommand, rpc_args: &ChainArgs, network: Network) -> Result<()> {
     if network != Network::Regtest {
         bail!("vault node commands are unavailable in mainnet mode");
@@ -2538,7 +2719,9 @@ fn command_network(
     signet: bool,
     _command: &Command,
 ) -> Result<Network> {
-    let configured = if core::storage::config_exists(data_dir) {
+    let configured = if simple_wallet::is_initialized(data_dir) {
+        Some(simple_wallet::load_config(data_dir)?.bitcoin_network()?)
+    } else if core::storage::config_exists(data_dir) {
         Some(core::storage::load_config(data_dir)?.bitcoin_network()?)
     } else if data_dir.join(core::storage::PHONE_DEVICE_FILE).exists() {
         Some(

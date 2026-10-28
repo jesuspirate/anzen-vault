@@ -5,17 +5,19 @@
 //! ```text
 //! cold_wallet ────┐
 //! heir_wallet ────┤
-//! hot_wallet ─────┼──> core
+//! hot_wallet ─────┤
+//! simple_wallet ──┼──> core
 //! yubikey_wallet ─┘
 //! ```
 //!
-//! `cold_wallet`, `heir_wallet`, `hot_wallet` and `yubikey_wallet` never depend on one another. Application front
-//! ends, such as the CLI, compose their public APIs.
+//! `cold_wallet`, `heir_wallet`, `hot_wallet`, `simple_wallet` and `yubikey_wallet` never depend
+//! on one another. Application front ends, such as the CLI, compose their public APIs.
 
 pub mod cold_wallet;
 pub mod core;
 pub mod heir_wallet;
 pub mod hot_wallet;
+pub mod simple_wallet;
 pub mod yubikey_wallet;
 
 #[cfg(test)]

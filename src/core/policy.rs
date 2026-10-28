@@ -360,6 +360,152 @@ impl RungPolicy {
     }
 }
 
+impl TaprootPolicy for PayoutPolicy {
+    fn leaf(&self, path: SpendPath) -> Result<VaultLeaf> {
+        PayoutPolicy::leaf(self, path)
+    }
+
+    fn definite_descriptor(&self) -> Result<Descriptor<DefiniteDescriptorKey>> {
+        receive_descriptor(&self.descriptor)
+    }
+
+    fn descriptor(&self) -> &Descriptor<DescriptorPublicKey> {
+        &self.descriptor
+    }
+
+    fn address(&self) -> &Address {
+        &self.address
+    }
+
+    fn wallet_name(&self) -> String {
+        match self.unlock {
+            0 => "Anzen simple inbox".to_owned(),
+            unlock => format!("Anzen payout {}", format_unlock_date(unlock)),
+        }
+    }
+}
+
+/// Simple mode: one payout that only the owner's single key spends, once `unlock` has passed.
+/// With a rescue paper, the owner key and the rescue key together may move it at any time, so a
+/// thief who copied only the owner's words has to wait while the owner moves everything away.
+///
+/// `tr(NUMS, {and_v(v:pk(owner), after(unlock)), multi_a(2, owner, rescue)})`, or the first leaf
+/// alone without a rescue paper. The inbox that deposits land in (`unlock` 0) is `tr(NUMS,
+/// pk(owner))`: it is the owner's to lock into payouts.
+#[derive(Debug, Clone)]
+pub struct PayoutPolicy {
+    pub descriptor: Descriptor<DescriptorPublicKey>,
+    pub address: Address,
+    pub unlock: u32,
+    owner: VaultKey,
+    rescue: Option<VaultKey>,
+}
+
+impl PayoutPolicy {
+    pub fn new_for_network(
+        owner: VaultKey,
+        rescue: Option<VaultKey>,
+        unlock: u32,
+        network: Network,
+    ) -> Result<Self> {
+        if unlock < bitcoin::absolute::LOCK_TIME_THRESHOLD {
+            bail!("a payout must unlock at a Unix time, not a block height");
+        }
+        if rescue.is_some_and(|rescue| rescue.cooperative() == owner.cooperative()) {
+            bail!("the rescue key must differ from the owner key");
+        }
+        let owner_r = owner.branch_expression(RECOVERY_BRANCH);
+        let dated = format!("and_v(v:pk({owner_r}),after({unlock}))");
+        let tree = match rescue {
+            Some(rescue) => format!(
+                "{{{dated},multi_a(2,{},{})}}",
+                owner.branch_expression(COOPERATIVE_BRANCH),
+                rescue.branch_expression(COOPERATIVE_BRANCH)
+            ),
+            None => dated,
+        };
+        Self::from_tree(&tree, owner, rescue, unlock, network)
+    }
+
+    pub fn inbox(owner: VaultKey, network: Network) -> Result<Self> {
+        let tree = format!("pk({})", owner.branch_expression(RECOVERY_BRANCH));
+        Self::from_tree(&tree, owner, None, 0, network)
+    }
+
+    fn from_tree(
+        tree: &str,
+        owner: VaultKey,
+        rescue: Option<VaultKey>,
+        unlock: u32,
+        network: Network,
+    ) -> Result<Self> {
+        let descriptor = taproot_descriptor(tree, InternalKey::Legacy, network)
+            .context("invalid payout descriptor")?;
+        let address = policy_address(&descriptor, network)?;
+        Ok(Self {
+            descriptor,
+            address,
+            unlock,
+            owner,
+            rescue,
+        })
+    }
+
+    pub fn has_rescue(&self) -> bool {
+        self.rescue.is_some()
+    }
+
+    /// The earliest nLockTime a spend through `path` can use.
+    pub fn earliest_lock_time(&self, path: SpendPath) -> u32 {
+        match path {
+            SpendPath::PhoneRecovery => self.unlock,
+            _ => 0,
+        }
+    }
+
+    /// The owner's dated leaf is [`SpendPath::PhoneRecovery`]; the owner-plus-rescue leaf is
+    /// [`SpendPath::Cooperative`].
+    pub fn leaf(&self, path: SpendPath) -> Result<VaultLeaf> {
+        let wanted = match (path, self.rescue) {
+            (SpendPath::PhoneRecovery, _) => vec![self.owner.recovery()],
+            (SpendPath::Cooperative, Some(rescue)) => {
+                vec![self.owner.cooperative(), rescue.cooperative()]
+            }
+            (SpendPath::Cooperative, None) => bail!("this payout has no rescue paper"),
+            (other, _) => bail!("a payout has no {other:?} leaf"),
+        };
+        let tr = taproot_spend(&self.descriptor)?;
+        let spend_info = tr.spend_info();
+        for (depth, miniscript) in tr.iter_scripts() {
+            let keys: Vec<XOnlyPublicKey> = miniscript
+                .iter_pk()
+                .map(|key| key.inner.x_only_public_key().0)
+                .collect();
+            if keys != wanted {
+                continue;
+            }
+            let script = miniscript.encode();
+            let leaf_version = LeafVersion::TapScript;
+            let leaf_hash = TapLeafHash::from_script(&script, leaf_version);
+            let control_block = spend_info
+                .control_block(&(script.clone(), leaf_version))
+                .context("payout leaf has no Taproot control block")?;
+            return Ok(VaultLeaf {
+                path,
+                depth,
+                script,
+                leaf_hash,
+                control_block,
+            });
+        }
+        bail!("payout descriptor does not contain the requested {path:?} leaf")
+    }
+
+    pub fn descriptor_string(&self) -> String {
+        self.descriptor.to_string()
+    }
+}
+
 impl ControllerPolicy {
     pub fn wallet_name(&self) -> String {
         "Anzen connector".to_owned()

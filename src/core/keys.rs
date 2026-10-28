@@ -366,6 +366,43 @@ impl VaultKeyParent {
     }
 }
 
+/// Simple mode's account, `m/86'/coin'/7000'/0/0`. It is far from the vault's account (`100'`)
+/// and from wallets' usual accounts, so words shared with another app (Fedi's, for example) give
+/// Simple mode keys nothing else derives.
+pub const SIMPLE_ACCOUNT: u32 = 7000;
+
+/// Simple mode's owner or rescue key from its 12 or 24 words.
+pub fn simple_account_keys(
+    secp: &Secp256k1<All>,
+    words: &str,
+    network: Network,
+) -> Result<(VaultKeypairs, VaultKey)> {
+    let mnemonic = Mnemonic::parse_in_normalized(Language::English, words)
+        .context("invalid recovery words")?;
+    let master = Xpriv::new_master(network, &mnemonic.to_seed_normalized(""))?;
+    let path = DerivationPath::from_str(&format!(
+        "m/86'/{}'/{SIMPLE_ACCOUNT}'/0/0",
+        coin_type(network)?
+    ))?;
+    let account = master.derive_priv(secp, &path)?;
+    let keypairs = VaultKeypairs::from_account(secp, &account)?;
+    let key = VaultKey::new(
+        master.fingerprint(secp),
+        &path,
+        Xpub::from_priv(secp, &account),
+    )?;
+    Ok((keypairs, key))
+}
+
+/// Fresh 12 words, for Simple mode's rescue paper.
+pub fn generate_words() -> Result<String> {
+    let mut entropy = [0_u8; 16];
+    OsRng.fill_bytes(&mut entropy);
+    Ok(Mnemonic::from_entropy_in(Language::English, &entropy)
+        .context("failed to generate recovery words")?
+        .to_string())
+}
+
 fn vault_parent_path(network: Network) -> Result<DerivationPath> {
     let coin_type = coin_type(network)?;
     Ok(DerivationPath::from_str(&format!(
