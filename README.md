@@ -765,6 +765,8 @@ anzen simple rescue --to <safe address>                     # asks for the rescu
 
 `lock` refuses when the estimated fees for setting up and claiming the payouts would take more than 2% of the savings a year; for small amounts, ecash in a federation is cheaper. Pass `--accept-high-fees` to lock anyway.
 
+To try it on signet without waiting a month, `simple init --every hourly` opens a payout every hour. Hourly is refused on mainnet, and its fees always exceed the 2% floor, so `lock` needs `--accept-high-fees` with it. Step-by-step: `notes/simple-mode-signet-run.md` in the project files.
+
 ## Run the end-to-end tests
 
 Docker is the only host dependency:
