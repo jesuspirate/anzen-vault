@@ -191,7 +191,7 @@ enum WatchCommand {
         /// Shell command run for each alert. It gets ANZEN_ALERT_LEVEL, ANZEN_ALERT_TITLE and
         /// ANZEN_ALERT_MESSAGE, and the title and message on stdin. Alert text never contains
         /// amounts, addresses or txids, so it is safe to forward to a push service.
-        #[arg(long, env = "ANZEN_NOTIFY_COMMAND")]
+        #[arg(long, env = "ANZEN_NOTIFY_COMMAND", hide_env_values = true)]
         notify_command: Option<String>,
         /// Also print amounts and txids in this computer's output.
         #[arg(long)]
@@ -512,13 +512,15 @@ struct ChainArgs {
     /// Chain backend to use. Defaults to RPC on regtest and Electrum on mainnet.
     #[arg(long, env = "ANZEN_CHAIN_BACKEND", value_enum, global = true)]
     chain_backend: Option<ChainBackendKind>,
-    #[arg(long, env = "ANZEN_RPC_URL", global = true)]
+    // The URL may carry credentials; `--help` must not print values taken from the environment.
+    #[arg(long, env = "ANZEN_RPC_URL", hide_env_values = true, global = true)]
     rpc_url: Option<String>,
     #[arg(long, env = "ANZEN_RPC_USER", default_value = "anzen", global = true)]
     rpc_user: String,
     #[arg(
         long,
         env = "ANZEN_RPC_PASSWORD",
+        hide_env_values = true,
         default_value = "anzen",
         global = true
     )]
@@ -1930,7 +1932,8 @@ fn write_recovery_kit(data_dir: &Path, output: &Path, owner: Option<String>) -> 
         }),
         yubikey: config.yubikey_vault_pubkey.clone(),
     });
-    fs::write(output, html).with_context(|| format!("failed to write {}", output.display()))?;
+    write_private_document(output, html.as_bytes())
+        .with_context(|| format!("failed to write {}", output.display()))?;
     println!("Recovery kit written: {}", output.display());
     println!(
         "It holds no keys and cannot move coins, but it shows where they are. Keep it private."
@@ -2681,6 +2684,28 @@ fn read_artifact<T: DeserializeOwned>(path: &Path) -> Result<T> {
     } else {
         core::storage::read_json(path)
     }
+}
+
+/// Write a document the owner asked for at a path of their choosing. It names the vault's
+/// descriptors and addresses, so on Unix only the owner may read the file.
+fn write_private_document(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    // An existing file keeps its old mode when it is reopened, so tighten that too. Leave
+    // anything that is not a regular file (a pipe or terminal) as it is.
+    #[cfg(unix)]
+    if file.metadata()?.is_file() {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    Ok(())
 }
 
 fn write_artifact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
