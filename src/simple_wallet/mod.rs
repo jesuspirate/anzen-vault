@@ -43,6 +43,8 @@ const PAYOUT_SEQUENCE: Sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Frequency {
+    /// Test networks only: lets a signet trial open a payout within the hour.
+    Hourly,
     Weekly,
     Biweekly,
     Monthly,
@@ -53,6 +55,7 @@ impl Frequency {
     pub fn seconds(self) -> u32 {
         const DAY: u32 = 86_400;
         match self {
+            Self::Hourly => 3_600,
             Self::Weekly => 7 * DAY,
             Self::Biweekly => 14 * DAY,
             Self::Monthly => 30 * DAY,
@@ -62,6 +65,7 @@ impl Frequency {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Hourly => "every hour (test networks only)",
             Self::Weekly => "every week",
             Self::Biweekly => "every two weeks",
             Self::Monthly => "every month",
@@ -145,6 +149,10 @@ pub fn initialize(
     if is_initialized(data_dir) {
         bail!("Simple mode is already set up in {}", data_dir.display());
     }
+    ensure!(
+        !(network == Network::Bitcoin && frequency == Frequency::Hourly),
+        "hourly payouts are for trying Simple mode on signet or regtest only"
+    );
     let secp = Secp256k1::new();
     let (_, owner) = simple_account_keys(&secp, owner_words, network)?;
     let rescue_words = with_rescue.then(generate_words).transpose()?;
@@ -581,6 +589,26 @@ mod tests {
         assert!(
             PayoutPolicy::new_for_network(owner, Some(owner), unlock, Network::Regtest).is_err()
         );
+    }
+
+    #[test]
+    fn hourly_payouts_are_refused_on_mainnet() {
+        let dir = tempfile::tempdir().unwrap();
+        let Err(error) = initialize(
+            dir.path(),
+            Network::Bitcoin,
+            OWNER,
+            false,
+            Frequency::Hourly,
+        ) else {
+            panic!("mainnet accepted hourly payouts");
+        };
+        assert!(
+            error.to_string().contains("signet or regtest only"),
+            "{error:#}"
+        );
+        assert!(!is_initialized(dir.path()));
+        initialize(dir.path(), Network::Signet, OWNER, false, Frequency::Hourly).unwrap();
     }
 
     #[test]
