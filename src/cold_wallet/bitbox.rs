@@ -440,7 +440,7 @@ impl BitBoxDevice {
             .build()
             .context("could not start the BitBox02 connection")?;
         let pairing_dir = data_dir.join(BITBOX_PAIRING_DIR);
-        std::fs::create_dir_all(&pairing_dir)
+        create_private_pairing_dir(&pairing_dir)
             .with_context(|| format!("could not create {}", pairing_dir.display()))?;
         let bitbox = runtime.block_on(pair(pairing_dir))?;
         bitbox.validate_firmware()?;
@@ -509,6 +509,21 @@ impl FirmwareCheck for PairedBitBox<TokioRuntime> {
         );
         Ok(())
     }
+}
+
+/// Create the pairing folder so that on Unix only the owner can enter it. `bitbox-api` writes
+/// `bitbox.json` there with default permissions, and that file holds this computer's pairing
+/// private key. A folder left open by an earlier version is tightened too.
+fn create_private_pairing_dir(pairing_dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(pairing_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(pairing_dir)?.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(pairing_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
 }
 
 async fn pair(pairing_dir: PathBuf) -> Result<PairedBitBox<TokioRuntime>> {
@@ -637,5 +652,26 @@ mod tests {
         );
         assert_eq!(infos[1].xpub, hww.vault_pubkey.xpub);
         assert_eq!(infos[2].root_fingerprint, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_pairing_folder_is_owner_only_even_when_it_was_created_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+
+        let fresh = dir.path().join("fresh").join(BITBOX_PAIRING_DIR);
+        create_private_pairing_dir(&fresh).unwrap();
+        assert_eq!(mode(&fresh), 0o700);
+
+        // A folder an earlier version left readable by others, already holding the pairing.
+        let open = dir.path().join("open").join(BITBOX_PAIRING_DIR);
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(open.join("bitbox.json"), b"{}").unwrap();
+        create_private_pairing_dir(&open).unwrap();
+        assert_eq!(mode(&open), 0o700);
+        assert_eq!(std::fs::read(open.join("bitbox.json")).unwrap(), b"{}");
     }
 }
