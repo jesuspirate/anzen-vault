@@ -15,6 +15,28 @@ fn binary_and_help_use_the_anzen_name() {
 }
 
 #[test]
+fn help_never_prints_secrets_taken_from_the_environment() {
+    for arguments in [vec!["--help"], vec!["watch", "run", "--help"]] {
+        Command::cargo_bin("anzen")
+            .unwrap()
+            .env("ANZEN_RPC_PASSWORD", "rpc-password-from-env")
+            .env(
+                "ANZEN_RPC_URL",
+                "http://user:url-password-from-env@node:8332",
+            )
+            .env("ANZEN_NOTIFY_COMMAND", "push --token notify-token-from-env")
+            .env("ANZEN_SIMPLE_WORDS", "simple-words-from-env")
+            .env("ANZEN_RESCUE_WORDS", "rescue-words-from-env")
+            .args(&arguments)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("ANZEN_RPC_PASSWORD"))
+            .stdout(predicate::str::contains("from-env").not())
+            .stderr(predicate::str::contains("from-env").not());
+    }
+}
+
+#[test]
 fn device_setup_and_vault_init_are_separate_and_monthly_spending_starts_disabled() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_str().unwrap();
@@ -479,6 +501,29 @@ fn health_checks_and_recovery_kit_work_without_a_chain_backend() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Recovery kit written"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&kit), 0o600, "the kit shows where the coins are");
+        // Writing over a kit that was world-readable makes it private as well.
+        std::fs::set_permissions(&kit, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Command::cargo_bin("anzen")
+            .unwrap()
+            .args(["--data-dir", data_dir, "recovery-kit", "--output"])
+            .arg(&kit)
+            .assert()
+            .success();
+        assert_eq!(mode(&kit), 0o600);
+        Command::cargo_bin("anzen")
+            .unwrap()
+            .args(["--data-dir", data_dir, "recovery-kit", "--owner", "Jet"])
+            .arg("--output")
+            .arg(&kit)
+            .assert()
+            .success();
+    }
     let html = std::fs::read_to_string(&kit).unwrap();
     assert!(html.contains("How to get to Jet&#39;s vault"));
     assert!(html.contains("Savings lock opening January 1, 2030"));
