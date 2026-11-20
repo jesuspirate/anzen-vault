@@ -18,7 +18,10 @@ use pgp::{
         SignedPublicKey, SignedSecretKey, SubkeyParamsBuilder,
     },
     crypto::{ecc_curve::ECCCurve, sym::SymmetricKeyAlgorithm},
-    types::{KeyDetails, Password, PublicKeyTrait},
+    types::{
+        EcdhPublicParams, EddsaLegacyPublicParams, KeyDetails, Password, PublicKeyTrait,
+        PublicParams,
+    },
 };
 use rand::thread_rng;
 use serde::{Deserialize, Serialize};
@@ -186,6 +189,22 @@ pub fn decrypt_with_friend(
     validate_backup(backup)?;
     let (secret, _) = SignedSecretKey::from_reader_single(private_key)
         .context("failed to parse recovery friend's OpenPGP private key")?;
+    // Refuse legacy algorithms before any signature check or decryption touches them.
+    require_modern_friend_key(
+        std::iter::once(secret.primary_key.public_key().public_params()).chain(
+            secret
+                .secret_subkeys
+                .iter()
+                .map(|subkey| subkey.key.public_key().public_params())
+                .chain(
+                    secret
+                        .public_subkeys
+                        .iter()
+                        .map(|subkey| subkey.key.public_params()),
+                ),
+        ),
+    )
+    .context(LEGACY_FRIEND_KEY_RECOVERY_HINT)?;
     secret
         .verify()
         .context("recovery friend's OpenPGP private key failed self-signature validation")?;
@@ -239,6 +258,8 @@ pub fn friend_user_id(public_key: &[u8]) -> Option<String> {
 pub fn friend_fingerprint(public_key: &[u8]) -> Result<String> {
     let (public, _) = SignedPublicKey::from_reader_single(public_key)
         .context("failed to parse recovery friend's OpenPGP public key")?;
+    // Refuse legacy algorithms before any signature check or encryption touches them.
+    require_modern_public_friend_key(&public)?;
     public
         .verify()
         .context("recovery friend's OpenPGP public key failed self-signature validation")?;
@@ -286,6 +307,8 @@ pub fn generate_friend_key(name: &str) -> Result<GeneratedFriendKey> {
 fn wrap_for_friend(public_key: &[u8], symmetric_key: &[u8]) -> Result<FriendKeyWrapper> {
     let (public, _) = SignedPublicKey::from_reader_single(public_key)
         .context("failed to parse recovery friend's OpenPGP public key")?;
+    // Refuse legacy algorithms before any signature check or encryption touches them.
+    require_modern_public_friend_key(&public)?;
     public
         .verify()
         .context("recovery friend's OpenPGP public key failed self-signature validation")?;
@@ -307,6 +330,73 @@ fn wrap_for_friend(public_key: &[u8], symmetric_key: &[u8]) -> Result<FriendKeyW
         public_key_armored: public.to_armored_string(ArmorOptions::default())?,
         encrypted_symmetric_key: STANDARD.encode(encrypted),
     })
+}
+
+/// Shown when a friend's own private key is refused during recovery. The vault owner (not the
+/// friend) can fix this, so point the friend at the owner and the hardware wallet path.
+const LEGACY_FRIEND_KEY_RECOVERY_HINT: &str = "this recovery friend's key is an old type that \
+     Anzen no longer opens. Ask the vault owner to recover with their hardware wallet instead, or \
+     to add you again with a new modern key";
+
+/// Recovery friends may only use the modern Curve25519/Curve448 family: Ed25519/Ed448 for the
+/// primary (certifying) key and X25519/X448 (cv25519) for encryption.
+///
+/// RSA is refused because the `rsa` crate under `pgp` has unfixed timing issues (Marvin attack,
+/// RUSTSEC-2023-0071, and `crypto-bigint` timing). DSA and ElGamal are obsolete, and NIST curves
+/// are refused to keep one simple, well-understood key type for every friend. The check runs on
+/// the parsed key material before any signature verification, encryption or decryption, so
+/// refused keys never reach those code paths.
+fn is_modern_friend_key(params: &PublicParams) -> bool {
+    matches!(
+        params,
+        PublicParams::EdDSALegacy(EddsaLegacyPublicParams::Ed25519 { .. })
+            | PublicParams::Ed25519(_)
+            | PublicParams::Ed448(_)
+            | PublicParams::X25519(_)
+            | PublicParams::X448(_)
+            | PublicParams::ECDH(EcdhPublicParams::Curve25519 { .. })
+    )
+}
+
+fn legacy_key_kind(params: &PublicParams) -> &'static str {
+    match params {
+        PublicParams::RSA(_) => "RSA",
+        PublicParams::DSA(_) => "DSA",
+        PublicParams::Elgamal(_) => "ElGamal",
+        PublicParams::ECDSA(_) | PublicParams::ECDH(_) => "NIST-curve (ECDSA/ECDH)",
+        _ => "unsupported",
+    }
+}
+
+fn require_modern_friend_key<'a>(keys: impl IntoIterator<Item = &'a PublicParams>) -> Result<()> {
+    if let Some(refused) = keys
+        .into_iter()
+        .find(|params| !is_modern_friend_key(params))
+    {
+        bail!(
+            "This recovery friend's OpenPGP key is an older {kind} key, and Anzen only accepts \
+             modern ed25519 keys. Older key types run on code with known weaknesses, so Anzen \
+             refuses them before using them. Nothing was changed.\n\
+             How to fix it: your friend makes a new key, either with \
+             `anzen social generate-friend-key --name \"Their Name\" --public-key friend.pub.asc \
+             --private-key friend.sec.asc`, or in GnuPG with \
+             `gpg --quick-gen-key \"Their Name <email>\" ed25519 cert` followed by \
+             `gpg --quick-add-key <FINGERPRINT> cv25519 encr`. Then send the new public key.",
+            kind = legacy_key_kind(refused)
+        );
+    }
+    Ok(())
+}
+
+fn require_modern_public_friend_key(public: &SignedPublicKey) -> Result<()> {
+    require_modern_friend_key(
+        std::iter::once(public.primary_key.public_params()).chain(
+            public
+                .public_subkeys
+                .iter()
+                .map(|subkey| subkey.key.public_params()),
+        ),
+    )
 }
 
 fn decrypt_payload(backup: &CloudRecoveryBackup, symmetric_key: &[u8]) -> Result<RecoveryPayload> {
@@ -552,5 +642,111 @@ mod tests {
             recovery::sign_recovery_sweep(plan, SweepPath::PhoneRecovery, &recovered_phone)
                 .unwrap();
         assert_eq!(result.input_count, 1);
+    }
+
+    const GINA_PUBLIC: &str = include_str!("../../tests/fixtures/friend-keys/gina.pub.asc");
+    const GINA_SECRET: &str = include_str!("../../tests/fixtures/friend-keys/gina.sec.asc");
+    const RITA_RSA_PUBLIC: &str = include_str!("../../tests/fixtures/friend-keys/rita.pub.asc");
+    const RITA_RSA_SECRET: &str = include_str!("../../tests/fixtures/friend-keys/rita.sec.asc");
+    const MAX_RSA_SUBKEY_PUBLIC: &str =
+        include_str!("../../tests/fixtures/friend-keys/max.pub.asc");
+    const PAT_P256_PUBLIC: &str = include_str!("../../tests/fixtures/friend-keys/pat.pub.asc");
+
+    fn backup_fixture(
+        friends: &[String],
+    ) -> (
+        tempfile::TempDir,
+        RecoveryPayload,
+        Vec<u8>,
+        Result<CloudRecoveryBackup>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let initialized = initialize(dir.path()).unwrap();
+        let phone = crate::core::storage::load_device_keys(
+            dir.path(),
+            crate::core::storage::PHONE_DEVICE_FILE,
+        )
+        .unwrap();
+        let hww = crate::core::storage::load_device_keys(
+            dir.path(),
+            crate::core::storage::HWW_DEVICE_FILE,
+        )
+        .unwrap();
+        let payload = RecoveryPayload::new(&initialized.config, &phone).unwrap();
+        let backup = create_backup(&payload, &hww.seed, friends);
+        (dir, payload, hww.seed.to_vec(), backup)
+    }
+
+    fn assert_refused_as(error: anyhow::Error, kind: &str) {
+        let message = format!("{error:#}");
+        assert!(message.contains(kind), "{message}");
+        assert!(
+            message.contains("only accepts modern ed25519 keys"),
+            "{message}"
+        );
+        assert!(message.contains("cv25519 encr"), "{message}");
+    }
+
+    #[test]
+    fn gnupg_ed25519_friend_keys_are_accepted_and_can_recover() {
+        assert!(friend_fingerprint(GINA_PUBLIC.as_bytes()).is_ok());
+        let (_dir, payload, _, backup) = backup_fixture(&[GINA_PUBLIC.to_owned()]);
+        let backup = backup.unwrap();
+        assert_eq!(
+            decrypt_with_friend(&backup, GINA_SECRET.as_bytes()).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn rsa_friend_keys_are_refused_everywhere_they_can_be_added() {
+        assert_refused_as(
+            friend_fingerprint(RITA_RSA_PUBLIC.as_bytes()).unwrap_err(),
+            "older RSA key",
+        );
+        let (_dir, _, _, backup) = backup_fixture(&[RITA_RSA_PUBLIC.to_owned()]);
+        assert_refused_as(backup.unwrap_err(), "older RSA key");
+
+        let (_dir, _, hww_seed, backup) = backup_fixture(&[GINA_PUBLIC.to_owned()]);
+        let mut backup = backup.unwrap();
+        let before = backup.clone();
+        assert_refused_as(
+            add_friend(&mut backup, &hww_seed, RITA_RSA_PUBLIC.as_bytes()).unwrap_err(),
+            "older RSA key",
+        );
+        assert_eq!(
+            backup, before,
+            "a refused friend must leave the backup unchanged"
+        );
+    }
+
+    #[test]
+    fn a_modern_primary_key_with_an_rsa_subkey_is_refused() {
+        assert_refused_as(
+            friend_fingerprint(MAX_RSA_SUBKEY_PUBLIC.as_bytes()).unwrap_err(),
+            "older RSA key",
+        );
+        let (_dir, _, _, backup) = backup_fixture(&[MAX_RSA_SUBKEY_PUBLIC.to_owned()]);
+        assert_refused_as(backup.unwrap_err(), "older RSA key");
+    }
+
+    #[test]
+    fn nist_curve_friend_keys_are_refused() {
+        assert_refused_as(
+            friend_fingerprint(PAT_P256_PUBLIC.as_bytes()).unwrap_err(),
+            "NIST-curve",
+        );
+    }
+
+    #[test]
+    fn an_rsa_private_key_is_refused_before_any_decryption() {
+        let (_dir, _, _, backup) = backup_fixture(&[GINA_PUBLIC.to_owned()]);
+        let error = decrypt_with_friend(&backup.unwrap(), RITA_RSA_SECRET.as_bytes()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("recover with their hardware wallet"),
+            "{message}"
+        );
+        assert_refused_as(error, "older RSA key");
     }
 }

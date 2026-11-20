@@ -591,7 +591,7 @@ Each allowance month's address is tied to the phone key that existed at the cere
 
 The backup payload contains the phone mnemonic and cold-storage descriptor, authenticated-encrypted under one random symmetric key. The HWW holds one encrypted copy of that key. Each recovery friend can hold another copy encrypted to their OpenPGP public key; the complete friend list is also authenticated by the symmetric key so cloud tampering cannot silently change who survives a later rotation. Friends are independent 1-of-N recipients, not threshold shares.
 
-The key generator is a simulation convenience. In a real integration, import a public key whose private half stays under the friend's control:
+The key generator is a simulation convenience. In a real integration, import a public key whose private half stays under the friend's control Recovery friend keys must be modern ed25519 keys (an ed25519 primary key with a cv25519 encryption subkey, which is what the generator and GnuPG's `ed25519`/`cv25519` options make). RSA, DSA, ElGamal and NIST-curve keys are refused before any signature check, encryption or decryption runs on them, because the RSA code under the `pgp` crate still has unfixed timing advisories (Marvin attack, `crypto-bigint`):
 
 ```console
 $ anzen social generate-friend-key --name "Alice <alice@example.test>" --public-key alice.pub.asc --private-key alice.sec.asc
