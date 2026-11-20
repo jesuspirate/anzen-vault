@@ -29,6 +29,8 @@ impl HotWallet {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        make_database_private(&path)
+            .with_context(|| format!("could not make {} private", path.display()))?;
         let db = Connection::open(&path)
             .with_context(|| format!("failed to open hot wallet database {}", path.display()))?;
         Self::open_or_create_with_keys(&keys, db)
@@ -364,10 +366,57 @@ impl HotWallet {
     }
 }
 
+/// Create the hot-wallet database owner-only (`0600`) on Unix, and tighten one an earlier version
+/// left open. SQLite would otherwise create it with default permissions, letting other accounts
+/// on the computer read the wallet's descriptors, addresses and transaction history. SQLite
+/// gives its journal files the database file's permissions.
+fn make_database_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Neither truncates nor writes: an existing database is left exactly as it was.
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        if file.metadata()?.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::initialize;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_hot_wallet_database_is_owner_only_even_when_it_was_created_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let dir = tempfile::tempdir().unwrap();
+        initialize(dir.path()).unwrap();
+        let path = hot_db_path(dir.path());
+        let first_receive = {
+            let mut hot = HotWallet::open_or_create(dir.path()).unwrap();
+            hot.next_receive_address().unwrap()
+        };
+        assert_eq!(mode(&path), 0o600);
+
+        // A database an earlier version left readable by others keeps its wallet state.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut reopened = HotWallet::open_or_create(dir.path()).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_ne!(first_receive, reopened.next_receive_address().unwrap());
+    }
 
     #[test]
     fn bdk_hot_wallet_persists_external_and_change_derivation() {
