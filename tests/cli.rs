@@ -428,6 +428,33 @@ fn openpgp_friend_decrypts_the_descriptor_bound_cloud_backup() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Phone key restored"));
+
+    let fingerprint = backup_json["friends"][0]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["--data-dir", data_dir, "hww", "remove-recovery-friend"])
+        .arg(&fingerprint)
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Recovery friend removed"));
+    let backup_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&backup).unwrap()).unwrap();
+    assert!(backup_json["friends"].as_array().unwrap().is_empty());
+    Command::cargo_bin("anzen")
+        .unwrap()
+        .args(["--data-dir", data_dir, "social", "decrypt-backup"])
+        .arg(&backup)
+        .arg("--private-key")
+        .arg(&private)
+        .arg("--output")
+        .arg(dir.path().join("after-removal.json"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no wrapper for friend"));
 }
 
 #[test]

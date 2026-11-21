@@ -182,15 +182,32 @@ pub fn decrypt_with_hww(backup: &CloudRecoveryBackup, hww_seed: &[u8]) -> Result
     decrypt_payload(backup, &symmetric_key)
 }
 
+/// What a recovery friend's key unlocked, and whether that key is an older type that only opens
+/// backups made before Anzen stopped accepting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FriendRecovery {
+    pub payload: RecoveryPayload,
+    /// `Some("RSA")` (or another older type) when the friend's key is no longer accepted for new
+    /// backups. The caller must show [`OLDER_FRIEND_KEY_WARNING`].
+    pub older_key_kind: Option<&'static str>,
+}
+
+/// Shown to a recovery friend whose older key still opened a backup made before Anzen started
+/// refusing older keys.
+pub const OLDER_FRIEND_KEY_WARNING: &str = "Warning: your recovery key is an older type that \
+     Anzen no longer accepts for new backups. It still opened this backup because the backup was \
+     made before that change, so the vault is not stranded. Please make a new modern key now \
+     (`anzen social generate-friend-key`, or GnuPG's ed25519 + cv25519 keys) and ask the vault \
+     owner to add it and remove the old one.";
+
 pub fn decrypt_with_friend(
     backup: &CloudRecoveryBackup,
     private_key: &[u8],
-) -> Result<RecoveryPayload> {
+) -> Result<FriendRecovery> {
     validate_backup(backup)?;
     let (secret, _) = SignedSecretKey::from_reader_single(private_key)
         .context("failed to parse recovery friend's OpenPGP private key")?;
-    // Refuse legacy algorithms before any signature check or decryption touches them.
-    require_modern_friend_key(
+    let older_key_kind = older_key_kind(
         std::iter::once(secret.primary_key.public_key().public_params()).chain(
             secret
                 .secret_subkeys
@@ -203,17 +220,25 @@ pub fn decrypt_with_friend(
                         .map(|subkey| subkey.key.public_params()),
                 ),
         ),
-    )
-    .context(LEGACY_FRIEND_KEY_RECOVERY_HINT)?;
-    secret
-        .verify()
-        .context("recovery friend's OpenPGP private key failed self-signature validation")?;
+    );
+    // The fingerprint is a hash of the public primary key; no private-key operation runs yet.
     let fingerprint = secret.fingerprint().to_string();
     let wrapper = backup
         .friends
         .iter()
-        .find(|friend| friend.fingerprint == fingerprint)
-        .with_context(|| format!("cloud backup has no wrapper for friend {fingerprint}"))?;
+        .find(|friend| friend.fingerprint == fingerprint);
+    let wrapper = match (wrapper, older_key_kind) {
+        (Some(wrapper), _) => wrapper,
+        // An older key that this backup does not already list is refused before any signature
+        // check or decryption touches it. Only friends added before the change keep working.
+        (None, Some(kind)) => {
+            return Err(older_key_error(kind)).context(LEGACY_FRIEND_KEY_RECOVERY_HINT);
+        }
+        (None, None) => bail!("cloud backup has no wrapper for friend {fingerprint}"),
+    };
+    secret
+        .verify()
+        .context("recovery friend's OpenPGP private key failed self-signature validation")?;
     let encrypted_key = STANDARD
         .decode(&wrapper.encrypted_symmetric_key)
         .context("friend key wrapper is not valid base64")?;
@@ -233,15 +258,92 @@ pub fn decrypt_with_friend(
         bail!("friend recovery wrapper contains an invalid symmetric key");
     }
     validate_friend_manifest(backup, &symmetric_key)?;
-    decrypt_payload(backup, &symmetric_key)
+    Ok(FriendRecovery {
+        payload: decrypt_payload(backup, &symmetric_key)?,
+        older_key_kind,
+    })
 }
 
-pub fn friend_public_keys(backup: &CloudRecoveryBackup) -> Vec<String> {
+/// A recovery friend listed in an existing backup whose key is an older type. They can still
+/// open that backup, but the owner should swap in a new modern key, and a phone-key rotation
+/// leaves them out of the new backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OlderFriend {
+    pub fingerprint: String,
+    pub name: Option<String>,
+    pub kind: &'static str,
+}
+
+/// Friends in `backup` whose stored public key is an older type (RSA, DSA, ElGamal, NIST curves,
+/// Ed448/X448). Only the stored public key is parsed; nothing is verified, encrypted or decrypted.
+pub fn older_friends(backup: &CloudRecoveryBackup) -> Vec<OlderFriend> {
     backup
         .friends
         .iter()
+        .filter_map(|friend| {
+            let kind = stored_friend_key_kind(friend)?;
+            Some(OlderFriend {
+                fingerprint: friend.fingerprint.clone(),
+                name: friend_user_id(friend.public_key_armored.as_bytes()),
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// Public keys of the friends that can be carried into a new backup (modern keys only).
+pub fn modern_friend_public_keys(backup: &CloudRecoveryBackup) -> Vec<String> {
+    backup
+        .friends
+        .iter()
+        .filter(|friend| stored_friend_key_kind(friend).is_none())
         .map(|friend| friend.public_key_armored.clone())
         .collect()
+}
+
+/// Remove a recovery friend's wrapper and re-authenticate the friend list. Copies of the old
+/// backup file that exist elsewhere still list the friend until the next phone-key rotation.
+pub fn remove_friend(
+    backup: &mut CloudRecoveryBackup,
+    hww_seed: &[u8],
+    fingerprint: &str,
+) -> Result<()> {
+    validate_backup(backup)?;
+    let symmetric_key = crypto::decrypt(
+        hww_seed,
+        HWW_KEY_PURPOSE,
+        &backup.hww_encrypted_symmetric_key,
+    )?;
+    if symmetric_key.len() != 32 {
+        bail!("cloud backup contains an invalid symmetric key");
+    }
+    validate_friend_manifest(backup, &symmetric_key)?;
+    let wanted = fingerprint.trim().to_ascii_lowercase();
+    let before = backup.friends.len();
+    backup
+        .friends
+        .retain(|friend| friend.fingerprint.to_ascii_lowercase() != wanted);
+    if backup.friends.len() == before {
+        bail!("no recovery friend with fingerprint {fingerprint} is in this backup");
+    }
+    backup.encrypted_friend_manifest = encrypt_friend_manifest(&symmetric_key, &backup.friends)?;
+    Ok(())
+}
+
+/// `Some(kind)` when a stored friend public key is an older type. A key that no longer parses is
+/// reported as older too, so it is never silently carried forward.
+fn stored_friend_key_kind(friend: &FriendKeyWrapper) -> Option<&'static str> {
+    match SignedPublicKey::from_reader_single(friend.public_key_armored.as_bytes()) {
+        Ok((public, _)) => older_key_kind(
+            std::iter::once(public.primary_key.public_params()).chain(
+                public
+                    .public_subkeys
+                    .iter()
+                    .map(|subkey| subkey.key.public_params()),
+            ),
+        ),
+        Err(_) => Some("unreadable"),
+    }
 }
 
 /// The name a recovery friend's OpenPGP key was issued to, for the printed recovery kit. This is
@@ -309,6 +411,13 @@ fn wrap_for_friend(public_key: &[u8], symmetric_key: &[u8]) -> Result<FriendKeyW
         .context("failed to parse recovery friend's OpenPGP public key")?;
     // Refuse legacy algorithms before any signature check or encryption touches them.
     require_modern_public_friend_key(&public)?;
+    wrap_for_parsed_friend(&public, symmetric_key)
+}
+
+fn wrap_for_parsed_friend(
+    public: &SignedPublicKey,
+    symmetric_key: &[u8],
+) -> Result<FriendKeyWrapper> {
     public
         .verify()
         .context("recovery friend's OpenPGP public key failed self-signature validation")?;
@@ -334,28 +443,39 @@ fn wrap_for_friend(public_key: &[u8], symmetric_key: &[u8]) -> Result<FriendKeyW
 
 /// Shown when a friend's own private key is refused during recovery. The vault owner (not the
 /// friend) can fix this, so point the friend at the owner and the hardware wallet path.
-const LEGACY_FRIEND_KEY_RECOVERY_HINT: &str = "this recovery friend's key is an old type that \
-     Anzen no longer opens. Ask the vault owner to recover with their hardware wallet instead, or \
-     to add you again with a new modern key";
+const LEGACY_FRIEND_KEY_RECOVERY_HINT: &str = "this recovery friend's key is an older type, and \
+     this backup does not list it. Older keys only open backups that already listed them before \
+     Anzen stopped accepting older keys. Ask the vault owner to recover with their hardware wallet \
+     instead, or to add you again with a new modern key";
 
-/// Recovery friends may only use the modern Curve25519/Curve448 family: Ed25519/Ed448 for the
-/// primary (certifying) key and X25519/X448 (cv25519) for encryption.
+/// Recovery friends may only use Curve25519 keys: Ed25519 for the primary (certifying) key and
+/// X25519 (cv25519) for encryption. These run on the `curve25519-dalek` family, which has no open
+/// advisories.
 ///
-/// RSA is refused because the `rsa` crate under `pgp` has unfixed timing issues (Marvin attack,
-/// RUSTSEC-2023-0071, and `crypto-bigint` timing). DSA and ElGamal are obsolete, and NIST curves
-/// are refused to keep one simple, well-understood key type for every friend. The check runs on
-/// the parsed key material before any signature verification, encryption or decryption, so
-/// refused keys never reach those code paths.
+/// Everything else is refused for new backups:
+/// - RSA: the `rsa` 0.9 crate under `pgp` has the unfixed Marvin timing attack
+///   (RUSTSEC-2023-0071).
+/// - Ed448/X448 and NIST curves: their code in `pgp` (`cx448`, `p256`/`p384`/`p521`) runs on
+///   `crypto-bigint` 0.5, which has timing advisories (RUSTSEC-2026-0387).
+/// - DSA and ElGamal: obsolete.
+///
+/// The check runs on the parsed key material before any signature verification, encryption or
+/// decryption. The one exception is a friend already listed in a backup made before this rule:
+/// their key may still decrypt that backup (see [`decrypt_with_friend`]), never anything new.
 fn is_modern_friend_key(params: &PublicParams) -> bool {
     matches!(
         params,
         PublicParams::EdDSALegacy(EddsaLegacyPublicParams::Ed25519 { .. })
             | PublicParams::Ed25519(_)
-            | PublicParams::Ed448(_)
             | PublicParams::X25519(_)
-            | PublicParams::X448(_)
             | PublicParams::ECDH(EcdhPublicParams::Curve25519 { .. })
     )
+}
+
+fn older_key_kind<'a>(keys: impl IntoIterator<Item = &'a PublicParams>) -> Option<&'static str> {
+    keys.into_iter()
+        .find(|params| !is_modern_friend_key(params))
+        .map(legacy_key_kind)
 }
 
 fn legacy_key_kind(params: &PublicParams) -> &'static str {
@@ -363,18 +483,22 @@ fn legacy_key_kind(params: &PublicParams) -> &'static str {
         PublicParams::RSA(_) => "RSA",
         PublicParams::DSA(_) => "DSA",
         PublicParams::Elgamal(_) => "ElGamal",
+        PublicParams::Ed448(_) | PublicParams::X448(_) => "Ed448/X448",
         PublicParams::ECDSA(_) | PublicParams::ECDH(_) => "NIST-curve (ECDSA/ECDH)",
         _ => "unsupported",
     }
 }
 
 fn require_modern_friend_key<'a>(keys: impl IntoIterator<Item = &'a PublicParams>) -> Result<()> {
-    if let Some(refused) = keys
-        .into_iter()
-        .find(|params| !is_modern_friend_key(params))
-    {
-        bail!(
-            "This recovery friend's OpenPGP key is an older {kind} key, and Anzen only accepts \
+    match older_key_kind(keys) {
+        Some(kind) => Err(older_key_error(kind)),
+        None => Ok(()),
+    }
+}
+
+fn older_key_error(kind: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "This recovery friend's OpenPGP key is an older {kind} key, and Anzen only accepts \
              modern ed25519 keys. Older key types run on code with known weaknesses, so Anzen \
              refuses them before using them. Nothing was changed.\n\
              How to fix it: your friend makes a new key, either with \
@@ -382,10 +506,7 @@ fn require_modern_friend_key<'a>(keys: impl IntoIterator<Item = &'a PublicParams
              --private-key friend.sec.asc`, or in GnuPG with \
              `gpg --quick-gen-key \"Their Name <email>\" ed25519 cert` followed by \
              `gpg --quick-add-key <FINGERPRINT> cv25519 encr`. Then send the new public key.",
-            kind = legacy_key_kind(refused)
-        );
-    }
-    Ok(())
+    )
 }
 
 fn require_modern_public_friend_key(public: &SignedPublicKey) -> Result<()> {
@@ -466,11 +587,15 @@ mod tests {
 
         assert_eq!(decrypt_with_hww(&backup, &hww.seed).unwrap(), payload);
         assert_eq!(
-            decrypt_with_friend(&backup, alice.private_key_armored.as_bytes()).unwrap(),
+            decrypt_with_friend(&backup, alice.private_key_armored.as_bytes())
+                .unwrap()
+                .payload,
             payload
         );
         assert_eq!(
-            decrypt_with_friend(&backup, bob.private_key_armored.as_bytes()).unwrap(),
+            decrypt_with_friend(&backup, bob.private_key_armored.as_bytes())
+                .unwrap()
+                .payload,
             payload
         );
     }
@@ -599,8 +724,9 @@ mod tests {
             &[friend.public_key_armored],
         )
         .unwrap();
-        let recovered =
-            decrypt_with_friend(&backup, friend.private_key_armored.as_bytes()).unwrap();
+        let recovered = decrypt_with_friend(&backup, friend.private_key_armored.as_bytes())
+            .unwrap()
+            .payload;
         let recovered_phone = DeviceKeys::parse_for_network_at_index(
             &bitcoin::key::Secp256k1::new(),
             &recovered.phone_mnemonic,
@@ -651,6 +777,67 @@ mod tests {
     const MAX_RSA_SUBKEY_PUBLIC: &str =
         include_str!("../../tests/fixtures/friend-keys/max.pub.asc");
     const PAT_P256_PUBLIC: &str = include_str!("../../tests/fixtures/friend-keys/pat.pub.asc");
+    const EVE_GNUPG_ED448_PUBLIC: &str =
+        include_str!("../../tests/fixtures/friend-keys/eve.pub.asc");
+
+    /// A backup as Anzen made it before older friend keys were refused: `older_public` is wrapped
+    /// without the modern-key check, next to the modern friend Gina.
+    fn backup_made_before_the_rule(
+        older_public: &str,
+    ) -> (
+        tempfile::TempDir,
+        RecoveryPayload,
+        Vec<u8>,
+        CloudRecoveryBackup,
+    ) {
+        let (dir, payload, hww_seed, backup) = backup_fixture(&[GINA_PUBLIC.to_owned()]);
+        let mut backup = backup.unwrap();
+        let symmetric_key = crypto::decrypt(
+            &hww_seed,
+            HWW_KEY_PURPOSE,
+            &backup.hww_encrypted_symmetric_key,
+        )
+        .unwrap();
+        let (public, _) = SignedPublicKey::from_reader_single(older_public.as_bytes()).unwrap();
+        backup
+            .friends
+            .push(wrap_for_parsed_friend(&public, &symmetric_key).unwrap());
+        backup
+            .friends
+            .sort_by(|left, right| left.fingerprint.cmp(&right.fingerprint));
+        backup.encrypted_friend_manifest =
+            encrypt_friend_manifest(&symmetric_key, &backup.friends).unwrap();
+        (dir, payload, hww_seed, backup)
+    }
+
+    fn generate_ed448_friend_key() -> (String, String) {
+        let mut encryption_subkey = SubkeyParamsBuilder::default();
+        encryption_subkey
+            .key_type(KeyType::X448)
+            .can_sign(false)
+            .can_encrypt(true)
+            .can_authenticate(false);
+        let mut params = SecretKeyParamsBuilder::default();
+        params
+            .key_type(KeyType::Ed448)
+            .can_certify(true)
+            .can_sign(false)
+            .can_encrypt(false)
+            .primary_user_id("Ed448 Friend".to_owned())
+            .subkeys(vec![encryption_subkey.build().unwrap()]);
+        let secret = params
+            .build()
+            .unwrap()
+            .generate(thread_rng())
+            .unwrap()
+            .sign(&mut thread_rng(), &Password::empty())
+            .unwrap();
+        let public = SignedPublicKey::from(secret.clone());
+        (
+            public.to_armored_string(ArmorOptions::default()).unwrap(),
+            secret.to_armored_string(ArmorOptions::default()).unwrap(),
+        )
+    }
 
     fn backup_fixture(
         friends: &[String],
@@ -694,7 +881,10 @@ mod tests {
         let backup = backup.unwrap();
         assert_eq!(
             decrypt_with_friend(&backup, GINA_SECRET.as_bytes()).unwrap(),
-            payload
+            FriendRecovery {
+                payload,
+                older_key_kind: None,
+            }
         );
     }
 
@@ -748,5 +938,121 @@ mod tests {
             "{message}"
         );
         assert_refused_as(error, "older RSA key");
+    }
+
+    #[test]
+    fn ed448_and_x448_friend_keys_are_refused_for_new_backups() {
+        let (public, secret) = generate_ed448_friend_key();
+        assert_refused_as(
+            friend_fingerprint(public.as_bytes()).unwrap_err(),
+            "older Ed448/X448 key",
+        );
+        let (_dir, _, _, backup) = backup_fixture(std::slice::from_ref(&public));
+        assert_refused_as(backup.unwrap_err(), "older Ed448/X448 key");
+
+        let (_dir, _, hww_seed, backup) = backup_fixture(&[GINA_PUBLIC.to_owned()]);
+        let mut backup = backup.unwrap();
+        let before = backup.clone();
+        assert_refused_as(
+            add_friend(&mut backup, &hww_seed, public.as_bytes()).unwrap_err(),
+            "older Ed448/X448 key",
+        );
+        assert_eq!(backup, before);
+        assert_refused_as(
+            decrypt_with_friend(&backup, secret.as_bytes()).unwrap_err(),
+            "older Ed448/X448 key",
+        );
+    }
+
+    #[test]
+    fn gnupg_ed448_friend_keys_are_not_accepted() {
+        // GnuPG 2.4 makes Ed448 keys in its own v5 format. Whether `pgp` refuses to parse them or
+        // our check refuses them, they must never be accepted.
+        assert!(friend_fingerprint(EVE_GNUPG_ED448_PUBLIC.as_bytes()).is_err());
+        let (_dir, _, _, backup) = backup_fixture(&[EVE_GNUPG_ED448_PUBLIC.to_owned()]);
+        assert!(backup.is_err());
+    }
+
+    #[test]
+    fn an_rsa_friend_in_a_backup_made_before_the_rule_can_still_recover() {
+        let (_dir, payload, hww_seed, backup) = backup_made_before_the_rule(RITA_RSA_PUBLIC);
+
+        let recovered = decrypt_with_friend(&backup, RITA_RSA_SECRET.as_bytes()).unwrap();
+        assert_eq!(recovered.payload, payload);
+        assert_eq!(recovered.older_key_kind, Some("RSA"));
+        // The modern friend and the HWW are unaffected.
+        assert_eq!(
+            decrypt_with_friend(&backup, GINA_SECRET.as_bytes())
+                .unwrap()
+                .older_key_kind,
+            None
+        );
+        assert_eq!(decrypt_with_hww(&backup, &hww_seed).unwrap(), payload);
+    }
+
+    #[test]
+    fn an_ed448_friend_in_a_backup_made_before_the_rule_can_still_recover() {
+        let (public, secret) = generate_ed448_friend_key();
+        let (_dir, payload, _, backup) = backup_made_before_the_rule(&public);
+        let recovered = decrypt_with_friend(&backup, secret.as_bytes()).unwrap();
+        assert_eq!(recovered.payload, payload);
+        assert_eq!(recovered.older_key_kind, Some("Ed448/X448"));
+    }
+
+    #[test]
+    fn older_friends_are_listed_and_left_out_of_new_backups() {
+        let (_dir, _, _, backup) = backup_made_before_the_rule(RITA_RSA_PUBLIC);
+        let rita_fingerprint = SignedPublicKey::from_reader_single(RITA_RSA_PUBLIC.as_bytes())
+            .unwrap()
+            .0
+            .fingerprint()
+            .to_string();
+        let older = older_friends(&backup);
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].fingerprint, rita_fingerprint);
+        assert_eq!(older[0].kind, "RSA");
+
+        let carried = modern_friend_public_keys(&backup);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(
+            friend_fingerprint(carried[0].as_bytes()).unwrap(),
+            friend_fingerprint(GINA_PUBLIC.as_bytes()).unwrap()
+        );
+    }
+
+    #[test]
+    fn removing_an_older_friend_keeps_the_backup_authenticated() {
+        let (_dir, payload, hww_seed, mut backup) = backup_made_before_the_rule(RITA_RSA_PUBLIC);
+        let rita_fingerprint = older_friends(&backup)[0].fingerprint.clone();
+
+        remove_friend(
+            &mut backup,
+            &hww_seed,
+            &rita_fingerprint.to_ascii_uppercase(),
+        )
+        .unwrap();
+        assert!(older_friends(&backup).is_empty());
+        assert_eq!(decrypt_with_hww(&backup, &hww_seed).unwrap(), payload);
+        assert_eq!(
+            decrypt_with_friend(&backup, GINA_SECRET.as_bytes())
+                .unwrap()
+                .payload,
+            payload
+        );
+        // Rita is no longer listed, so her older key is refused outright.
+        assert_refused_as(
+            decrypt_with_friend(&backup, RITA_RSA_SECRET.as_bytes()).unwrap_err(),
+            "older RSA key",
+        );
+        assert!(remove_friend(&mut backup, &hww_seed, &rita_fingerprint).is_err());
+    }
+
+    #[test]
+    fn removing_a_friend_needs_the_hww() {
+        let (_dir, _, _, mut backup) = backup_made_before_the_rule(RITA_RSA_PUBLIC);
+        let before = backup.clone();
+        let fingerprint = older_friends(&backup)[0].fingerprint.clone();
+        assert!(remove_friend(&mut backup, &[7u8; 64], &fingerprint).is_err());
+        assert_eq!(backup, before);
     }
 }

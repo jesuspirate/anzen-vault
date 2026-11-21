@@ -431,6 +431,14 @@ enum HwwCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Remove a recovery friend from the cloud backup, for example one with an older key type.
+    RemoveRecoveryFriend {
+        /// The friend's OpenPGP fingerprint, as `anzen status` or `hww add-recovery-friend` shows it.
+        fingerprint: String,
+        /// Approve non-interactively; intended for deterministic tests.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Sweep mature vault outputs using the HWW-only recovery path.
     Recover { destination: String },
     /// Phone lost: propose moving every vault coin with the hardware wallet and the YubiKey.
@@ -1028,6 +1036,20 @@ fn run_hww(
             let fingerprint = cold_wallet::add_recovery_friend(data_dir, &key)?;
             println!("Recovery friend added: {fingerprint}");
             println!("Cloud backup now grants this friend delayed phone recovery access");
+            warn_older_friends(data_dir)?;
+        }
+        HwwCommand::RemoveRecoveryFriend { fingerprint, yes } => {
+            hww_banner(data_dir, "REMOVE RECOVERY FRIEND");
+            eprintln!("OpenPGP fingerprint: {fingerprint}");
+            eprintln!("This friend will no longer be able to open the cloud backup");
+            eprintln!(
+                "Copies of the old backup saved elsewhere still open for them until the next \
+                 phone-key rotation"
+            );
+            require_hww_approval(yes, Path::new(&fingerprint), "recovery friend removal")?;
+            cold_wallet::remove_recovery_friend(data_dir, &fingerprint)?;
+            println!("Recovery friend removed: {fingerprint}");
+            warn_older_friends(data_dir)?;
         }
         HwwCommand::Recover { destination } => {
             let destination = configured_address(data_dir, &destination)?;
@@ -1188,7 +1210,18 @@ fn run_hww(
             let package: core::recovery::PhoneRotationPackage = read_artifact(&proposal)?;
             report_rotation(&package, true)?;
             require_hww_approval(yes, proposal.as_path(), "phone-key rotation")?;
+            let left_out = cold_wallet::older_recovery_friends(data_dir)?;
             let approved = cold_wallet::approve_phone_rotation(data_dir, &package)?;
+            for friend in &left_out {
+                eprintln!(
+                    "Warning: recovery friend {} ({}) uses an older {} key, so they are NOT in \
+                     the new cloud backup. Ask them for a new modern key and add it with \
+                     `anzen hww add-recovery-friend` after the rotation.",
+                    friend.name.as_deref().unwrap_or("name not recorded"),
+                    friend.fingerprint,
+                    friend.kind
+                );
+            }
             if let Some(policy) = &approved.renewed_policy {
                 eprintln!(
                     "HWW validated and signed the phone-key rotation plus {} renewed-policy PSBTs",
@@ -1293,7 +1326,14 @@ fn friend_recovery_package(
             private_key_path.display()
         )
     })?;
-    let payload = core::social::decrypt_with_friend(&backup, &private_key)?;
+    let recovery = core::social::decrypt_with_friend(&backup, &private_key)?;
+    if let Some(kind) = recovery.older_key_kind {
+        eprintln!(
+            "{} (key type: {kind})",
+            core::social::OLDER_FRIEND_KEY_WARNING
+        );
+    }
+    let payload = recovery.payload;
     payload.validate_against(&config)?;
     Ok(core::recovery::PhoneRecoveryPackage {
         version: 2,
@@ -2113,8 +2153,27 @@ fn print_coins(data_dir: &Path, rpc_args: &ChainArgs, reveal: bool) -> Result<()
     Ok(())
 }
 
+/// Tell the owner which recovery friends still use an older key type and how to fix it.
+fn warn_older_friends(data_dir: &Path) -> Result<()> {
+    for friend in cold_wallet::older_recovery_friends(data_dir)? {
+        eprintln!(
+            "Warning: recovery friend {} ({}) uses an older {} key. It still opens today's \
+             backup, but Anzen no longer accepts it for new backups and a phone-key rotation will \
+             leave it out. Ask this friend for a new modern key, add it with \
+             `anzen hww add-recovery-friend`, then remove the old one with \
+             `anzen hww remove-recovery-friend {}`.",
+            friend.name.as_deref().unwrap_or("name not recorded"),
+            friend.fingerprint,
+            friend.kind,
+            friend.fingerprint
+        );
+    }
+    Ok(())
+}
+
 fn print_status(data_dir: &Path, rpc_args: &ChainArgs) -> Result<()> {
     let config = core::storage::load_config(data_dir)?;
+    warn_older_friends(data_dir)?;
     let backend = rpc_args.connect_chain(data_dir)?;
     let tip = backend.chain_tip()?;
     let utxos = backend.scan_vault(&config)?;

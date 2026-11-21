@@ -8,4 +8,7 @@ must never be used for a real vault.
 | `gina.*.asc` | ed25519 | cv25519 | yes (GnuPG's modern default) |
 | `rita.*.asc` | rsa2048 | rsa2048 | no: RSA |
 | `max.pub.asc` | ed25519 | rsa2048 | no: RSA subkey |
-| `pat.pub.asc` | nistp256 | nistp256 | no: only the 25519/448 family is accepted |
+| `pat.pub.asc` | nistp256 | nistp256 | no: only Curve25519 keys are accepted |
+| `eve.*.asc` | ed448 (GnuPG v5) | cv448 | no: Ed448/X448 reach `crypto-bigint` |
+
+The Ed448/X448 tests in the RFC 9580 format generate their keys at run time with the `pgp` crate.

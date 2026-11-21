@@ -228,7 +228,8 @@ fn real_regtest_enforces_both_recovery_delays_and_rotates_the_phone_epoch() {
         &rotated_backup,
         recovery_friend.private_key_armored.as_bytes(),
     )
-    .unwrap();
+    .unwrap()
+    .payload;
     friend_payload
         .validate_against(&load_config(rotation_dir.path()).unwrap())
         .unwrap();
