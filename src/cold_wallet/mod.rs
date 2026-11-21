@@ -181,6 +181,31 @@ pub fn add_recovery_friend(data_dir: &Path, public_key: &[u8]) -> Result<String>
     Ok(fingerprint)
 }
 
+/// Remove a recovery friend from the cloud backup. Needs the HWW to re-authenticate the friend list.
+pub fn remove_recovery_friend(data_dir: &Path, fingerprint: &str) -> Result<()> {
+    let config = load_config(data_dir)?;
+    let hww = load_hww(data_dir)?;
+    let mut backup =
+        load_or_migrate_cloud_backup(data_dir, &data_dir.join(PHONE_BACKUP_FILE), &config, &*hww)?;
+    let secret = hww.backup_secret()?;
+    social::decrypt_with_hww(&backup, &secret)?.validate_against(&config)?;
+    social::remove_friend(&mut backup, &secret, fingerprint)?;
+    write_json(&data_dir.join(PHONE_BACKUP_FILE), &backup)?;
+    Ok(())
+}
+
+/// Recovery friends in the current cloud backup whose key is an older type. Reads only the public
+/// friend list; no device is needed. Empty when there is no backup yet.
+pub fn older_recovery_friends(data_dir: &Path) -> Result<Vec<social::OlderFriend>> {
+    let path = data_dir.join(PHONE_BACKUP_FILE);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(read_json::<CloudRecoveryBackup>(&path)
+        .map(|backup| social::older_friends(&backup))
+        .unwrap_or_default())
+}
+
 /// Validate every transaction against the displayed policy, verify the phone signatures, and add
 /// the HWW signatures.
 pub fn approve_policy(data_dir: &Path, batch_dir: &Path) -> Result<BatchManifest> {
@@ -519,7 +544,9 @@ pub fn approve_phone_rotation(
     )?;
     let secret = hww.backup_secret()?;
     social::decrypt_with_hww(&current_backup, &secret)?.validate_against(&old_config)?;
-    let friend_public_keys = social::friend_public_keys(&current_backup);
+    // Friends with an older key type cannot be wrapped into a new backup. They keep opening the
+    // old one; the HWW screen tells the owner to ask them for a new key.
+    let friend_public_keys = social::modern_friend_public_keys(&current_backup);
     let payload = RecoveryPayload::new(&new_config, &new_phone)?;
     approved.cloud_recovery_backup = Some(social::create_backup(
         &payload,

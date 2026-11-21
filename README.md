@@ -585,13 +585,32 @@ Allowance months: 12
 Emergency access preserved: 50000000 sats
 ```
 
-Each allowance month's address is tied to the phone key that existed at the ceremony, so `phone rotate-key` refuses while any month is still outside the vault; `anzen hww revoke-policy <vault address>` brings them back and cancels emergency access first. The rotation preserves the HWW key, every configured recovery friend, and the active monthly and emergency-access limits. It spends any old controller that is still live to replacement-phone change, so no old-key policy authority survives. It then creates a new phone seed and descriptor-bound cloud envelope and sweeps the old vault cooperatively. The same proposal chains a fresh annual policy to that sweep, with a new ladder of months for the new phone key; one HWW prompt approves both, and all replacement artifacts and connectors use the new phone key. A disabled feature remains disabled after rotation.
+Each allowance month's address is tied to the phone key that existed at the ceremony, so `phone rotate-key` refuses while any month is still outside the vault; `anzen hww revoke-policy <vault address>` brings them back and cancels emergency access first. The rotation preserves the HWW key, every recovery friend with a modern ed25519 key (a friend with an older key type is left out and named on the HWW screen, see [Configure social recovery](#configure-social-recovery)), and the active monthly and emergency-access limits. It spends any old controller that is still live to replacement-phone change, so no old-key policy authority survives. It then creates a new phone seed and descriptor-bound cloud envelope and sweeps the old vault cooperatively. The same proposal chains a fresh annual policy to that sweep, with a new ladder of months for the new phone key; one HWW prompt approves both, and all replacement artifacts and connectors use the new phone key. A disabled feature remains disabled after rotation.
 
 ### Configure social recovery
 
 The backup payload contains the phone mnemonic and cold-storage descriptor, authenticated-encrypted under one random symmetric key. The HWW holds one encrypted copy of that key. Each recovery friend can hold another copy encrypted to their OpenPGP public key; the complete friend list is also authenticated by the symmetric key so cloud tampering cannot silently change who survives a later rotation. Friends are independent 1-of-N recipients, not threshold shares.
 
-The key generator is a simulation convenience. In a real integration, import a public key whose private half stays under the friend's control Recovery friend keys must be modern ed25519 keys (an ed25519 primary key with a cv25519 encryption subkey, which is what the generator and GnuPG's `ed25519`/`cv25519` options make). RSA, DSA, ElGamal and NIST-curve keys are refused before any signature check, encryption or decryption runs on them, because the RSA code under the `pgp` crate still has unfixed timing advisories (Marvin attack, `crypto-bigint`):
+The key generator is a simulation convenience. In a real integration, import a public key whose private half stays under the friend's control.
+
+Recovery friend keys must be modern ed25519 keys: an ed25519 primary key with a cv25519 encryption subkey. That is what the generator makes, and what GnuPG makes with its `ed25519` and `cv25519` options. Every other key type is refused before any signature check, encryption or decryption runs on it, because the code for those types inside the `pgp` library has known timing weaknesses that are not fixed yet:
+
+| Key type | Why it is refused |
+|----------|-------------------|
+| RSA | The `rsa` crate's Marvin timing attack (RUSTSEC-2023-0071) |
+| Ed448 / X448, NIST curves (P-256, P-384, P-521) | Their code runs on `crypto-bigint` 0.5, which has timing advisories (RUSTSEC-2026-0387) |
+| DSA, ElGamal | Obsolete |
+
+**Backups made before this rule.** A friend whose older key (for example RSA) was added before Anzen started refusing older keys can still open that backup, so no vault is stranded. Their key is used only to decrypt a backup that already lists it, never to add them to a new one. The friend sees a warning asking them to make a new key, and `anzen status` and the HWW screens tell the owner which friends need one. To swap a friend's key:
+
+```console
+$ anzen hww add-recovery-friend alice-new.pub.asc
+$ anzen hww remove-recovery-friend <OLD FINGERPRINT>
+```
+
+A phone-key rotation carries only modern-key friends into the new backup and names any friend it left out. Copies of the old backup file saved elsewhere keep working for a removed friend until the next rotation, because removing a friend does not change the backup's inner key.
+
+Why letting an older key decrypt once is acceptable: the Marvin attack needs an attacker to time thousands of decryptions they choose. A recovery friend decrypts one backup, on their own computer, usually once in an emergency. The real risk in that moment is a vault nobody can open, so Anzen allows it and pushes everyone to a modern key.
 
 ```console
 $ anzen social generate-friend-key --name "Alice <alice@example.test>" --public-key alice.pub.asc --private-key alice.sec.asc

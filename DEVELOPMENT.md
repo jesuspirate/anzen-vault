@@ -45,6 +45,18 @@ Trezor firmware ──> independent Anzen protocol implementation
 
 The tests in `tests/architecture.rs` enforce the root Rust dependency boundaries. Hardware implementations must never gain network access or depend on phone-wallet implementation code.
 
+## Known dependency advisories
+
+These advisories reach Anzen through libraries we cannot upgrade past yet. Check this list when a new BDK or `pgp` release ships (last checked 2026-11-21).
+
+| Advisory | Comes in through | What it means for Anzen | What we do now | When it goes away |
+|----------|------------------|-------------------------|----------------|-------------------|
+| RUSTSEC-2026-0459, SQLite reads leftover memory from a crafted database + `-wal` file pair | `bdk_wallet` 3.1 / 3.2 → `bdk_chain` 0.23 (latest 0.23.4) → `rusqlite` 0.31 (`bundled`) → `libsqlite3-sys` 0.28 | Anzen only opens its own phone wallet database, `phone/hot-wallet.sqlite`, in a data folder only the user can read (PR #25). An attacker would first need to write files into that folder, which already means they control the device. Low practical risk. | Never open a wallet database or `-wal` file that someone else gave you. Nothing to patch: a `[patch]` cannot jump `libsqlite3-sys` 0.28 → 0.39. | A BDK release on `rusqlite` 0.41 or newer. That needs Rust 1.89 (CI pins 1.85), so bump `bdk_wallet`, `bdk_chain`, the CI toolchain and `rust-version` together. |
+| RUSTSEC-2023-0071, `rsa` Marvin timing attack | `pgp` 0.17 → `rsa` 0.9 | Reached only when a recovery friend's older RSA key opens a backup made before RSA keys were refused (decrypt only, once, on the friend's computer). New RSA friends are refused. | Refuse RSA for new friends; warn and help swap old ones. | A `pgp` release on `rsa` 0.10. The newest `pgp`, 0.21.1, still uses `rsa` 0.9 and needs Rust 1.88. |
+| RUSTSEC-2026-0387, `crypto-bigint` timing | `pgp` 0.17 → `cx448` (Ed448/X448) and `p256`/`p384`/`p521`/`k256` → `crypto-bigint` 0.5 | Reached only by Ed448/X448 or NIST-curve friend keys. These are refused for new friends, so as with RSA only an older backup's existing friend can reach it. Ed25519/X25519 friends never touch `crypto-bigint`. | Same as RSA. | A `pgp` release whose curve crates use `crypto-bigint` 0.7.6 or newer. `pgp` 0.21.1 still uses the 0.5 line. |
+
+Upgrading `pgp` today (0.17 → 0.21) would not clear either `pgp` advisory and would need a newer toolchain, so it is not worth the churn yet.
+
 ## Root Rust development
 
 The normal Rust checks cover the root package and `cold-signer` workspace member:
